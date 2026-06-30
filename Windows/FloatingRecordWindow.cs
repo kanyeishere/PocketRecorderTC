@@ -69,7 +69,7 @@ internal sealed class FloatingRecordWindow : Window
         HandleRightMouseDrag();
 
         if (!_suppressContextMenuThisFrame &&
-            ImGui.BeginPopup("PocketRecorderFloatingMenu"))
+            ImGui.BeginPopupContextItem("PocketRecorderFloatingMenu", ImGuiPopupFlags.MouseButtonRight))
         {
             if (ImGui.MenuItem("打开设置"))
                 _plugin.ConfigWindow.IsOpen = true;
@@ -181,11 +181,6 @@ internal sealed class FloatingRecordWindow : Window
                 _plugin.Config.HasFloatingRecordButtonPosition = true;
                 _plugin.Config.Save(Plugin.PluginInterface);
             }
-            else
-            {
-                Position = _rightDragStartWindowPos;
-                ImGui.OpenPopup("PocketRecorderFloatingMenu");
-            }
 
             _rightDragStartedOnButton = false;
             _wasDragging = false;
@@ -193,9 +188,12 @@ internal sealed class FloatingRecordWindow : Window
         }
 
         var dragDelta = ImGui.GetMousePos() - _rightDragStartMousePos;
+        if (!_wasDragging && dragDelta.LengthSquared() < 16f)
+            return;
+
+        _wasDragging = true;
         Position = _rightDragStartWindowPos + dragDelta;
         PositionCondition = ImGuiCond.Always;
-        _wasDragging = true;
     }
 
     private static void DrawCornerTicks(ImDrawListPtr draw, Vector2 min, Vector2 max, uint cyan, uint magenta)
