@@ -146,6 +146,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
         run: |
+          if (-not $env:GH_TOKEN) {
+            throw "DISPATCH_TOKEN secret is not set. Create a PAT with 'repo' scope and add it as DISPATCH_TOKEN in repo settings."
+          }
+
           Write-Host "Sending repository_dispatch to PocketStation repo..."
           gh api `
             --method POST `
@@ -153,4 +157,8 @@ jobs:
             -f event_type="aggregate-manifest" `
             -f 'client_payload[plugin]="PocketRecorder"' `
             -f "client_payload[version]=${{ steps.version.outputs.version }}"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh api failed with exit code $LASTEXITCODE. Check that DISPATCH_TOKEN has 'repo' scope."
+          }
           Write-Host "repository_dispatch sent successfully."
