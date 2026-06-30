@@ -23,6 +23,7 @@ namespace Recorder.Capture;
 internal sealed unsafe class WindowGraphicsCapture : IDisposable
 {
     private readonly Action<VideoFrame> _onFrame;
+    private readonly Func<bool>? _shouldCaptureFrame;
     private readonly int _targetFps;
     private readonly Stopwatch _sw = new();
     private readonly long _minIntervalTicks;
@@ -38,6 +39,7 @@ internal sealed unsafe class WindowGraphicsCapture : IDisposable
 
     private int _frameCount;
     private int _skipCount;
+    private int _backpressureSkipCount;
     private int _errorCount;
     private int _width;
     private int _height;
@@ -109,16 +111,17 @@ internal sealed unsafe class WindowGraphicsCapture : IDisposable
     public int CurrentWidth => _width;
     public int CurrentHeight => _height;
 
-    public WindowGraphicsCapture(IntPtr d3d11DeviceHandle, int targetFps, Action<VideoFrame> onFrame)
+    public WindowGraphicsCapture(IntPtr d3d11DeviceHandle, int targetFps, Action<VideoFrame> onFrame, Func<bool>? shouldCaptureFrame = null)
     {
         _nativeDevice = (ID3D11Device*)d3d11DeviceHandle;
         if (_nativeDevice == null)
             throw new ArgumentException("D3D11 device handle is zero.", nameof(d3d11DeviceHandle));
 
         _nativeDevice->AddRef();
-        _targetFps = targetFps;
+        _targetFps = Math.Max(1, targetFps);
         _onFrame = onFrame;
-        _minIntervalTicks = Stopwatch.Frequency / targetFps;
+        _shouldCaptureFrame = shouldCaptureFrame;
+        _minIntervalTicks = Stopwatch.Frequency / _targetFps;
     }
 
     public bool Start(IntPtr hwnd)
@@ -193,7 +196,7 @@ internal sealed unsafe class WindowGraphicsCapture : IDisposable
         _item = null;
 
         _sw.Stop();
-        Plugin.Log!.Info($"[WGC] Stopped. frames={_frameCount}, skipped={_skipCount}, errors={_errorCount}");
+        Plugin.Log!.Info($"[WGC] Stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, errors={_errorCount}");
     }
 
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
@@ -209,6 +212,7 @@ internal sealed unsafe class WindowGraphicsCapture : IDisposable
                 return;
             }
             _lastFrameTicks = now;
+            if (ShouldSkipCaptureForBackpressure()) return;
 
             using var frame = sender.TryGetNextFrame();
             if (frame == null)
@@ -374,44 +378,54 @@ internal sealed unsafe class WindowGraphicsCapture : IDisposable
                     int dstStride = (int)width * bpp;
                     int dataSize = dstStride * (int)height;
 
-                    byte[] buffer = new byte[dataSize];
+                    byte[]? rentedBuffer = VideoFrame.RentBuffer(dataSize);
+                    byte[] buffer = rentedBuffer;
                     byte* src = (byte*)mapped.pData;
 
-                    if (srcStride == dstStride)
+                    try
                     {
-                        Marshal.Copy((IntPtr)src, buffer, 0, dataSize);
-                    }
-                    else
-                    {
-                        for (int y = 0; y < (int)height; y++)
+                        if (srcStride == dstStride)
                         {
-                            Marshal.Copy((IntPtr)(src + y * srcStride), buffer, y * dstStride, dstStride);
+                            Marshal.Copy((IntPtr)src, buffer, 0, dataSize);
                         }
-                    }
+                        else
+                        {
+                            for (int y = 0; y < (int)height; y++)
+                            {
+                                Marshal.Copy((IntPtr)(src + y * srcStride), buffer, y * dstStride, dstStride);
+                            }
+                        }
 
-                    // 首帧诊断
-                    if (_frameCount == 0)
+                        // 首帧诊断
+                        if (_frameCount == 0)
+                        {
+                            Plugin.Log!.Info($"[WGC] First frame: {width}x{height}, format={desc.Format}, " +
+                                $"usage={desc.Usage}, bindFlags=0x{desc.BindFlags:X}, cpuAccess=0x{desc.CPUAccessFlags:X}, " +
+                                $"miscFlags=0x{desc.MiscFlags:X}, mips={desc.MipLevels}, sample={desc.SampleDesc.Count}/{desc.SampleDesc.Quality}");
+                            DiagnosePixels(buffer, (int)width, (int)height, dstStride);
+                        }
+
+                        if (IsFrameEmpty(buffer, (int)width, (int)height, dstStride))
+                        {
+                            _skipCount++;
+                            if (_skipCount <= 5 || _skipCount % 300 == 0)
+                                Plugin.Log!.Warning($"[WGC] Empty frame skipped. skipped={_skipCount}");
+                            return;
+                        }
+
+                        // WGC 已经返回 BGRA，无需转换
+                        long timestampHns = _frameCount == 0
+                            ? 0
+                            : (long)(systemRelativeTime.TotalMilliseconds * 10_000);
+
+                        frame = new VideoFrame(buffer, dataSize, (int)width, (int)height, dstStride, timestampHns, VideoPixelFormat.Bgra, ownsBuffer: true);
+                        rentedBuffer = null;
+                    }
+                    finally
                     {
-                        Plugin.Log!.Info($"[WGC] First frame: {width}x{height}, format={desc.Format}, " +
-                            $"usage={desc.Usage}, bindFlags=0x{desc.BindFlags:X}, cpuAccess=0x{desc.CPUAccessFlags:X}, " +
-                            $"miscFlags=0x{desc.MiscFlags:X}, mips={desc.MipLevels}, sample={desc.SampleDesc.Count}/{desc.SampleDesc.Quality}");
-                        DiagnosePixels(buffer, (int)width, (int)height, dstStride);
+                        if (rentedBuffer != null)
+                            VideoFrame.ReturnBuffer(rentedBuffer);
                     }
-
-                    if (IsFrameEmpty(buffer, (int)width, (int)height, dstStride))
-                    {
-                        _skipCount++;
-                        if (_skipCount <= 5 || _skipCount % 300 == 0)
-                            Plugin.Log!.Warning($"[WGC] Empty frame skipped. skipped={_skipCount}");
-                        return;
-                    }
-
-                    // WGC 已经返回 BGRA，无需转换
-                    long timestampHns = _frameCount == 0
-                        ? 0
-                        : (long)(systemRelativeTime.TotalMilliseconds * 10_000);
-
-                    frame = new VideoFrame(buffer, (int)width, (int)height, dstStride, timestampHns, VideoPixelFormat.Bgra);
                 }
             }
             finally
@@ -425,7 +439,18 @@ internal sealed unsafe class WindowGraphicsCapture : IDisposable
 
             if (frame != null)
             {
-                _onFrame(frame);
+                bool delivered = false;
+                try
+                {
+                    _onFrame(frame);
+                    delivered = true;
+                }
+                finally
+                {
+                    if (!delivered)
+                        frame.ReturnBuffer();
+                }
+
                 _frameCount++;
 
                 if (_frameCount % 300 == 0)
@@ -436,6 +461,34 @@ internal sealed unsafe class WindowGraphicsCapture : IDisposable
         {
             ctx->Release();
         }
+    }
+
+    private bool ShouldSkipCaptureForBackpressure()
+    {
+        if (_shouldCaptureFrame == null)
+            return false;
+
+        bool shouldCapture;
+        try
+        {
+            shouldCapture = _shouldCaptureFrame();
+        }
+        catch (Exception ex)
+        {
+            if (_backpressureSkipCount == 0)
+                Plugin.Log!.Warning($"[WGC] Capture backpressure check failed: {ex.Message}");
+            return false;
+        }
+
+        if (shouldCapture)
+            return false;
+
+        _skipCount++;
+        _backpressureSkipCount++;
+        if (_backpressureSkipCount <= 3 || _backpressureSkipCount % 300 == 0)
+            Plugin.Log!.Info($"[WGC] Encoder queue backed up; skipped capture readback. backpressureSkips={_backpressureSkipCount}");
+
+        return true;
     }
 
     private void EnsureD3D11MultithreadProtection(ID3D11DeviceContext* ctx)

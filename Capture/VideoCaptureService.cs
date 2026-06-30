@@ -23,6 +23,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     private readonly IGameInteropProvider _gameInterop;
     private readonly IFramework _framework;
     private readonly Action<VideoFrame> _onFrame;
+    private readonly Func<bool>? _shouldCaptureFrame;
 
     // D3D11 对象
     private ID3D11Device* _device;
@@ -58,6 +59,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     private readonly Stopwatch _sw = new();
     private int _frameCount;
     private int _skipCount;
+    private int _backpressureSkipCount;
     private int _errorCount;
     private int _consecutiveBlackFrames;
     private bool _presentHookEnabled;
@@ -79,12 +81,13 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int PresentDelegate(IntPtr swapChain, uint syncInterval, uint flags);
 
-    public VideoCaptureService(IUiBuilder uiBuilder, IGameInteropProvider gameInterop, IFramework framework, Action<VideoFrame> onFrame)
+    public VideoCaptureService(IUiBuilder uiBuilder, IGameInteropProvider gameInterop, IFramework framework, Action<VideoFrame> onFrame, Func<bool>? shouldCaptureFrame = null)
     {
         _uiBuilder = uiBuilder;
         _gameInterop = gameInterop;
         _framework = framework;
         _onFrame = onFrame;
+        _shouldCaptureFrame = shouldCaptureFrame;
     }
 
     public void Start(int targetFps)
@@ -93,11 +96,13 @@ internal sealed unsafe class VideoCaptureService : IDisposable
         _capturing = true;
         _frameCount = 0;
         _skipCount = 0;
+        _backpressureSkipCount = 0;
         _errorCount = 0;
         _consecutiveBlackFrames = 0;
         _presentHookEnabled = false;
         _diagnosedBackendMask = 0;
         _activeBackend = CaptureBackend.PresentHook;
+        _lastFrameTicks = 0;
         _sw.Restart();
 
         // 默认用 Present Hook 在 Present 前捕获，避免 Framework.Update 读到渲染中间态。
@@ -143,7 +148,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
         }
 
         _sw.Stop();
-        Plugin.Log!.Info($"[Video] Capture stopped. frames={_frameCount}, skipped={_skipCount}, errors={_errorCount}, method={_captureMethod}");
+        Plugin.Log!.Info($"[Video] Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, errors={_errorCount}, method={_captureMethod}");
     }
 
     // ──────────────────────────────────────────────────────────
@@ -172,6 +177,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
         long minInterval = Stopwatch.Frequency / _targetFps;
         if (now - _lastFrameTicks < minInterval) return;
         _lastFrameTicks = now;
+        if (ShouldSkipCaptureForBackpressure()) return;
 
         Device* gameDevice = Device.Instance();
         if (gameDevice == null) { _skipCount++; return; }
@@ -312,6 +318,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
         long minInterval = Stopwatch.Frequency / _targetFps;
         if (now - _lastFrameTicks < minInterval) return;
         _lastFrameTicks = now;
+        if (ShouldSkipCaptureForBackpressure()) return;
 
         var swapChain = (IDXGISwapChain*)swapChainPtr;
 
@@ -428,8 +435,10 @@ internal sealed unsafe class VideoCaptureService : IDisposable
                 ? (ID3D11Texture2D*)_stagingTextures[(_stagingWriteIndex + 1) % StagingTextureCount]
                 : null;
 
-            EnsureD3D11MultithreadProtection(ctx);
-            bool d3dLocked = EnterD3D11Multithread();
+            bool useD3D11MultithreadProtection = _activeBackend != CaptureBackend.PresentHook;
+            if (useD3D11MultithreadProtection)
+                EnsureD3D11MultithreadProtection(ctx);
+            bool d3dLocked = useD3D11MultithreadProtection && EnterD3D11Multithread();
             bool mappedOk = false;
             bool switchBackendAfterReadback = false;
             VideoFrame? frame = null;
@@ -484,51 +493,61 @@ internal sealed unsafe class VideoCaptureService : IDisposable
                     int dstStride = (int)width * bpp;
                     int dataSize = dstStride * (int)height;
 
-                    byte[] buffer = new byte[dataSize];
+                    byte[]? rentedBuffer = VideoFrame.RentBuffer(dataSize);
+                    byte[] buffer = rentedBuffer;
                     byte* src = (byte*)mapped.pData;
 
-                    if (srcStride == dstStride)
+                    try
                     {
-                        Marshal.Copy((IntPtr)src, buffer, 0, dataSize);
-                    }
-                    else
-                    {
-                        for (int y = 0; y < (int)height; y++)
+                        if (srcStride == dstStride)
                         {
-                            Marshal.Copy((IntPtr)(src + y * srcStride), buffer, y * dstStride, dstStride);
+                            Marshal.Copy((IntPtr)src, buffer, 0, dataSize);
+                        }
+                        else
+                        {
+                            for (int y = 0; y < (int)height; y++)
+                            {
+                                Marshal.Copy((IntPtr)(src + y * srcStride), buffer, y * dstStride, dstStride);
+                            }
+                        }
+
+                        bool isEmptyFrame = IsFrameEmpty(buffer, (int)width, (int)height, dstStride);
+
+                        if (diagnoseThisBackend)
+                        {
+                            DiagnosePixels(buffer, (int)width, (int)height, dstStride);
+                        }
+
+                        VideoPixelFormat pixelFormat =
+                            format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM ||
+                            format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                            format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS
+                                ? VideoPixelFormat.Rgba
+                                : VideoPixelFormat.Bgra;
+
+                        // 空帧（RGBA 全 0）通常表示 GPU 读回失败；不要把它送进编码器。
+                        if (isEmptyFrame)
+                        {
+                            _consecutiveBlackFrames++;
+                            if (_consecutiveBlackFrames >= MaxBlackFramesBeforeFallback)
+                            {
+                                Plugin.Log!.Warning($"[Video] {_consecutiveBlackFrames} consecutive empty frames on {_captureMethod}! Switching capture backend.");
+                                switchBackendAfterReadback = true;
+                            }
+                        }
+                        else
+                        {
+                            _consecutiveBlackFrames = 0;
+
+                            long timestampHns = timestampTicks * 10_000_000L / Stopwatch.Frequency;
+                            frame = new VideoFrame(buffer, dataSize, (int)width, (int)height, dstStride, timestampHns, pixelFormat, ownsBuffer: true);
+                            rentedBuffer = null;
                         }
                     }
-
-                    bool isEmptyFrame = IsFrameEmpty(buffer, (int)width, (int)height, dstStride);
-
-                    if (diagnoseThisBackend)
+                    finally
                     {
-                        DiagnosePixels(buffer, (int)width, (int)height, dstStride);
-                    }
-
-                    VideoPixelFormat pixelFormat =
-                        format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM ||
-                        format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                        format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS
-                            ? VideoPixelFormat.Rgba
-                            : VideoPixelFormat.Bgra;
-
-                    // 空帧（RGBA 全 0）通常表示 GPU 读回失败；不要把它送进编码器。
-                    if (isEmptyFrame)
-                    {
-                        _consecutiveBlackFrames++;
-                        if (_consecutiveBlackFrames >= MaxBlackFramesBeforeFallback)
-                        {
-                            Plugin.Log!.Warning($"[Video] {_consecutiveBlackFrames} consecutive empty frames on {_captureMethod}! Switching capture backend.");
-                            switchBackendAfterReadback = true;
-                        }
-                    }
-                    else
-                    {
-                        _consecutiveBlackFrames = 0;
-
-                        long timestampHns = timestampTicks * 10_000_000L / Stopwatch.Frequency;
-                        frame = new VideoFrame(buffer, (int)width, (int)height, dstStride, timestampHns, pixelFormat);
+                        if (rentedBuffer != null)
+                            VideoFrame.ReturnBuffer(rentedBuffer);
                     }
                 }
             }
@@ -549,7 +568,18 @@ internal sealed unsafe class VideoCaptureService : IDisposable
 
             if (frame != null)
             {
-                _onFrame(frame);
+                bool delivered = false;
+                try
+                {
+                    _onFrame(frame);
+                    delivered = true;
+                }
+                finally
+                {
+                    if (!delivered)
+                        frame.ReturnBuffer();
+                }
+
                 _frameCount++;
 
                 if (_frameCount % 300 == 0)
@@ -626,7 +656,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
         WindowGraphicsCapture wgcCapture;
         try
         {
-            wgcCapture = new WindowGraphicsCapture(deviceHandle, _targetFps, OnWgcFrame);
+            wgcCapture = new WindowGraphicsCapture(deviceHandle, _targetFps, OnWgcFrame, _shouldCaptureFrame);
         }
         finally
         {
@@ -702,11 +732,26 @@ internal sealed unsafe class VideoCaptureService : IDisposable
 
     private void OnWgcFrame(VideoFrame frame)
     {
-        if (!_capturing) return;
+        if (!_capturing)
+        {
+            frame.ReturnBuffer();
+            return;
+        }
 
         CurrentWidth = frame.Width;
         CurrentHeight = frame.Height;
-        _onFrame(frame);
+        bool delivered = false;
+        try
+        {
+            _onFrame(frame);
+            delivered = true;
+        }
+        finally
+        {
+            if (!delivered)
+                frame.ReturnBuffer();
+        }
+
         _frameCount++;
 
         if (_frameCount % 300 == 0)
@@ -724,6 +769,34 @@ internal sealed unsafe class VideoCaptureService : IDisposable
             return false;
 
         _diagnosedBackendMask |= bit;
+        return true;
+    }
+
+    private bool ShouldSkipCaptureForBackpressure()
+    {
+        if (_shouldCaptureFrame == null)
+            return false;
+
+        bool shouldCapture;
+        try
+        {
+            shouldCapture = _shouldCaptureFrame();
+        }
+        catch (Exception ex)
+        {
+            if (_backpressureSkipCount == 0)
+                Plugin.Log!.Warning($"[Video] Capture backpressure check failed: {ex.Message}");
+            return false;
+        }
+
+        if (shouldCapture)
+            return false;
+
+        _skipCount++;
+        _backpressureSkipCount++;
+        if (_backpressureSkipCount <= 3 || _backpressureSkipCount % 300 == 0)
+            Plugin.Log!.Info($"[Video] Encoder queue backed up; skipped capture readback. backpressureSkips={_backpressureSkipCount}");
+
         return true;
     }
 
@@ -921,4 +994,51 @@ internal enum VideoPixelFormat
     Rgba,
 }
 
-internal sealed record VideoFrame(byte[] Data, int Width, int Height, int Stride, long TimestampHns, VideoPixelFormat PixelFormat);
+internal sealed class VideoFrame
+{
+    private readonly bool _ownsBuffer;
+    private int _bufferReturned;
+
+    public VideoFrame(
+        byte[] data,
+        int dataLength,
+        int width,
+        int height,
+        int stride,
+        long timestampHns,
+        VideoPixelFormat pixelFormat,
+        bool ownsBuffer = false)
+    {
+        Data = data;
+        DataLength = dataLength;
+        Width = width;
+        Height = height;
+        Stride = stride;
+        TimestampHns = timestampHns;
+        PixelFormat = pixelFormat;
+        _ownsBuffer = ownsBuffer;
+    }
+
+    public byte[] Data { get; }
+    public int DataLength { get; }
+    public int Width { get; }
+    public int Height { get; }
+    public int Stride { get; }
+    public long TimestampHns { get; }
+    public VideoPixelFormat PixelFormat { get; }
+
+    public static byte[] RentBuffer(int minimumLength)
+        => System.Buffers.ArrayPool<byte>.Shared.Rent(minimumLength);
+
+    public static void ReturnBuffer(byte[] buffer)
+        => System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+
+    public void ReturnBuffer()
+    {
+        if (!_ownsBuffer)
+            return;
+
+        if (System.Threading.Interlocked.Exchange(ref _bufferReturned, 1) == 0)
+            ReturnBuffer(Data);
+    }
+}

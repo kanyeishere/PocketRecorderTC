@@ -4,6 +4,7 @@ using Recorder.Encoding;
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 
 namespace Recorder.Recording;
 
@@ -15,11 +16,18 @@ internal sealed class RecordingService : IDisposable
     private readonly Plugin _plugin;
     private readonly IGameInteropProvider _gameInterop;
     private readonly IFramework _framework;
+    private readonly object _sync = new();
+
     private VideoCaptureService? _videoCapture;
     private AudioCaptureService? _audioCapture;
     private FFmpegWriter? _writer;
+    private RecordingStartOptions? _startOptions;
 
+    private int _sessionId;
     private bool _isRecording;
+    private bool _isStartingWriter;
+    private bool _isFinalizing;
+    private bool _stopRequested;
     private DateTime _recordStart;
     private int _frameCount;
     private string? _currentFilePath;
@@ -29,9 +37,45 @@ internal sealed class RecordingService : IDisposable
     private int _videoHeight;
     private int _videoFps;
 
-    public bool IsRecording => _isRecording;
-    public TimeSpan Elapsed => _isRecording ? DateTime.Now - _recordStart : TimeSpan.Zero;
-    public int FrameCount => _frameCount;
+    public bool IsRecording
+    {
+        get
+        {
+            lock (_sync)
+                return HasActiveSessionNoLock();
+        }
+    }
+
+    public RecordingPhase Phase
+    {
+        get
+        {
+            lock (_sync)
+            {
+                if (_isFinalizing)
+                    return RecordingPhase.Finalizing;
+
+                if (_isRecording)
+                    return RecordingPhase.Recording;
+
+                if (_startOptions != null || _videoCapture != null || _audioCapture != null || _isStartingWriter)
+                    return RecordingPhase.Preparing;
+
+                return RecordingPhase.Idle;
+            }
+        }
+    }
+
+    public TimeSpan Elapsed
+    {
+        get
+        {
+            lock (_sync)
+                return _isRecording ? DateTime.Now - _recordStart : TimeSpan.Zero;
+        }
+    }
+
+    public int FrameCount => Volatile.Read(ref _frameCount);
     public string? CurrentFilePath => _currentFilePath;
 
     public event Action<bool>? RecordingStateChanged;
@@ -45,175 +89,491 @@ internal sealed class RecordingService : IDisposable
 
     public void ToggleRecording()
     {
-        if (_isRecording)
+        var phase = Phase;
+        if (phase is RecordingPhase.Recording or RecordingPhase.Preparing)
             StopRecording();
-        else
+        else if (phase == RecordingPhase.Idle)
             StartRecording();
     }
 
     public void StartRecording()
     {
-        if (_isRecording) return;
+        Stopwatch startSw = Stopwatch.StartNew();
+        RecordingStartOptions options;
+        AudioCaptureService? audioCapture = null;
+        VideoCaptureService videoCapture;
 
-        var config = _plugin.Config;
-        _videoFps = config.TargetFps;
-
-        // 生成输出文件路径
-        string dir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
-        string fileName = $"FFXIV_{DateTime.Now:yyyyMMdd_HHmmss}.mp4";
-        _currentFilePath = Path.Combine(dir, fileName);
-
-        string ffmpegPath = config.GetEffectiveFFmpegPath();
-        EncoderSelection encoder = FFmpegEncoderSelector.Select(ffmpegPath, config);
-
-        // 创建输出 sink（FFmpeg）
-        _writer = new FFmpegWriter(
-            ffmpegPath,
-            config.VideoBitrate,
-            encoder.Codec,
-            encoder.Preset,
-            encoder.IsHardware);
-        _writer.SetOutputPath(_currentFilePath);
-
-        // 创建并启动音频捕获（如果启用），以便获取音频格式
-        if (config.CaptureAudio)
+        lock (_sync)
         {
-            Plugin.Log.Info("[Record] Starting audio capture...");
-            _audioCapture = new AudioCaptureService(OnAudioPacket);
-            _audioCapture.Start();
-            // 等待音频初始化完成（最多 2 秒）
-            Thread.Sleep(500);
-            if (_audioCapture.Initialized)
-                Plugin.Log.Info($"[Record] Audio initialized: {_audioCapture.SampleRate}Hz, {_audioCapture.Channels}ch, {_audioCapture.BitsPerSample}bit");
-            else
-            {
-                Plugin.Log.Warning($"[Record] Audio init failed (LastError={_audioCapture.LastError}), continuing video-only.");
-                _audioCapture.Stop();
-                _audioCapture = null;
-            }
+            if (HasActiveSessionNoLock())
+                return;
+
+            var config = _plugin.Config;
+            int sessionId = ++_sessionId;
+            _videoFps = Math.Max(1, config.TargetFps);
+
+            string dir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
+            string fileName = $"FFXIV_{DateTime.Now:yyyyMMdd_HHmmss}.mp4";
+            _currentFilePath = Path.Combine(dir, fileName);
+
+            options = new RecordingStartOptions(
+                sessionId,
+                _currentFilePath,
+                config.FFmpegPath,
+                Plugin.PluginInterface.GetPluginConfigDirectory(),
+                config.VideoBitrate,
+                _videoFps,
+                config.CaptureAudio,
+                config.VideoCodec,
+                config.EncoderPreset,
+                config.UseHardwareEncoder);
+
+            _startOptions = options;
+            _writer = null;
+            _audioCapture = null;
+            _videoCapture = null;
+            _isRecording = false;
+            _isStartingWriter = false;
+            _isFinalizing = false;
+            _stopRequested = false;
+            _frameCount = 0;
+            _videoWidth = 0;
+            _videoHeight = 0;
         }
 
-        // 创建并启动视频捕获
-        _videoCapture = new VideoCaptureService(
+        if (options.CaptureAudio)
+        {
+            Plugin.Log.Info("[Record] Starting audio capture...");
+            audioCapture = new AudioCaptureService(OnAudioPacket);
+            lock (_sync)
+            {
+                if (IsCurrentSessionNoLock(options.SessionId))
+                    _audioCapture = audioCapture;
+            }
+
+            audioCapture.Start();
+        }
+
+        videoCapture = new VideoCaptureService(
             Plugin.PluginInterface.UiBuilder,
             _gameInterop,
             _framework,
-            OnVideoFrame);
-        _videoCapture.Start(_videoFps);
+            OnVideoFrame,
+            ShouldCaptureVideoFrame);
 
-        // 实际录制开始要等第一帧确定视频尺寸后
-        _isRecording = false;
-        _frameCount = 0;
-        Plugin.Log.Info($"[Record] Preparation started → {_currentFilePath}");
-        Plugin.Log.Info($"[Record] Config: fps={_videoFps}, bitrate={config.VideoBitrate}, codec={encoder.Codec}, preset={encoder.Preset}, audio={config.CaptureAudio}, hw={encoder.IsHardware}, encoderReason={encoder.Reason}");
+        lock (_sync)
+        {
+            if (!IsCurrentSessionNoLock(options.SessionId))
+            {
+                audioCapture?.Stop();
+                audioCapture?.Dispose();
+                videoCapture.Dispose();
+                return;
+            }
+
+            _videoCapture = videoCapture;
+        }
+
+        videoCapture.Start(options.TargetFps);
+
+        Plugin.Log.Info($"[Record] Preparation started -> {options.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
+        Plugin.Log.Info($"[Record] Config: fps={options.TargetFps}, bitrate={options.VideoBitrate}, codec={options.VideoCodec}, preset={options.EncoderPreset}, audio={options.CaptureAudio}, hw={options.UseHardwareEncoder}");
+        RecordingStateChanged?.Invoke(true);
     }
 
     private void OnVideoFrame(VideoFrame frame)
     {
-        if (_writer == null) return;
+        FFmpegWriter? writer;
+        RecordingStartOptions? options;
+        bool startWriter;
+        int expectedWidth;
+        int expectedHeight;
 
-        // 第一帧：确定尺寸并初始化 writer
-        if (!_isRecording)
+        lock (_sync)
         {
-            _videoWidth = frame.Width;
-            _videoHeight = frame.Height;
-
-            AudioFormat? audioFormat = null;
-            if (_plugin.Config.CaptureAudio && _audioCapture != null && _audioCapture.Initialized)
+            if (_stopRequested || _startOptions == null)
             {
-                audioFormat = new AudioFormat(
-                    _audioCapture.SampleRate,
-                    _audioCapture.Channels,
-                    _audioCapture.BitsPerSample,
-                    _audioCapture.BitsPerSample == 32);
-                Plugin.Log.Info($"[Record] Audio format: {audioFormat.SampleRate}Hz, {audioFormat.Channels}ch, {audioFormat.BitsPerSample}bit, float={audioFormat.IsFloat}");
+                frame.ReturnBuffer();
+                return;
+            }
+
+            writer = _writer;
+            if (writer == null)
+            {
+                if (_isStartingWriter)
+                {
+                    frame.ReturnBuffer();
+                    return;
+                }
+
+                _isStartingWriter = true;
+                _videoWidth = frame.Width;
+                _videoHeight = frame.Height;
+                options = _startOptions;
+                startWriter = true;
+                expectedWidth = frame.Width;
+                expectedHeight = frame.Height;
             }
             else
             {
-                Plugin.Log.Info("[Record] No audio (disabled or init failed), video-only recording.");
-            }
-
-            try
-            {
-                _writer.Start(
-                    new VideoFormat(_videoWidth, _videoHeight, _videoFps, frame.PixelFormat),
-                    audioFormat);
-                _isRecording = true;
-                _recordStart = DateTime.Now;
-                Plugin.Log!.Info($"[Record] Recording started: {_videoWidth}x{_videoHeight}@{_videoFps}fps, audio={audioFormat != null}");
-                RecordingStateChanged?.Invoke(true);
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log!.Error($"[Record] Failed to start writer: {ex}");
-                _writer.Dispose();
-                _writer = null;
-                _videoCapture?.Stop();
-                _videoCapture = null;
-                _audioCapture?.Stop();
-                _audioCapture = null;
-                return;
+                options = null;
+                startWriter = false;
+                expectedWidth = _videoWidth;
+                expectedHeight = _videoHeight;
             }
         }
 
-        // 尺寸不匹配（窗口调整），跳过帧
-        if (frame.Width != _videoWidth || frame.Height != _videoHeight)
+        if (startWriter)
         {
-            Plugin.Log!.Warning($"Frame size changed {frame.Width}x{frame.Height} ≠ {_videoWidth}x{_videoHeight}, skipping.");
+            StartWriterInBackground(options!, frame);
             return;
         }
 
-        _writer.WriteVideoFrame(frame);
-        _frameCount++;
+        if (frame.Width != expectedWidth || frame.Height != expectedHeight)
+        {
+            Plugin.Log!.Warning($"Frame size changed {frame.Width}x{frame.Height} != {expectedWidth}x{expectedHeight}, skipping.");
+            frame.ReturnBuffer();
+            return;
+        }
+
+        writer!.WriteVideoFrame(frame);
+        Interlocked.Increment(ref _frameCount);
+    }
+
+    private void StartWriterInBackground(RecordingStartOptions options, VideoFrame firstFrame)
+    {
+        var thread = new Thread(() => StartWriterWorker(options, firstFrame))
+        {
+            IsBackground = true,
+            Name = "Recorder-StartWriter",
+        };
+        thread.Start();
+    }
+
+    private void StartWriterWorker(RecordingStartOptions options, VideoFrame firstFrame)
+    {
+        Stopwatch startSw = Stopwatch.StartNew();
+        FFmpegWriter? writer = null;
+        FFmpegWriter? startedWriter = null;
+        bool frameHandedToWriter = false;
+
+        try
+        {
+            AudioFormat? audioFormat = WaitForAudioFormat(options);
+            if (!IsCurrentSession(options.SessionId))
+            {
+                firstFrame.ReturnBuffer();
+                return;
+            }
+
+            var encoderConfig = new Configuration
+            {
+                VideoBitrate = options.VideoBitrate,
+                VideoCodec = options.VideoCodec,
+                EncoderPreset = options.EncoderPreset,
+                UseHardwareEncoder = options.UseHardwareEncoder,
+            };
+
+            string ffmpegPath = FFmpegBootstrapper.ResolveOrInstall(options.FFmpegPath, options.PluginConfigDirectory);
+            EncoderSelection encoder = FFmpegEncoderSelector.Select(ffmpegPath, encoderConfig);
+            if (!IsCurrentSession(options.SessionId))
+            {
+                firstFrame.ReturnBuffer();
+                return;
+            }
+
+            writer = new FFmpegWriter(
+                ffmpegPath,
+                options.VideoBitrate,
+                encoder.Codec,
+                encoder.Preset,
+                encoder.IsHardware);
+            writer.SetOutputPath(options.OutputPath);
+
+            writer.Start(
+                new VideoFormat(firstFrame.Width, firstFrame.Height, options.TargetFps, firstFrame.PixelFormat),
+                audioFormat);
+
+            lock (_sync)
+            {
+                if (!IsCurrentSessionNoLock(options.SessionId))
+                {
+                    firstFrame.ReturnBuffer();
+                    return;
+                }
+
+                _writer = writer;
+                startedWriter = writer;
+                writer = null;
+                _isRecording = true;
+                _isStartingWriter = false;
+                _recordStart = DateTime.Now;
+                _videoWidth = firstFrame.Width;
+                _videoHeight = firstFrame.Height;
+            }
+
+            startedWriter!.WriteVideoFrame(firstFrame);
+            frameHandedToWriter = true;
+            Interlocked.Increment(ref _frameCount);
+
+            Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, codec={encoder.Codec}, preset={encoder.Preset}, hw={encoder.IsHardware}, encoderReason={encoder.Reason}, asyncStart={startSw.ElapsedMilliseconds}ms");
+        }
+        catch (Exception ex)
+        {
+            if (!frameHandedToWriter)
+                firstFrame.ReturnBuffer();
+
+            Plugin.Log!.Error($"[Record] Failed to start writer: {ex}");
+            AbortStart(options.SessionId);
+        }
+        finally
+        {
+            if (writer != null)
+            {
+                try { writer.Stop(TimeSpan.Zero); } catch { }
+                try { writer.Dispose(); } catch { }
+            }
+        }
+    }
+
+    private AudioFormat? WaitForAudioFormat(RecordingStartOptions options)
+    {
+        if (!options.CaptureAudio)
+        {
+            Plugin.Log.Info("[Record] No audio (disabled), video-only recording.");
+            return null;
+        }
+
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 500)
+        {
+            AudioCaptureService? audioCapture;
+            lock (_sync)
+            {
+                if (!IsCurrentSessionNoLock(options.SessionId))
+                    return null;
+
+                audioCapture = _audioCapture;
+            }
+
+            if (audioCapture == null)
+                return null;
+
+            if (audioCapture.Initialized)
+            {
+                Plugin.Log.Info($"[Record] Audio initialized: {audioCapture.SampleRate}Hz, {audioCapture.Channels}ch, {audioCapture.BitsPerSample}bit");
+                var audioFormat = new AudioFormat(
+                    audioCapture.SampleRate,
+                    audioCapture.Channels,
+                    audioCapture.BitsPerSample,
+                    audioCapture.BitsPerSample == 32);
+                Plugin.Log.Info($"[Record] Audio format: {audioFormat.SampleRate}Hz, {audioFormat.Channels}ch, {audioFormat.BitsPerSample}bit, float={audioFormat.IsFloat}");
+                return audioFormat;
+            }
+
+            if (!string.IsNullOrEmpty(audioCapture.LastError))
+                break;
+
+            Thread.Sleep(25);
+        }
+
+        AudioCaptureService? audioToStop = null;
+        lock (_sync)
+        {
+            if (IsCurrentSessionNoLock(options.SessionId))
+            {
+                audioToStop = _audioCapture;
+                _audioCapture = null;
+            }
+        }
+
+        if (audioToStop != null)
+        {
+            Plugin.Log.Warning($"[Record] Audio init failed or timed out (LastError={audioToStop.LastError}), continuing video-only.");
+            try { audioToStop.Stop(); } catch { }
+            try { audioToStop.Dispose(); } catch { }
+        }
+
+        return null;
     }
 
     private void OnAudioPacket(AudioPacket packet)
     {
-        _writer?.WriteAudioPacket(packet);
+        FFmpegWriter? writer;
+        lock (_sync)
+        {
+            if (_stopRequested)
+                return;
+
+            writer = _writer;
+        }
+
+        writer?.WriteAudioPacket(packet);
+    }
+
+    private bool ShouldCaptureVideoFrame()
+    {
+        lock (_sync)
+        {
+            if (_stopRequested || _startOptions == null || _isStartingWriter)
+                return false;
+
+            return _writer == null || !_writer.IsVideoBackedUp;
+        }
     }
 
     public void StopRecording()
     {
-        if (!_isRecording && _writer == null)
+        StopRecording(waitForFinalize: false);
+    }
+
+    private void StopRecording(bool waitForFinalize)
+    {
+        VideoCaptureService? videoCapture;
+        AudioCaptureService? audioCapture;
+        FFmpegWriter? writer;
+        string? outputPath;
+        TimeSpan finalDuration;
+        Stopwatch stopSw = Stopwatch.StartNew();
+
+        lock (_sync)
         {
-            // 可能还在等待第一帧
-            _videoCapture?.Stop();
-            _videoCapture?.Dispose();
+            if (!HasActiveSessionNoLock())
+                return;
+
+            finalDuration = _isRecording ? DateTime.Now - _recordStart : TimeSpan.Zero;
+            outputPath = _currentFilePath;
+            videoCapture = _videoCapture;
+            audioCapture = _audioCapture;
+            writer = _writer;
+
+            _stopRequested = true;
+            _sessionId++;
+            _startOptions = null;
             _videoCapture = null;
-            _audioCapture?.Stop();
-            _audioCapture?.Dispose();
             _audioCapture = null;
-            _writer?.Dispose();
             _writer = null;
-            return;
+            _isRecording = false;
+            _isStartingWriter = false;
+            _isFinalizing = writer != null || audioCapture != null || videoCapture != null;
         }
 
-        TimeSpan finalDuration = Elapsed;
-        Plugin.Log.Info($"[Record] Stopping... frames={_frameCount}, duration={finalDuration}");
+        Plugin.Log.Info($"[Record] Stopping... frames={FrameCount}, duration={finalDuration}");
 
-        // 停止捕获
-        _videoCapture?.Stop();
-        _audioCapture?.Stop();
+        try { videoCapture?.Stop(); } catch { }
+        Plugin.Log.Info($"[Record] Capture stopped synchronously in {stopSw.ElapsedMilliseconds}ms; finalizing writer in background.");
 
-        // 完成 writer
-        _writer?.Stop(finalDuration);
-        _writer?.Dispose();
-        _writer = null;
+        void FinalizeRecording()
+        {
+            Stopwatch finalizeSw = Stopwatch.StartNew();
+            try { videoCapture?.Dispose(); } catch { }
+            try { audioCapture?.Stop(); } catch { }
+            try { audioCapture?.Dispose(); } catch { }
 
-        // 清理
-        _videoCapture?.Dispose();
-        _videoCapture = null;
-        _audioCapture?.Dispose();
-        _audioCapture = null;
+            try { writer?.Stop(finalDuration); } catch (Exception ex) { Plugin.Log.Warning($"[Record] Writer stop failed: {ex.Message}"); }
+            try { writer?.Dispose(); } catch { }
 
-        _isRecording = false;
+            lock (_sync)
+            {
+                _isFinalizing = false;
+            }
+
+            Plugin.Log.Info($"[Record] Saved: {outputPath}, finalize={finalizeSw.ElapsedMilliseconds}ms");
+        }
+
+        if (waitForFinalize)
+        {
+            FinalizeRecording();
+        }
+        else
+        {
+            var thread = new Thread(FinalizeRecording)
+            {
+                IsBackground = true,
+                Name = "Recorder-Finalize",
+            };
+            thread.Start();
+        }
+
         RecordingStateChanged?.Invoke(false);
+    }
 
-        Plugin.Log.Info($"[Record] Saved: {_currentFilePath}");
+    private void AbortStart(int sessionId)
+    {
+        VideoCaptureService? videoCapture = null;
+        AudioCaptureService? audioCapture = null;
+
+        lock (_sync)
+        {
+            if (_startOptions?.SessionId != sessionId)
+                return;
+
+            videoCapture = _videoCapture;
+            audioCapture = _audioCapture;
+
+            _sessionId++;
+            _startOptions = null;
+            _videoCapture = null;
+            _audioCapture = null;
+            _writer = null;
+            _isRecording = false;
+            _isStartingWriter = false;
+            _isFinalizing = false;
+            _stopRequested = true;
+        }
+
+        try { videoCapture?.Stop(); } catch { }
+        try { videoCapture?.Dispose(); } catch { }
+        try { audioCapture?.Stop(); } catch { }
+        try { audioCapture?.Dispose(); } catch { }
+
+        RecordingStateChanged?.Invoke(false);
+    }
+
+    private bool HasActiveSessionNoLock()
+    {
+        return _startOptions != null ||
+               _videoCapture != null ||
+               _audioCapture != null ||
+               _writer != null ||
+               _isRecording ||
+               _isStartingWriter ||
+               _isFinalizing;
+    }
+
+    private bool IsCurrentSession(int sessionId)
+    {
+        lock (_sync)
+            return IsCurrentSessionNoLock(sessionId);
+    }
+
+    private bool IsCurrentSessionNoLock(int sessionId)
+    {
+        return !_stopRequested && _startOptions?.SessionId == sessionId;
     }
 
     public void Dispose()
     {
-        StopRecording();
+        StopRecording(waitForFinalize: true);
     }
+
+    private sealed record RecordingStartOptions(
+        int SessionId,
+        string OutputPath,
+        string FFmpegPath,
+        string PluginConfigDirectory,
+        int VideoBitrate,
+        int TargetFps,
+        bool CaptureAudio,
+        string VideoCodec,
+        string EncoderPreset,
+        bool UseHardwareEncoder);
+}
+
+internal enum RecordingPhase
+{
+    Idle,
+    Preparing,
+    Recording,
+    Finalizing,
 }

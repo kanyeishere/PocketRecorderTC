@@ -1,9 +1,9 @@
 {
   "Author": "Recorder",
   "Name": "Recorder",
-  "Punchline": "FFXIV 原生音画录制，支持 H.264 + AAC 编码，预留 WebRTC 推流。",
-  "Description": "使用 Windows Media Foundation 进行硬件加速的 H.264 视频和 AAC 音频编码，无需 FFmpeg。通过 D3D11 直接捕获游戏画面，WASAPI Loopback 捕获系统音频。架构预留 WebRTC 推流接口。",
-  "Tags": ["recording", "capture", "video", "audio", "media-foundation"],
+  "Punchline": "FFXIV 音画录制，自动选择硬件编码，支持 H.264 + AAC。",
+  "Description": "通过 D3D11 捕获游戏画面，WASAPI Loopback 捕获系统音频，并使用 FFmpeg 编码为 MP4。若未配置 FFmpeg，插件会在首次录制时自动下载到插件配置目录。架构预留 WebRTC 推流接口。",
+  "Tags": ["recording", "capture", "video", "audio", "ffmpeg"],
   "InternalName": "Recorder",
   "AssemblyVersion": "1.0.0.0",
   "RepoUrl": "",

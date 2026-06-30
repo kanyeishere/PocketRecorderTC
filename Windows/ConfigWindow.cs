@@ -1,9 +1,11 @@
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 using Recorder.Encoding;
+using Recorder.Recording;
 using System;
 using System.IO;
 using System.Numerics;
+using System.Threading;
 
 namespace Recorder.Windows;
 
@@ -11,6 +13,8 @@ internal sealed class ConfigWindow : Window
 {
     private readonly Plugin _plugin;
     private bool _isRecording;
+    private bool _ffmpegInstallInProgress;
+    private string _ffmpegInstallStatus = string.Empty;
 
     public ConfigWindow(Plugin plugin) : base("Recorder 录制器###RecorderConfig")
     {
@@ -57,23 +61,20 @@ internal sealed class ConfigWindow : Window
         // ── FFmpeg 设置 ──
         DrawFFmpegSettings(config);
 
-        // 保存按钮
         ImGui.Separator();
-        if (ImGui.Button("保存设置"))
-        {
-            config.Save(Plugin.PluginInterface);
-        }
+        ImGui.TextDisabled("设置会自动保存");
     }
 
     private void DrawRecordingStatus()
     {
-        if (_isRecording)
+        var phase = _plugin.RecordingService.Phase;
+        if (phase != RecordingPhase.Idle)
         {
             var elapsed = _plugin.RecordingService.Elapsed;
             int frameCount = _plugin.RecordingService.FrameCount;
 
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.3f, 0.3f, 1f));
-            ImGui.Text($"● 录制中  {elapsed:hh\\:mm\\:ss}");
+            ImGui.Text($"{GetPhaseIndicator(phase)} {GetPhaseText(phase)}  {elapsed:hh\\:mm\\:ss}");
             ImGui.PopStyleColor();
             ImGui.Text($"帧数: {frameCount}");
             if (!string.IsNullOrEmpty(_plugin.RecordingService.CurrentFilePath))
@@ -89,12 +90,19 @@ internal sealed class ConfigWindow : Window
 
     private void DrawRecordingControls()
     {
-        if (_isRecording)
+        var phase = _plugin.RecordingService.Phase;
+        if (phase == RecordingPhase.Recording || phase == RecordingPhase.Preparing)
         {
             if (ImGui.Button("■ 停止录制", new Vector2(-1, 32)))
             {
                 _plugin.RecordingService.StopRecording();
             }
+        }
+        else if (phase == RecordingPhase.Finalizing)
+        {
+            ImGui.BeginDisabled();
+            ImGui.Button("保存中", new Vector2(-1, 32));
+            ImGui.EndDisabled();
         }
         else
         {
@@ -106,17 +114,44 @@ internal sealed class ConfigWindow : Window
         ImGui.TextDisabled("快捷命令: /record toggle");
     }
 
+    private static string GetPhaseText(RecordingPhase phase)
+    {
+        return phase switch
+        {
+            RecordingPhase.Preparing => "准备中",
+            RecordingPhase.Recording => "录制中",
+            RecordingPhase.Finalizing => "保存中",
+            _ => "待机中",
+        };
+    }
+
+    private static string GetPhaseIndicator(RecordingPhase phase)
+    {
+        return phase switch
+        {
+            RecordingPhase.Finalizing => "◆",
+            RecordingPhase.Idle => "○",
+            _ => "●",
+        };
+    }
+
     private void DrawVideoSettings(Configuration config)
     {
         ImGui.Text("视频设置");
 
         int bitrate = config.VideoBitrate / 1_000_000;
-        ImGui.SliderInt("码率 (Mbps)", ref bitrate, 1, 100);
-        config.VideoBitrate = bitrate * 1_000_000;
+        if (ImGui.SliderInt("码率 (Mbps)", ref bitrate, 1, 100))
+        {
+            config.VideoBitrate = bitrate * 1_000_000;
+        }
+        SaveConfigAfterItemEdit(config);
 
         int fps = config.TargetFps;
-        ImGui.SliderInt("目标帧率", ref fps, 15, 60);
-        config.TargetFps = fps;
+        if (ImGui.SliderInt("目标帧率", ref fps, 15, 144))
+        {
+            config.TargetFps = fps;
+        }
+        SaveConfigAfterItemEdit(config);
 
         string[] modes = { "自动", "兼容", "高级" };
         int modeIdx = config.VideoCodec == "auto"
@@ -129,25 +164,34 @@ internal sealed class ConfigWindow : Window
                 config.VideoCodec = "auto";
                 config.UseHardwareEncoder = true;
                 config.EncoderPreset = "auto";
+                SaveConfig(config);
             }
             else if (modeIdx == 1)
             {
                 config.VideoCodec = "auto";
                 config.UseHardwareEncoder = false;
                 config.EncoderPreset = "auto";
+                SaveConfig(config);
             }
             else if (config.VideoCodec == "auto")
             {
-                var encoder = FFmpegEncoderSelector.Select(config.GetEffectiveFFmpegPath(), config);
+                string resolvedFFmpeg = FFmpegBootstrapper.ResolveOrInstall(
+                    config.FFmpegPath,
+                    Plugin.PluginInterface.GetPluginConfigDirectory());
+                var encoder = FFmpegEncoderSelector.Select(resolvedFFmpeg, config);
                 config.VideoCodec = encoder.Codec;
                 config.EncoderPreset = "auto";
                 config.UseHardwareEncoder = true;
+                SaveConfig(config);
             }
         }
 
         bool lowLat = config.LowLatencyMode;
-        ImGui.Checkbox("低延迟模式 (WebRTC 预留)", ref lowLat);
-        config.LowLatencyMode = lowLat;
+        if (ImGui.Checkbox("低延迟模式 (WebRTC 预留)", ref lowLat))
+        {
+            config.LowLatencyMode = lowLat;
+            SaveConfig(config);
+        }
         if (lowLat)
         {
             ImGui.SameLine();
@@ -159,8 +203,11 @@ internal sealed class ConfigWindow : Window
     {
         ImGui.Text("音频设置");
         bool audio = config.CaptureAudio;
-        ImGui.Checkbox("录制系统音频 (WASAPI Loopback)", ref audio);
-        config.CaptureAudio = audio;
+        if (ImGui.Checkbox("录制系统音频 (WASAPI Loopback)", ref audio))
+        {
+            config.CaptureAudio = audio;
+            SaveConfig(config);
+        }
     }
 
     private void DrawFFmpegSettings(Configuration config)
@@ -169,11 +216,13 @@ internal sealed class ConfigWindow : Window
 
         // FFmpeg 路径
         string ffmpegPath = config.FFmpegPath;
-        if (ImGui.InputText("FFmpeg 路径 (空=PATH)", ref ffmpegPath, 512))
+        if (ImGui.InputText("FFmpeg 路径 (空=自动)", ref ffmpegPath, 512))
         {
             config.FFmpegPath = ffmpegPath;
         }
-        ImGui.TextDisabled($"当前: {config.GetEffectiveFFmpegPath()}");
+        SaveConfigAfterItemEdit(config);
+        ImGui.TextDisabled($"当前: {config.GetEffectiveFFmpegPath(Plugin.PluginInterface)}");
+        DrawBundledFFmpegControls(config);
 
         ImGui.TextDisabled($"编码模式: {GetEncodingModeText(config)}");
 
@@ -185,6 +234,7 @@ internal sealed class ConfigWindow : Window
             if (ImGui.Combo("视频编码器", ref codecIdx, codecs, codecs.Length))
             {
                 config.VideoCodec = codecs[codecIdx];
+                SaveConfig(config);
             }
 
             string preset = config.EncoderPreset;
@@ -192,8 +242,58 @@ internal sealed class ConfigWindow : Window
             {
                 config.EncoderPreset = preset;
             }
+            SaveConfigAfterItemEdit(config);
             ImGui.TextDisabled($"实际预设: {config.ResolvePreset()}");
         }
+    }
+
+    private void DrawBundledFFmpegControls(Configuration config)
+    {
+        if (_ffmpegInstallInProgress)
+        {
+            ImGui.BeginDisabled();
+            ImGui.Button("下载中", new Vector2(-1, 0));
+            ImGui.EndDisabled();
+        }
+        else if (ImGui.Button("下载/更新内置 FFmpeg", new Vector2(-1, 0)))
+        {
+            StartBundledFFmpegInstall(config);
+        }
+
+        if (!string.IsNullOrWhiteSpace(_ffmpegInstallStatus))
+            ImGui.TextDisabled(_ffmpegInstallStatus);
+    }
+
+    private void StartBundledFFmpegInstall(Configuration config)
+    {
+        _ffmpegInstallInProgress = true;
+        _ffmpegInstallStatus = "正在下载 FFmpeg...";
+
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                string installedPath = FFmpegBootstrapper.InstallOrUpdateBundled(
+                    Plugin.PluginInterface.GetPluginConfigDirectory());
+                config.FFmpegPath = installedPath;
+                config.Save(Plugin.PluginInterface);
+                _ffmpegInstallStatus = $"已安装: {installedPath}";
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log!.Error($"[FFmpeg] Manual install/update failed: {ex}");
+                _ffmpegInstallStatus = $"下载失败: {ex.Message}";
+            }
+            finally
+            {
+                _ffmpegInstallInProgress = false;
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "Recorder-FFmpegInstall",
+        };
+        thread.Start();
     }
 
     private static string GetEncodingModeText(Configuration config)
@@ -215,6 +315,7 @@ internal sealed class ConfigWindow : Window
         {
             config.OutputDirectory = dir;
         }
+        SaveConfigAfterItemEdit(config);
 
         string effectiveDir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
         ImGui.TextDisabled($"当前: {effectiveDir}");
@@ -237,5 +338,16 @@ internal sealed class ConfigWindow : Window
                 Plugin.Log!.Error($"Failed to open directory: {ex}");
             }
         }
+    }
+
+    private static void SaveConfig(Configuration config)
+    {
+        config.Save(Plugin.PluginInterface);
+    }
+
+    private static void SaveConfigAfterItemEdit(Configuration config)
+    {
+        if (ImGui.IsItemDeactivatedAfterEdit())
+            SaveConfig(config);
     }
 }

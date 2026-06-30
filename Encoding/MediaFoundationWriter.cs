@@ -262,26 +262,37 @@ internal sealed unsafe class MediaFoundationWriter : IOutputSink
 
     public void WriteVideoFrame(VideoFrame frame)
     {
-        if (_sinkWriter == null || _finalized) return;
-
-        IMFSample* sample = CreateSampleFromBuffer(frame.Data, frame.TimestampHns);
-        if (sample == null) return;
+        if (_sinkWriter == null || _finalized)
+        {
+            frame.ReturnBuffer();
+            return;
+        }
 
         try
         {
-            // 设置帧持续时间（100ns 单位）
-            long duration = 10_000_000L / _videoFps;
-            sample->SetSampleDuration(duration);
+            IMFSample* sample = CreateSampleFromBuffer(frame.Data, frame.DataLength, frame.TimestampHns);
+            if (sample == null) return;
 
-            int hr = _sinkWriter->WriteSample(_videoStreamIndex, sample);
-            if (hr < 0)
+            try
             {
-                Plugin.Log!.Warning($"WriteSample(video) failed: 0x{hr:X8}");
+                // 设置帧持续时间（100ns 单位）
+                long duration = 10_000_000L / _videoFps;
+                sample->SetSampleDuration(duration);
+
+                int hr = _sinkWriter->WriteSample(_videoStreamIndex, sample);
+                if (hr < 0)
+                {
+                    Plugin.Log!.Warning($"WriteSample(video) failed: 0x{hr:X8}");
+                }
+            }
+            finally
+            {
+                sample->Release();
             }
         }
         finally
         {
-            sample->Release();
+            frame.ReturnBuffer();
         }
     }
 
@@ -289,7 +300,7 @@ internal sealed unsafe class MediaFoundationWriter : IOutputSink
     {
         if (_sinkWriter == null || _finalized || !_hasAudio) return;
 
-        IMFSample* sample = CreateSampleFromBuffer(packet.Data, packet.TimestampHns);
+        IMFSample* sample = CreateSampleFromBuffer(packet.Data, packet.Data.Length, packet.TimestampHns);
         if (sample == null) return;
 
         try
@@ -332,13 +343,13 @@ internal sealed unsafe class MediaFoundationWriter : IOutputSink
         }
     }
 
-    private IMFSample* CreateSampleFromBuffer(byte[] data, long timestampHns)
+    private IMFSample* CreateSampleFromBuffer(byte[] data, int dataLength, long timestampHns)
     {
         int hr;
 
         // 创建内存缓冲区
         IMFMediaBuffer* buffer;
-        hr = MFCreateMemoryBuffer((uint)data.Length, &buffer);
+        hr = MFCreateMemoryBuffer((uint)dataLength, &buffer);
         if (hr < 0)
         {
             Plugin.Log!.Warning($"MFCreateMemoryBuffer failed: 0x{hr:X8}");
@@ -358,8 +369,8 @@ internal sealed unsafe class MediaFoundationWriter : IOutputSink
 
         try
         {
-            Marshal.Copy(data, 0, (IntPtr)pData, data.Length);
-            buffer->SetCurrentLength((uint)data.Length);
+            Marshal.Copy(data, 0, (IntPtr)pData, dataLength);
+            buffer->SetCurrentLength((uint)dataLength);
         }
         finally
         {

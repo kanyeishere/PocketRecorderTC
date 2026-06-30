@@ -85,10 +85,15 @@ public class Configuration : IPluginConfiguration
             : OutputDirectory;
     }
 
-    /// <summary>获取有效的 FFmpeg 路径。空则返回 "ffmpeg"（依赖系统 PATH）。</summary>
-    public string GetEffectiveFFmpegPath()
+    /// <summary>获取有效的 FFmpeg 路径。空则返回插件目录下的自动安装路径。</summary>
+    public string GetEffectiveFFmpegPath(IDalamudPluginInterface? pi = null)
     {
-        return string.IsNullOrWhiteSpace(FFmpegPath) ? "ffmpeg" : FFmpegPath;
+        if (!string.IsNullOrWhiteSpace(FFmpegPath))
+            return FFmpegPath;
+
+        return pi != null
+            ? FFmpegBootstrapper.GetInstalledFFmpegPath(pi.GetPluginConfigDirectory())
+            : "ffmpeg";
     }
 
     /// <summary>解析视频编码器。auto 模式在录制开始时由 FFmpegEncoderSelector 探测。</summary>
