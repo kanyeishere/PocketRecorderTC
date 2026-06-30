@@ -12,6 +12,8 @@
     <Version>1.0.0.0</Version>
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
     <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyName>PocketRecorder</AssemblyName>
+    <RootNamespace>Recorder</RootNamespace>
     <DalamudLibPath>$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
     <DalamudLibPath Condition="Exists('$(APPDATA)\XIVLauncherCN\addon\Hooks\dev\')">$(APPDATA)\XIVLauncherCN\addon\Hooks\dev\</DalamudLibPath>
     <RestoreAdditionalProjectSources>
@@ -22,13 +24,20 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <None Remove="Recorder.json" />
-    <EmbeddedResource Include="Recorder.json" />
-    <Content Include="Recorder.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Remove="PocketRecorder.json" />
+    <EmbeddedResource Include="PocketRecorder.json" />
+    <Content Include="PocketRecorder.json" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Remove="OmenTools\**\*.cs" />
+    <EmbeddedResource Remove="OmenTools\**\*" />
+    <None Remove="OmenTools\**\*" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="OmenTools\OmenTools.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -54,6 +63,14 @@
     </Reference>
     <Reference Include="InteropGenerator.Runtime">
       <HintPath>$(DalamudLibPath)InteropGenerator.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Lumina">
+      <HintPath>$(DalamudLibPath)Lumina.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Lumina.Excel">
+      <HintPath>$(DalamudLibPath)Lumina.Excel.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>

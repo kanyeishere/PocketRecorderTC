@@ -16,7 +16,7 @@ internal sealed class ConfigWindow : Window
     private bool _ffmpegInstallInProgress;
     private string _ffmpegInstallStatus = string.Empty;
 
-    public ConfigWindow(Plugin plugin) : base("Recorder 录制器###RecorderConfig")
+    public ConfigWindow(Plugin plugin) : base("Pocket Recorder###PocketRecorderConfig")
     {
         _plugin = plugin;
         Size = new Vector2(420, 520);
@@ -38,8 +38,11 @@ internal sealed class ConfigWindow : Window
 
         ImGui.Separator();
 
-        // ── 录制控制 ──
         DrawRecordingControls();
+
+        ImGui.Separator();
+
+        DrawAutomationSettings(config);
 
         ImGui.Separator();
 
@@ -112,6 +115,54 @@ internal sealed class ConfigWindow : Window
             }
         }
         ImGui.TextDisabled("快捷命令: /record toggle");
+    }
+
+    private void DrawAutomationSettings(Configuration config)
+    {
+        ImGui.Text("快捷与自动录制");
+
+        bool floating = config.ShowFloatingRecordButton;
+        if (ImGui.Checkbox("显示悬浮录制按钮", ref floating))
+        {
+            config.ShowFloatingRecordButton = floating;
+            _plugin.FloatingRecordWindow.IsOpen = floating;
+            SaveConfig(config);
+        }
+
+        bool autoDuty = config.AutoRecordEightPlayerDuty;
+        if (ImGui.Checkbox("8 人副本倒计时自动录制", ref autoDuty))
+        {
+            config.AutoRecordEightPlayerDuty = autoDuty;
+            SaveConfig(config);
+        }
+
+        ImGui.TextDisabled($"自动录制状态: {_plugin.AutoDutyRecordingService.StatusText}");
+
+        ImGui.Spacing();
+        ImGui.Text("自动录制测试");
+        bool testActive = _plugin.AutoDutyRecordingService.IsTestScenarioActive;
+        if (!testActive)
+        {
+            bool canStartTest = _plugin.RecordingService.Phase == RecordingPhase.Idle;
+            if (!canStartTest)
+                ImGui.BeginDisabled();
+
+            if (ImGui.Button("模拟倒计时开始", new Vector2(-1, 0)))
+                _plugin.AutoDutyRecordingService.StartTestCountdown();
+
+            if (!canStartTest)
+                ImGui.EndDisabled();
+        }
+        else
+        {
+            if (ImGui.Button("模拟团灭停止", new Vector2(-1, 0)))
+                _plugin.AutoDutyRecordingService.StopTestAsWipe();
+
+            if (ImGui.Button("模拟离开副本停止", new Vector2(-1, 0)))
+                _plugin.AutoDutyRecordingService.StopTestAsLeave();
+        }
+
+        ImGui.TextDisabled("测试会生成“自动录制测试-日期-开始时间-结束时间.mp4”。");
     }
 
     private static string GetPhaseText(RecordingPhase phase)

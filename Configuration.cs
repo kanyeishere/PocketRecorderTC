@@ -8,7 +8,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 4;
+    public int Version { get; set; } = 5;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
@@ -43,6 +43,18 @@ public class Configuration : IPluginConfiguration
     /// <summary>录制开始/停止快捷键命令文本。</summary>
     public string ToggleCommand { get; set; } = "/record";
 
+    /// <summary>是否显示一键录制悬浮图标。</summary>
+    public bool ShowFloatingRecordButton { get; set; } = true;
+
+    /// <summary>是否在 8 人副本倒计时开始时自动录制。</summary>
+    public bool AutoRecordEightPlayerDuty { get; set; } = true;
+
+    /// <summary>悬浮录制按钮位置。</summary>
+    public System.Numerics.Vector2 FloatingRecordButtonPosition { get; set; } = new(48f, 180f);
+
+    /// <summary>是否已经保存过悬浮录制按钮位置。</summary>
+    public bool HasFloatingRecordButtonPosition { get; set; } = false;
+
     public static Configuration Load(IDalamudPluginInterface pi)
     {
         var config = (pi.GetPluginConfig() as Configuration) ?? new Configuration();
@@ -67,6 +79,14 @@ public class Configuration : IPluginConfiguration
                 config.EncoderPreset = "auto";
 
             config.Version = 4;
+            config.Save(pi);
+        }
+
+        if (config.Version < 5)
+        {
+            config.ShowFloatingRecordButton = true;
+            config.AutoRecordEightPlayerDuty = true;
+            config.Version = 5;
             config.Save(pi);
         }
 

@@ -154,7 +154,7 @@ internal static class FFmpegBootstrapper
         {
             Timeout = TimeSpan.FromMinutes(10),
         };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("Recorder-DalamudPlugin/1.0");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("PocketRecorder-DalamudPlugin/1.0");
 
         using HttpResponseMessage response = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
         response.EnsureSuccessStatusCode();

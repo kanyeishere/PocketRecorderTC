@@ -31,6 +31,7 @@ internal sealed class RecordingService : IDisposable
     private DateTime _recordStart;
     private int _frameCount;
     private string? _currentFilePath;
+    private Action<RecordingFinishedEventArgs>? _finishedCallback;
 
     // 配置缓存（录制开始时快照）
     private int _videoWidth;
@@ -96,7 +97,12 @@ internal sealed class RecordingService : IDisposable
             StartRecording();
     }
 
-    public void StartRecording()
+    public bool StartRecording()
+    {
+        return StartRecording(null, null);
+    }
+
+    public bool StartRecording(string? outputPath, Action<RecordingFinishedEventArgs>? finishedCallback = null)
     {
         Stopwatch startSw = Stopwatch.StartNew();
         RecordingStartOptions options;
@@ -106,15 +112,16 @@ internal sealed class RecordingService : IDisposable
         lock (_sync)
         {
             if (HasActiveSessionNoLock())
-                return;
+                return false;
 
             var config = _plugin.Config;
             int sessionId = ++_sessionId;
             _videoFps = Math.Max(1, config.TargetFps);
 
             string dir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
-            string fileName = $"FFXIV_{DateTime.Now:yyyyMMdd_HHmmss}.mp4";
-            _currentFilePath = Path.Combine(dir, fileName);
+            _currentFilePath = string.IsNullOrWhiteSpace(outputPath)
+                ? Path.Combine(dir, $"FFXIV_{DateTime.Now:yyyyMMdd_HHmmss}.mp4")
+                : outputPath;
 
             options = new RecordingStartOptions(
                 sessionId,
@@ -136,6 +143,7 @@ internal sealed class RecordingService : IDisposable
             _isStartingWriter = false;
             _isFinalizing = false;
             _stopRequested = false;
+            _finishedCallback = finishedCallback;
             _frameCount = 0;
             _videoWidth = 0;
             _videoHeight = 0;
@@ -168,7 +176,7 @@ internal sealed class RecordingService : IDisposable
                 audioCapture?.Stop();
                 audioCapture?.Dispose();
                 videoCapture.Dispose();
-                return;
+                return false;
             }
 
             _videoCapture = videoCapture;
@@ -179,6 +187,7 @@ internal sealed class RecordingService : IDisposable
         Plugin.Log.Info($"[Record] Preparation started -> {options.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
         Plugin.Log.Info($"[Record] Config: fps={options.TargetFps}, bitrate={options.VideoBitrate}, codec={options.VideoCodec}, preset={options.EncoderPreset}, audio={options.CaptureAudio}, hw={options.UseHardwareEncoder}");
         RecordingStateChanged?.Invoke(true);
+        return true;
     }
 
     private void OnVideoFrame(VideoFrame frame)
@@ -433,6 +442,7 @@ internal sealed class RecordingService : IDisposable
         AudioCaptureService? audioCapture;
         FFmpegWriter? writer;
         string? outputPath;
+        Action<RecordingFinishedEventArgs>? finishedCallback;
         TimeSpan finalDuration;
         Stopwatch stopSw = Stopwatch.StartNew();
 
@@ -443,6 +453,7 @@ internal sealed class RecordingService : IDisposable
 
             finalDuration = _isRecording ? DateTime.Now - _recordStart : TimeSpan.Zero;
             outputPath = _currentFilePath;
+            finishedCallback = _finishedCallback;
             videoCapture = _videoCapture;
             audioCapture = _audioCapture;
             writer = _writer;
@@ -456,6 +467,7 @@ internal sealed class RecordingService : IDisposable
             _isRecording = false;
             _isStartingWriter = false;
             _isFinalizing = writer != null || audioCapture != null || videoCapture != null;
+            _finishedCallback = null;
         }
 
         Plugin.Log.Info($"[Record] Stopping... frames={FrameCount}, duration={finalDuration}");
@@ -479,6 +491,17 @@ internal sealed class RecordingService : IDisposable
             }
 
             Plugin.Log.Info($"[Record] Saved: {outputPath}, finalize={finalizeSw.ElapsedMilliseconds}ms");
+            if (outputPath != null)
+            {
+                try
+                {
+                    finishedCallback?.Invoke(new RecordingFinishedEventArgs(outputPath, finalDuration, writer != null));
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log.Warning($"[Record] Finished callback failed: {ex.Message}");
+                }
+            }
         }
 
         if (waitForFinalize)
@@ -502,6 +525,8 @@ internal sealed class RecordingService : IDisposable
     {
         VideoCaptureService? videoCapture = null;
         AudioCaptureService? audioCapture = null;
+        Action<RecordingFinishedEventArgs>? finishedCallback = null;
+        string? outputPath = null;
 
         lock (_sync)
         {
@@ -510,6 +535,8 @@ internal sealed class RecordingService : IDisposable
 
             videoCapture = _videoCapture;
             audioCapture = _audioCapture;
+            finishedCallback = _finishedCallback;
+            outputPath = _currentFilePath;
 
             _sessionId++;
             _startOptions = null;
@@ -520,6 +547,7 @@ internal sealed class RecordingService : IDisposable
             _isStartingWriter = false;
             _isFinalizing = false;
             _stopRequested = true;
+            _finishedCallback = null;
         }
 
         try { videoCapture?.Stop(); } catch { }
@@ -528,6 +556,18 @@ internal sealed class RecordingService : IDisposable
         try { audioCapture?.Dispose(); } catch { }
 
         RecordingStateChanged?.Invoke(false);
+
+        if (outputPath != null)
+        {
+            try
+            {
+                finishedCallback?.Invoke(new RecordingFinishedEventArgs(outputPath, TimeSpan.Zero, false));
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Warning($"[Record] Abort callback failed: {ex.Message}");
+            }
+        }
     }
 
     private bool HasActiveSessionNoLock()
