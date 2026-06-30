@@ -1,0 +1,28 @@
+# Build outputs
+bin/
+obj/
+
+# IDE and editor state
+.idea/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Logs and local diagnostics
+*.log
+*.tspack
+*.dmp
+
+# Recording outputs
+Recordings/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+
+# OS files
+Thumbs.db
+Desktop.ini
