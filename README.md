@@ -1,6 +1,7 @@
 # Pocket Recorder
-
+<p align="center">
 <img src="images/icon.png" width="96" alt="Pocket Recorder icon">
+</p>
 
 Pocket Recorder 是一个用于 FFXIV / Dalamud 的轻量录制插件。它提供悬浮录制按钮、自动八人本倒计时录制、聊天命令和设置窗口，可以录制游戏画面与系统声音，并输出为 MP4 文件。
 
@@ -75,7 +76,7 @@ FFXIV_yyyyMMdd_HHmmss.mp4
 - 首次使用自动 FFmpeg 下载时需要网络访问；也可以在设置窗口中填写已有的 `ffmpeg.exe` 路径。
 - 录制质量和性能取决于分辨率、帧率、码率和本机编码器能力。若硬件编码不可用，可切换到兼容模式。
 
-## 📄 许可 | License
+## 许可
 
 MIT
 
