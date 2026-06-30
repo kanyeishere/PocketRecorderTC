@@ -11,6 +11,8 @@ namespace Recorder.Windows;
 
 internal sealed class ConfigWindow : Window
 {
+    private const string DiscordInviteUrl = "https://discord.gg/CQd4w7Bzv2";
+
     private readonly Plugin _plugin;
     private bool _isRecording;
     private bool _ffmpegInstallInProgress;
@@ -39,6 +41,8 @@ internal sealed class ConfigWindow : Window
         ImGui.Separator();
 
         DrawRecordingControls();
+
+        DrawCommunityLink();
 
         ImGui.Separator();
 
@@ -122,6 +126,18 @@ internal sealed class ConfigWindow : Window
             }
         }
         ImGui.TextDisabled("快捷命令: /pktr start, /pktr end, /pktr status");
+    }
+
+    private static void DrawCommunityLink()
+    {
+        ImGui.Spacing();
+        if (ImGui.Button("加入 Discord 社群", new Vector2(-1, 0)))
+            OpenDiscordInvite();
+
+        ImGui.TextDisabled(DiscordInviteUrl);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("复制链接##discord"))
+            ImGui.SetClipboardText(DiscordInviteUrl);
     }
 
     private void DrawAutomationSettings(Configuration config)
@@ -388,5 +404,21 @@ internal sealed class ConfigWindow : Window
     {
         if (ImGui.IsItemDeactivatedAfterEdit())
             SaveConfig(config);
+    }
+
+    private static void OpenDiscordInvite()
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = DiscordInviteUrl,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log!.Error($"Failed to open Discord invite: {ex}");
+        }
     }
 }

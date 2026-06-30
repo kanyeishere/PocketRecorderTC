@@ -11,6 +11,9 @@ internal sealed class FloatingRecordWindow : Window
     private readonly Vector2 _buttonSize = new(58f, 58f);
     private readonly Vector2 _windowPadding = new(7f, 7f);
     private bool _wasDragging;
+    private bool _rightDragStartedOnButton;
+    private Vector2 _rightDragStartMousePos;
+    private Vector2 _rightDragStartWindowPos;
     private bool _suppressContextMenuThisFrame;
 
     public FloatingRecordWindow(Plugin plugin) : base("Pocket Recorder###PocketRecorderFloating")
@@ -155,26 +158,42 @@ internal sealed class FloatingRecordWindow : Window
 
     private void HandleRightMouseDrag()
     {
-        if (!ImGui.IsMouseDragging(ImGuiMouseButton.Right))
+        if (!_rightDragStartedOnButton)
         {
-            if (_wasDragging)
+            if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
             {
+                _rightDragStartedOnButton = true;
                 _wasDragging = false;
-                _suppressContextMenuThisFrame = true;
-                _plugin.Config.FloatingRecordButtonPosition = Position ?? ImGui.GetWindowPos();
-                _plugin.Config.HasFloatingRecordButtonPosition = true;
-                _plugin.Config.Save(Plugin.PluginInterface);
+                _rightDragStartMousePos = ImGui.GetMousePos();
+                _rightDragStartWindowPos = Position ?? ImGui.GetWindowPos();
             }
 
             return;
         }
 
-        if (!ImGui.IsItemHovered() && !ImGui.IsItemActive())
-            return;
+        if (!ImGui.IsMouseDown(ImGuiMouseButton.Right))
+        {
+            if (_wasDragging)
+            {
+                _suppressContextMenuThisFrame = true;
+                _plugin.Config.FloatingRecordButtonPosition = Position ?? ImGui.GetWindowPos();
+                _plugin.Config.HasFloatingRecordButtonPosition = true;
+                _plugin.Config.Save(Plugin.PluginInterface);
+            }
+            else
+            {
+                Position = _rightDragStartWindowPos;
+            }
 
-        _wasDragging = true;
-        Position = ImGui.GetWindowPos() + ImGui.GetIO().MouseDelta;
+            _rightDragStartedOnButton = false;
+            _wasDragging = false;
+            return;
+        }
+
+        var dragDelta = ImGui.GetMousePos() - _rightDragStartMousePos;
+        Position = _rightDragStartWindowPos + dragDelta;
         PositionCondition = ImGuiCond.Always;
+        _wasDragging = true;
     }
 
     private static void DrawCornerTicks(ImDrawListPtr draw, Vector2 min, Vector2 max, uint cyan, uint magenta)
