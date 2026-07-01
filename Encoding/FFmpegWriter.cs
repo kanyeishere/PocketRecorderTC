@@ -42,9 +42,6 @@ internal sealed class FFmpegWriter : IOutputSink
     private readonly int _videoBitrate;
     private readonly string _videoCodec;
     private readonly string _preset;
-    private readonly VideoPipelinePerfStats _stdinWritePerfStats = new("FFmpeg stdin.Write", "write");
-    private readonly VideoPipelinePerfStats _nativeSnapshotPerfStats = new("FFmpeg native frame snapshot", "copy");
-    private readonly ManualResetEventSlim _firstVideoFrameWritten = new(false);
 
     public bool SupportsAudio => _hasAudio;
     public bool IsVideoBackedUp => _videoQueue != null && _videoQueue.Count >= MaxQueueSize / 2;
@@ -70,9 +67,6 @@ internal sealed class FFmpegWriter : IOutputSink
         _droppedFrameCount = 0;
         _audioPackets = 0;
         _finalVideoDuration = null;
-        _stdinWritePerfStats.Reset();
-        _nativeSnapshotPerfStats.Reset();
-        _firstVideoFrameWritten.Reset();
 
         // 确保输出目录
         string? dir = Path.GetDirectoryName(_outputPath);
@@ -294,18 +288,17 @@ internal sealed class FFmpegWriter : IOutputSink
 
         long? firstTimestampHns = null;
         long nextOutputFrameIndex = 0;
-        using var lastFrame = new LastVideoFrameCache(this);
+        VideoFrame? lastFrame = null;
+
         foreach (var frame in _videoQueue!.GetConsumingEnumerable())
         {
-            bool frameStored = false;
             try
             {
                 if (firstTimestampHns == null)
                 {
                     firstTimestampHns = frame.TimestampHns;
+                    lastFrame = frame;
                     WriteRawVideoFrame(frame, duplicate: false);
-                    lastFrame.Store(frame);
-                    frameStored = true;
                     nextOutputFrameIndex = 1;
                     continue;
                 }
@@ -313,9 +306,9 @@ internal sealed class FFmpegWriter : IOutputSink
                 long relativeHns = Math.Max(0, frame.TimestampHns - firstTimestampHns.Value);
                 long targetFrameIndex = relativeHns * _videoFps / 10_000_000L;
 
-                while (lastFrame.HasFrame && nextOutputFrameIndex < targetFrameIndex)
+                while (lastFrame != null && nextOutputFrameIndex < targetFrameIndex)
                 {
-                    lastFrame.WriteDuplicate(this);
+                    WriteRawVideoFrame(lastFrame, duplicate: true);
                     nextOutputFrameIndex++;
                 }
 
@@ -325,12 +318,13 @@ internal sealed class FFmpegWriter : IOutputSink
                     nextOutputFrameIndex++;
                 }
 
-                lastFrame.Store(frame);
-                frameStored = true;
+                if (!ReferenceEquals(lastFrame, frame))
+                    lastFrame?.ReturnBuffer();
+                lastFrame = frame;
             }
             catch (Exception ex)
             {
-                if (!frameStored)
+                if (!ReferenceEquals(lastFrame, frame))
                     frame.ReturnBuffer();
                 if (_stopped)
                     Plugin.Log!.Info($"[FFmpeg] Video writer stopped while writing: {ex.Message}");
@@ -340,14 +334,14 @@ internal sealed class FFmpegWriter : IOutputSink
             }
         }
 
-        if (_finalVideoDuration is { } finalDuration && lastFrame.HasFrame)
+        if (_finalVideoDuration is { } finalDuration && lastFrame != null)
         {
             long desiredFrameCount = Math.Max(1, (finalDuration.Ticks * _videoFps + TimeSpan.TicksPerSecond - 1) / TimeSpan.TicksPerSecond);
             while (nextOutputFrameIndex < desiredFrameCount)
             {
                 try
                 {
-                    lastFrame.WriteDuplicate(this);
+                    WriteRawVideoFrame(lastFrame, duplicate: true);
                     nextOutputFrameIndex++;
                 }
                 catch (Exception ex)
@@ -358,52 +352,16 @@ internal sealed class FFmpegWriter : IOutputSink
             }
         }
 
+        lastFrame?.ReturnBuffer();
         DrainQueuedVideoFrames();
-        _stdinWritePerfStats.FlushIfAny();
-        _nativeSnapshotPerfStats.FlushIfAny();
 
         Plugin.Log!.Info($"[FFmpeg] Video writer thread exiting. input={_inputFrameCount}, output={_frameCount}, duplicated={_duplicatedFrameCount}, dropped={_droppedFrameCount}");
     }
 
-    public bool WaitForFirstVideoFrameWritten(int timeoutMs)
-        => _firstVideoFrameWritten.Wait(timeoutMs);
-
     private void WriteRawVideoFrame(VideoFrame frame, bool duplicate)
     {
-        long writeStartTicks = Stopwatch.GetTimestamp();
-        if (frame.IsNative)
-        {
-            unsafe
-            {
-                _stdin!.Write(new ReadOnlySpan<byte>(frame.DataPtr, frame.DataLength));
-            }
-            long writeTicks = Stopwatch.GetTimestamp() - writeStartTicks;
-            ReadOnlySpan<long> perfTicks = stackalloc long[] { writeTicks };
-            _stdinWritePerfStats.Record(frame.Width, frame.Height, frame.DataLength, frame.PixelFormat, perfTicks);
-            RecordWrittenVideoFrame(duplicate);
-            return;
-        }
-
-        WriteRawVideoFrame(frame.Data.AsSpan(0, frame.DataLength), duplicate, frame.Width, frame.Height, frame.PixelFormat);
-    }
-
-    private void WriteRawVideoFrame(ReadOnlySpan<byte> data, bool duplicate, int width, int height, VideoPixelFormat pixelFormat)
-    {
-        long writeStartTicks = Stopwatch.GetTimestamp();
-        _stdin!.Write(data);
-        long writeTicks = Stopwatch.GetTimestamp() - writeStartTicks;
-        ReadOnlySpan<long> perfTicks = stackalloc long[] { writeTicks };
-        _stdinWritePerfStats.Record(width, height, data.Length, pixelFormat, perfTicks);
-
-        RecordWrittenVideoFrame(duplicate);
-    }
-
-    private void RecordWrittenVideoFrame(bool duplicate)
-    {
+        _stdin!.Write(frame.Data, 0, frame.DataLength);
         _frameCount++;
-        if (_frameCount == 1)
-            _firstVideoFrameWritten.Set();
-
         if (duplicate)
             _duplicatedFrameCount++;
 
@@ -424,113 +382,6 @@ internal sealed class FFmpegWriter : IOutputSink
         }
 
         return drained;
-    }
-
-    private sealed class LastVideoFrameCache : IDisposable
-    {
-        private readonly FFmpegWriter _writer;
-        private VideoFrame? _retainedFrame;
-        private byte[]? _snapshotBuffer;
-
-        public LastVideoFrameCache(FFmpegWriter writer)
-        {
-            _writer = writer;
-        }
-
-        public bool HasFrame => _retainedFrame != null || _snapshotBuffer != null;
-        public int DataLength { get; private set; }
-        public int Width { get; private set; }
-        public int Height { get; private set; }
-        public VideoPixelFormat PixelFormat { get; private set; }
-
-        public void Store(VideoFrame frame)
-        {
-            if (frame.IsNative)
-            {
-                StoreNativeSnapshot(frame);
-                return;
-            }
-
-            ReleaseRetainedFrame();
-            ReleaseSnapshotBuffer();
-            _retainedFrame = frame;
-            DataLength = frame.DataLength;
-            Width = frame.Width;
-            Height = frame.Height;
-            PixelFormat = frame.PixelFormat;
-        }
-
-        public void WriteDuplicate(FFmpegWriter writer)
-        {
-            if (_retainedFrame != null)
-            {
-                writer.WriteRawVideoFrame(_retainedFrame, duplicate: true);
-                return;
-            }
-
-            if (_snapshotBuffer != null)
-            {
-                writer.WriteRawVideoFrame(
-                    _snapshotBuffer.AsSpan(0, DataLength),
-                    duplicate: true,
-                    Width,
-                    Height,
-                    PixelFormat);
-            }
-        }
-
-        private unsafe void StoreNativeSnapshot(VideoFrame frame)
-        {
-            ReleaseRetainedFrame();
-            EnsureSnapshotBuffer(frame.DataLength);
-            long copyStartTicks = Stopwatch.GetTimestamp();
-            new ReadOnlySpan<byte>(frame.DataPtr, frame.DataLength).CopyTo(_snapshotBuffer!.AsSpan(0, frame.DataLength));
-            long copyTicks = Stopwatch.GetTimestamp() - copyStartTicks;
-            DataLength = frame.DataLength;
-            Width = frame.Width;
-            Height = frame.Height;
-            PixelFormat = frame.PixelFormat;
-            int width = frame.Width;
-            int height = frame.Height;
-            int dataLength = frame.DataLength;
-            VideoPixelFormat pixelFormat = frame.PixelFormat;
-            frame.ReturnBuffer();
-            ReadOnlySpan<long> perfTicks = stackalloc long[] { copyTicks };
-            _writer._nativeSnapshotPerfStats.Record(width, height, dataLength, pixelFormat, perfTicks);
-        }
-
-        private void EnsureSnapshotBuffer(int minimumLength)
-        {
-            if (_snapshotBuffer != null && _snapshotBuffer.Length >= minimumLength)
-                return;
-
-            ReleaseSnapshotBuffer();
-            _snapshotBuffer = VideoFrame.RentBuffer(minimumLength);
-        }
-
-        private void ReleaseRetainedFrame()
-        {
-            if (_retainedFrame == null)
-                return;
-
-            _retainedFrame.ReturnBuffer();
-            _retainedFrame = null;
-        }
-
-        private void ReleaseSnapshotBuffer()
-        {
-            if (_snapshotBuffer == null)
-                return;
-
-            VideoFrame.ReturnBuffer(_snapshotBuffer);
-            _snapshotBuffer = null;
-        }
-
-        public void Dispose()
-        {
-            ReleaseRetainedFrame();
-            ReleaseSnapshotBuffer();
-        }
     }
 
     /// <summary>音频写入线程：从队列取包写入命名管道。</summary>
@@ -628,6 +479,5 @@ internal sealed class FFmpegWriter : IOutputSink
         try { _audioPipe?.Dispose(); } catch { }
         try { _videoQueue?.Dispose(); } catch { }
         try { _audioQueue?.Dispose(); } catch { }
-        try { _firstVideoFrameWritten.Dispose(); } catch { }
     }
 }

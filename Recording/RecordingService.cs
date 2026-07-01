@@ -211,15 +211,15 @@ internal sealed class RecordingService : IDisposable
                 return;
             }
 
-            if (_lifecycle == RecordingLifecycle.StartingWriter)
-            {
-                frame.ReturnBuffer();
-                return;
-            }
-
             writer = _writer;
             if (writer == null)
             {
+                if (_lifecycle == RecordingLifecycle.StartingWriter)
+                {
+                    frame.ReturnBuffer();
+                    return;
+                }
+
                 _lifecycle = RecordingLifecycle.StartingWriter;
                 _videoWidth = frame.Width;
                 _videoHeight = frame.Height;
@@ -278,19 +278,11 @@ internal sealed class RecordingService : IDisposable
     {
         Stopwatch startSw = Stopwatch.StartNew();
         IOutputSink? writer = null;
+        IOutputSink? startedWriter = null;
         bool frameHandedToWriter = false;
-        bool writerPublished = false;
 
         try
         {
-            if (!IsCurrentSession(options.SessionId))
-            {
-                firstFrame.ReturnBuffer();
-                return;
-            }
-
-            firstFrame = firstFrame.DetachToManagedCopyIfNative();
-
             AudioFormat? audioFormat = WaitForAudioFormat(options);
             if (!IsCurrentSession(options.SessionId))
             {
@@ -327,41 +319,25 @@ internal sealed class RecordingService : IDisposable
 
             lock (_sync)
             {
-                if (!IsCurrentSessionNoLock(options.SessionId) ||
-                    _lifecycle != RecordingLifecycle.StartingWriter)
+                if (!IsCurrentSessionNoLock(options.SessionId))
                 {
                     firstFrame.ReturnBuffer();
                     return;
                 }
 
                 _writer = writer;
+                startedWriter = writer;
+                writer = null;
+                _lifecycle = RecordingLifecycle.Recording;
+                _recordStart = DateTime.Now;
                 _videoWidth = firstFrame.Width;
                 _videoHeight = firstFrame.Height;
                 _videoPixelFormat = firstFrame.PixelFormat;
-                writerPublished = true;
             }
 
-            writer!.WriteVideoFrame(firstFrame);
+            startedWriter!.WriteVideoFrame(firstFrame);
             frameHandedToWriter = true;
             Interlocked.Increment(ref _frameCount);
-
-            if (writer is FFmpegWriter ffmpegWriter &&
-                !ffmpegWriter.WaitForFirstVideoFrameWritten(1_000))
-            {
-                Plugin.Log!.Warning("[Record] FFmpeg did not accept the first video frame within 1000ms; starting capture anyway.");
-            }
-
-            lock (_sync)
-            {
-                if (!IsCurrentSessionNoLock(options.SessionId) ||
-                    !ReferenceEquals(_writer, writer))
-                {
-                    return;
-                }
-
-                _lifecycle = RecordingLifecycle.Recording;
-                _recordStart = DateTime.Now;
-            }
 
             Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, codec={encoder.Codec}, preset={encoder.Preset}, hw={encoder.IsHardware}, encoderReason={encoder.Reason}, asyncStart={startSw.ElapsedMilliseconds}ms");
         }
@@ -375,7 +351,7 @@ internal sealed class RecordingService : IDisposable
         }
         finally
         {
-            if (writer != null && !writerPublished)
+            if (writer != null)
             {
                 try { writer.Stop(TimeSpan.Zero); } catch { }
                 try { writer.Dispose(); } catch { }
@@ -508,39 +484,16 @@ internal sealed class RecordingService : IDisposable
 
         Plugin.Log.Info($"[Record] Stopping... frames={FrameCount}, duration={finalDuration}");
 
-        try { videoCapture?.RequestStop(); } catch { }
-        string finalizeMode = waitForFinalize ? "synchronously" : "in background";
-        Plugin.Log.Info($"[Record] Capture stop requested in {stopSw.ElapsedMilliseconds}ms; finalizing {finalizeMode}.");
+        try { videoCapture?.Stop(); } catch { }
+        Plugin.Log.Info($"[Record] Capture stopped synchronously in {stopSw.ElapsedMilliseconds}ms; finalizing writer in background.");
 
         void FinalizeRecording()
         {
             Stopwatch finalizeSw = Stopwatch.StartNew();
-            try
-            {
-                videoCapture?.Stop();
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.Warning($"[Record] Video capture stop failed: {ex.Message}");
-            }
-
-            Plugin.Log.Info($"[Record] Capture stopped after {stopSw.ElapsedMilliseconds}ms; finalizing writer.");
-
+            DisposeVideoCapture(videoCapture);
             StopAndDisposeAudioCapture(audioCapture);
 
-            try
-            {
-                writer?.Stop(finalDuration);
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.Warning($"[Record] Writer stop failed: {ex.Message}");
-            }
-            finally
-            {
-                DisposeVideoCapture(videoCapture);
-            }
-
+            try { writer?.Stop(finalDuration); } catch (Exception ex) { Plugin.Log.Warning($"[Record] Writer stop failed: {ex.Message}"); }
             try { writer?.Dispose(); } catch { }
 
             lock (_sync)

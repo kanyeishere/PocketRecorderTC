@@ -4,7 +4,6 @@ using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Threading;
 using TerraFX.Interop.DirectX;
 using DXGI_FORMAT = TerraFX.Interop.DirectX.DXGI_FORMAT;
 
@@ -37,8 +36,6 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     private ID3D11ComputeShader* _nv12ComputeShader;
     private IntPtr _nv12ShaderDevice;
     private readonly IntPtr[] _nv12ReadbackBuffers = new IntPtr[StagingTextureCount];
-    private readonly int[] _nv12ReadbackSlotStates = new int[StagingTextureCount];
-    private ID3D11DeviceContext* _nv12DrainContext;
     private uint _nv12SourceWidth;
     private uint _nv12SourceHeight;
     private uint _nv12OutputWidth;
@@ -50,21 +47,15 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     private int _nv12ReadyCount;
     private bool _nv12Disabled;
     private bool _nv12FallbackLogged;
-    private int _nv12BusySkipCount;
-    private int _nv12BusySkipSuppressed;
-    private long _lastNv12BusyLogTicks;
     private VideoPixelFormat? _lockedOutputPixelFormat;
-    private readonly VideoPipelinePerfStats _nv12PerfStats = new("NV12 capture", "map", "copy", "onFrame", "total");
 
     // Present Hook
     private Hook<PresentDelegate>? _presentHook;
 
     // 状态
-    private volatile bool _capturing;
+    private bool _capturing;
     private bool _disposed;
-    private int _stopStarted;
     private int _targetFps = 60;
-    private long _minFrameIntervalTicks;
     private long _lastFrameTicks;
     private readonly Stopwatch _sw = new();
     private int _frameCount;
@@ -77,14 +68,9 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     private bool _diagnosedReadbackFrame;
     private bool _loggedBackBufferSuccess;
     private string _captureMethod = "unknown";
-    private int _presentDetourDepth;
 
     private const int MaxConsecutiveEmptyFramesBeforeWarning = 3;
     private const int StagingTextureCount = 3;
-    private const int Nv12SlotAvailable = 0;
-    private const int Nv12SlotReady = 1;
-    private const int Nv12SlotMapped = 2;
-    private const int Nv12SlotPendingRelease = 3;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
     private const string Nv12ComputeShaderSource = @"
 Texture2D<float4> SourceTexture : register(t0);
@@ -182,8 +168,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     public bool Start(int targetFps)
     {
-        _targetFps = Math.Max(1, targetFps);
-        _minFrameIntervalTicks = Math.Max(1, Stopwatch.Frequency / _targetFps);
+        _targetFps = targetFps;
         _capturing = false;
         _frameCount = 0;
         _skipCount = 0;
@@ -196,14 +181,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         _loggedBackBufferSuccess = false;
         _nv12Disabled = false;
         _nv12FallbackLogged = false;
-        _nv12BusySkipCount = 0;
-        _nv12BusySkipSuppressed = 0;
-        _lastNv12BusyLogTicks = 0;
         _lockedOutputPixelFormat = null;
-        _presentDetourDepth = 0;
-        _stopStarted = 0;
-        Array.Clear(_nv12ReadbackSlotStates);
-        _nv12PerfStats.Reset();
         _lastFrameTicks = 0;
         _sw.Restart();
 
@@ -211,7 +189,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         {
             _capturing = true;
             _captureMethod = "PresentHook";
-            Plugin.Log!.Info($"[Video] Capture started, targetFps={_targetFps}, method=PresentHook");
+            Plugin.Log!.Info($"[Video] Capture started, targetFps={targetFps}, method=PresentHook");
             return true;
         }
 
@@ -223,10 +201,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     public void Stop()
     {
-        if (Interlocked.Exchange(ref _stopStarted, 1) != 0)
-            return;
-
-        RequestStop();
+        _capturing = false;
 
         // 卸载 hook
         if (_presentHook != null)
@@ -236,22 +211,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                 try { _presentHook.Disable(); } catch { }
                 _presentHookEnabled = false;
             }
-        }
-
-        WaitForPresentDetoursToDrain();
-        if (_presentHook != null)
-        {
             _presentHook.Dispose();
             _presentHook = null;
         }
-        _sw.Stop();
-        _nv12PerfStats.FlushIfAny();
-        Plugin.Log!.Info($"[Video] Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, nv12BusySkips={_nv12BusySkipCount}, errors={_errorCount}, method={_captureMethod}");
-    }
 
-    public void RequestStop()
-    {
-        _capturing = false;
+        _sw.Stop();
+        Plugin.Log!.Info($"[Video] Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, errors={_errorCount}, method={_captureMethod}");
     }
 
     // ──────────────────────────────────────────────────────────
@@ -325,7 +290,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     private int OnPresentDetour(IntPtr swapChainPtr, uint syncInterval, uint flags)
     {
-        Interlocked.Increment(ref _presentDetourDepth);
         if (_capturing)
         {
             try
@@ -340,20 +304,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             }
         }
 
-        try
-        {
-            return _presentHook!.Original(swapChainPtr, syncInterval, flags);
-        }
-        finally
-        {
-            Interlocked.Decrement(ref _presentDetourDepth);
-        }
+        return _presentHook!.Original(swapChainPtr, syncInterval, flags);
     }
 
     private void CaptureBeforePresent(IntPtr swapChainPtr)
     {
         long now = _sw.ElapsedTicks;
-        if (now - _lastFrameTicks < _minFrameIntervalTicks) return;
+        long minInterval = Stopwatch.Frequency / _targetFps;
+        if (now - _lastFrameTicks < minInterval) return;
         _lastFrameTicks = now;
         if (ShouldSkipCaptureForBackpressure()) return;
 
@@ -378,8 +336,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
         try
         {
-            DrainDeferredNv12Resources(ctx);
-
             ID3D11Texture2D* backBuffer = null;
             Guid iidTex2D = IID_ID3D11Texture2D;
             int hr = swapChain->GetBuffer(0, &iidTex2D, (void**)&backBuffer);
@@ -441,10 +397,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
         uint outputWidth = AlignUp(width, 4);
         uint outputHeight = AlignUp(height, 2);
-        long perfStartTicks = 0;
-        long perfMapTicks = 0;
-        long perfCopyTicks = 0;
-        long perfOnFrameTicks = 0;
 
         try
         {
@@ -454,22 +406,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                        SkipLockedNv12Frame("NV12 resources could not be created");
             }
 
-            perfStartTicks = Stopwatch.GetTimestamp();
-
-            DrainNv12ReleasedSlots(ctx);
-
-            int writeSlot = _nv12WriteIndex;
-            if (!IsNv12SlotAvailable(writeSlot))
-            {
-                SkipNv12FrameForBusySlot(writeSlot);
-                return true;
-            }
-
             ID3D11Buffer* writeBuffer = _nv12OutputBuffer;
-            int readSlot = _nv12ReadyCount >= StagingTextureCount - 1
-                ? (_nv12WriteIndex + 1) % StagingTextureCount
-                : -1;
-            ID3D11Buffer* readBuffer = readSlot >= 0 ? (ID3D11Buffer*)_nv12ReadbackBuffers[readSlot] : null;
+            ID3D11Buffer* readBuffer = _nv12ReadyCount >= StagingTextureCount - 1
+                ? (ID3D11Buffer*)_nv12ReadbackBuffers[(_nv12WriteIndex + 1) % StagingTextureCount]
+                : null;
 
             bool mappedOk = false;
             string? disableNv12AfterReadback = null;
@@ -478,47 +418,35 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             D3D11_MAPPED_SUBRESOURCE mapped;
             try
             {
-                long copyStartTicks = Stopwatch.GetTimestamp();
                 ctx->CopyResource((ID3D11Resource*)_nv12SourceTexture, (ID3D11Resource*)srcTexture);
                 DispatchNv12Conversion(ctx, width, height, outputWidth, outputHeight, format);
 
-                ID3D11Buffer* stagingWrite = (ID3D11Buffer*)_nv12ReadbackBuffers[writeSlot];
+                ID3D11Buffer* stagingWrite = (ID3D11Buffer*)_nv12ReadbackBuffers[_nv12WriteIndex];
                 ctx->CopyResource((ID3D11Resource*)stagingWrite, (ID3D11Resource*)writeBuffer);
-                perfCopyTicks = Stopwatch.GetTimestamp() - copyStartTicks;
 
-                Volatile.Write(ref _nv12ReadbackSlotStates[writeSlot], Nv12SlotReady);
-                _nv12WriteIndex = (writeSlot + 1) % StagingTextureCount;
+                _nv12WriteIndex = (_nv12WriteIndex + 1) % StagingTextureCount;
                 if (_nv12ReadyCount < StagingTextureCount)
                     _nv12ReadyCount++;
 
                 if (readBuffer == null)
                     return true;
 
-                if (!IsNv12SlotReady(readSlot))
-                {
-                    SkipNv12FrameForBusySlot(readSlot);
-                    return true;
-                }
-
-                long mapStartTicks = Stopwatch.GetTimestamp();
                 if (!TryMapReadbackResource(ctx, (ID3D11Resource*)readBuffer, "NV12", out mapped))
-                {
-                    perfMapTicks = Stopwatch.GetTimestamp() - mapStartTicks;
                     return true;
-                }
-
-                perfMapTicks = Stopwatch.GetTimestamp() - mapStartTicks;
 
                 mappedOk = true;
 
-                byte* data = (byte*)mapped.pData;
+                byte[]? rentedBuffer = VideoFrame.RentBuffer(_nv12DataSize);
+                byte[] buffer = rentedBuffer;
                 try
                 {
-                    bool isEmptyFrame = VideoFrameContentAnalyzer.IsNv12FrameEmpty(data, (int)outputWidth, (int)outputHeight);
+                    Marshal.Copy((IntPtr)mapped.pData, buffer, 0, _nv12DataSize);
+
+                    bool isEmptyFrame = IsNv12FrameEmpty(buffer, (int)outputWidth, (int)outputHeight);
                     if (readbackDiagnosticsPending && ClaimReadbackDiagnostic())
                     {
                         Plugin.Log!.Info($"[Video] NV12 path enabled: source={width}x{height}, encoded={outputWidth}x{outputHeight}, bytes={_nv12DataSize}, sourceFormat={format}");
-                        DiagnoseNv12PixelsPtr(data, (int)outputWidth, (int)outputHeight);
+                        DiagnoseNv12Pixels(buffer, (int)outputWidth, (int)outputHeight);
                     }
 
                     if (isEmptyFrame)
@@ -536,21 +464,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                         _consecutiveBlackFrames = 0;
                         long timestampHns = timestampTicks * 10_000_000L / Stopwatch.Frequency;
                         _lockedOutputPixelFormat ??= VideoPixelFormat.Nv12;
-                        Volatile.Write(ref _nv12ReadbackSlotStates[readSlot], Nv12SlotMapped);
-                        mappedOk = false;
-                        frame = new VideoFrame(
-                            data,
-                            _nv12DataSize,
-                            (int)outputWidth,
-                            (int)outputHeight,
-                            (int)outputWidth,
-                            timestampHns,
-                            VideoPixelFormat.Nv12,
-                            () => RequestNv12SlotRelease(readSlot));
+                        frame = new VideoFrame(buffer, _nv12DataSize, (int)outputWidth, (int)outputHeight, (int)outputWidth, timestampHns, VideoPixelFormat.Nv12, ownsBuffer: true);
+                        rentedBuffer = null;
                     }
                 }
                 finally
                 {
+                    if (rentedBuffer != null)
+                        VideoFrame.ReturnBuffer(rentedBuffer);
                 }
             }
             finally
@@ -570,31 +491,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                 bool delivered = false;
                 try
                 {
-                    long onFrameStartTicks = Stopwatch.GetTimestamp();
                     _onFrame(frame);
-                    perfOnFrameTicks = Stopwatch.GetTimestamp() - onFrameStartTicks;
                     delivered = true;
                 }
                 finally
                 {
                     if (!delivered)
-                    {
-                        if (perfOnFrameTicks == 0)
-                            perfOnFrameTicks = Stopwatch.GetTimestamp() - perfStartTicks;
                         frame.ReturnBuffer();
-                    }
                 }
-
-                DrainNv12ReleasedSlots(ctx);
-
-                ReadOnlySpan<long> perfTicks = stackalloc long[]
-                {
-                    perfMapTicks,
-                    perfCopyTicks,
-                    perfOnFrameTicks,
-                    Stopwatch.GetTimestamp() - perfStartTicks,
-                };
-                _nv12PerfStats.Record((int)outputWidth, (int)outputHeight, _nv12DataSize, VideoPixelFormat.Nv12, perfTicks);
 
                 _frameCount++;
 
@@ -713,7 +617,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                             }
                         }
 
-                        bool isEmptyFrame = VideoFrameContentAnalyzer.IsBgraFrameEmpty(buffer, (int)width, (int)height, dstStride);
+                        bool isEmptyFrame = IsFrameEmpty(buffer, (int)width, (int)height, dstStride);
 
                         if (readbackDiagnosticsPending && ClaimReadbackDiagnostic())
                         {
@@ -888,6 +792,22 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         }
 
         return false;
+    }
+
+    private static bool IsFrameEmpty(byte[] buffer, int width, int height, int stride)
+    {
+        int[] xs = { width / 4, width / 2, width * 3 / 4 };
+        int[] ys = { height / 4, height / 2, height * 3 / 4 };
+        foreach (int y in ys)
+        {
+            foreach (int x in xs)
+            {
+                int idx = y * stride + x * 4;
+                if (buffer[idx] != 0 || buffer[idx + 1] != 0 || buffer[idx + 2] != 0 || buffer[idx + 3] != 0)
+                    return false;
+            }
+        }
+        return true;
     }
 
     private static void DiagnosePixels(byte[] buffer, int width, int height, int stride)
@@ -1108,7 +1028,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         _nv12DataSize = dataSize;
         _nv12WriteIndex = 0;
         _nv12ReadyCount = 0;
-        EnsureNv12DrainContext();
         return true;
     }
 
@@ -1274,10 +1193,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     private void DisableNv12Path(string reason)
     {
         _nv12Disabled = true;
-        if (!HasOutstandingNv12Readbacks())
-        {
-            ReleaseNv12Resources();
-        }
+        ReleaseNv12Resources();
         if (!_nv12FallbackLogged)
         {
             _nv12FallbackLogged = true;
@@ -1285,74 +1201,26 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         }
     }
 
-    private bool IsNv12SlotAvailable(int slot)
-        => slot >= 0 && slot < StagingTextureCount &&
-           Volatile.Read(ref _nv12ReadbackSlotStates[slot]) == Nv12SlotAvailable;
-
-    private bool IsNv12SlotReady(int slot)
-        => slot >= 0 && slot < StagingTextureCount &&
-           Volatile.Read(ref _nv12ReadbackSlotStates[slot]) == Nv12SlotReady;
-
-    private bool IsNv12SlotPendingRelease(int slot)
-        => slot >= 0 && slot < StagingTextureCount &&
-           Volatile.Read(ref _nv12ReadbackSlotStates[slot]) == Nv12SlotPendingRelease;
-
-    private void RequestNv12SlotRelease(int slot)
+    private static bool IsNv12FrameEmpty(byte[] buffer, int width, int height)
     {
-        if (slot < 0 || slot >= StagingTextureCount)
-            return;
-
-        int previous = Interlocked.CompareExchange(ref _nv12ReadbackSlotStates[slot], Nv12SlotPendingRelease, Nv12SlotMapped);
-        if (previous == Nv12SlotMapped)
-            return;
-
-        if (previous == Nv12SlotReady)
+        int[] xs = { width / 4, width / 2, width * 3 / 4 };
+        int[] ys = { height / 4, height / 2, height * 3 / 4 };
+        foreach (int y in ys)
         {
-            Interlocked.Exchange(ref _nv12ReadbackSlotStates[slot], Nv12SlotAvailable);
-        }
-    }
-
-    private void DrainNv12ReleasedSlots(ID3D11DeviceContext* ctx)
-    {
-        for (int i = 0; i < StagingTextureCount; i++)
-        {
-            if (!IsNv12SlotPendingRelease(i))
-                continue;
-
-            ID3D11Buffer* buffer = (ID3D11Buffer*)_nv12ReadbackBuffers[i];
-            if (buffer == null)
-                continue;
-
-            ctx->Unmap((ID3D11Resource*)buffer, 0);
-            Volatile.Write(ref _nv12ReadbackSlotStates[i], Nv12SlotAvailable);
-        }
-    }
-
-    private void SkipNv12FrameForBusySlot(int slot)
-    {
-        if (slot < 0)
-            return;
-
-        _nv12BusySkipCount++;
-
-        long now = Stopwatch.GetTimestamp();
-        bool shouldLog = _nv12BusySkipCount <= 3 ||
-                         now - _lastNv12BusyLogTicks >= Stopwatch.Frequency;
-        if (!shouldLog)
-        {
-            _nv12BusySkipSuppressed++;
-            return;
+            foreach (int x in xs)
+            {
+                int evenX = x & ~1;
+                int evenY = y & ~1;
+                int uvBase = width * height + (evenY / 2) * width + evenX;
+                if (buffer[y * width + x] != 0 || buffer[uvBase] != 0 || buffer[uvBase + 1] != 0)
+                    return false;
+            }
         }
 
-        int suppressed = _nv12BusySkipSuppressed;
-        _nv12BusySkipSuppressed = 0;
-        _lastNv12BusyLogTicks = now;
-
-        string suffix = suppressed > 0 ? $", suppressed={suppressed}" : string.Empty;
-        Plugin.Log!.Info($"[Video] NV12 slot busy, skipped frame. slot={slot}, busySkips={_nv12BusySkipCount}{suffix}");
+        return true;
     }
 
-    private static unsafe void DiagnoseNv12PixelsPtr(byte* data, int width, int height)
+    private static void DiagnoseNv12Pixels(byte[] buffer, int width, int height)
     {
         (int x, int y)[] pts =
         {
@@ -1367,10 +1235,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         {
             int evenX = x & ~1;
             int evenY = y & ~1;
-            int yValue = data[y * width + x];
+            int yValue = buffer[y * width + x];
             int uvBase = width * height + (evenY / 2) * width + evenX;
-            int uValue = data[uvBase];
-            int vValue = data[uvBase + 1];
+            int uValue = buffer[uvBase];
+            int vValue = buffer[uvBase + 1];
             sb.Append($" ({x},{y})=[Y{yValue},U{uValue},V{vValue}]");
         }
 
@@ -1395,11 +1263,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     private void ReleaseNv12Resources()
     {
-        if (_nv12DrainContext != null)
-        {
-            DrainNv12ReleasedSlots(_nv12DrainContext);
-        }
-
         if (_nv12SourceSrv != null)
         {
             _nv12SourceSrv->Release();
@@ -1437,7 +1300,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
             ((ID3D11Buffer*)_nv12ReadbackBuffers[i])->Release();
             _nv12ReadbackBuffers[i] = IntPtr.Zero;
-            _nv12ReadbackSlotStates[i] = Nv12SlotAvailable;
         }
 
         _nv12SourceWidth = 0;
@@ -1449,12 +1311,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         _nv12DataSize = 0;
         _nv12WriteIndex = 0;
         _nv12ReadyCount = 0;
-
-        if (_nv12DrainContext != null)
-        {
-            _nv12DrainContext->Release();
-            _nv12DrainContext = null;
-        }
     }
 
     private void ReleaseNv12Shader()
@@ -1468,61 +1324,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         _nv12ShaderDevice = IntPtr.Zero;
     }
 
-    private bool EnsureNv12DrainContext()
-    {
-        if (_nv12DrainContext != null)
-            return true;
-
-        if (_device == null)
-            return false;
-
-        ID3D11DeviceContext* drainContext = null;
-        _device->GetImmediateContext(&drainContext);
-        if (drainContext == null)
-        {
-            Plugin.Log!.Warning("[Video] Failed to acquire NV12 drain context.");
-            return false;
-        }
-
-        _nv12DrainContext = drainContext;
-        return true;
-    }
-
-    private void DrainDeferredNv12Resources(ID3D11DeviceContext* ctx)
-    {
-        if (!_nv12Disabled || _nv12DrainContext == null)
-            return;
-
-        DrainNv12ReleasedSlots(ctx);
-        if (!HasOutstandingNv12Readbacks())
-            ReleaseNv12Resources();
-    }
-
-    private bool HasOutstandingNv12Readbacks()
-    {
-        for (int i = 0; i < _nv12ReadbackSlotStates.Length; i++)
-        {
-            int state = Volatile.Read(ref _nv12ReadbackSlotStates[i]);
-            if (state == Nv12SlotMapped || state == Nv12SlotPendingRelease)
-                return true;
-        }
-
-        return false;
-    }
-
-    private void WaitForPresentDetoursToDrain()
-    {
-        if (Volatile.Read(ref _presentDetourDepth) == 0)
-            return;
-
-        Stopwatch waitSw = Stopwatch.StartNew();
-        while (Volatile.Read(ref _presentDetourDepth) > 0 && waitSw.ElapsedMilliseconds < 250)
-            Thread.Sleep(1);
-
-        if (Volatile.Read(ref _presentDetourDepth) > 0)
-            Plugin.Log!.Warning($"[Video] Present detours did not drain within {waitSw.ElapsedMilliseconds}ms.");
-    }
-
     public void Dispose()
     {
         if (_disposed) return;
@@ -1533,5 +1334,62 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         ReleaseStagingTextures();
         ReleaseNv12Resources();
         ReleaseNv12Shader();
+    }
+}
+
+/// <summary>一帧视频画面的数据。</summary>
+internal enum VideoPixelFormat
+{
+    Bgra,
+    Rgba,
+    Nv12,
+}
+
+internal sealed class VideoFrame
+{
+    private readonly bool _ownsBuffer;
+    private int _bufferReturned;
+
+    public VideoFrame(
+        byte[] data,
+        int dataLength,
+        int width,
+        int height,
+        int stride,
+        long timestampHns,
+        VideoPixelFormat pixelFormat,
+        bool ownsBuffer = false)
+    {
+        Data = data;
+        DataLength = dataLength;
+        Width = width;
+        Height = height;
+        Stride = stride;
+        TimestampHns = timestampHns;
+        PixelFormat = pixelFormat;
+        _ownsBuffer = ownsBuffer;
+    }
+
+    public byte[] Data { get; }
+    public int DataLength { get; }
+    public int Width { get; }
+    public int Height { get; }
+    public int Stride { get; }
+    public long TimestampHns { get; }
+    public VideoPixelFormat PixelFormat { get; }
+
+    public static byte[] RentBuffer(int minimumLength)
+        => System.Buffers.ArrayPool<byte>.Shared.Rent(minimumLength);
+
+    public static void ReturnBuffer(byte[] buffer)
+        => System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+
+    public void ReturnBuffer()
+    {
+        if (!_ownsBuffer)
+            return;
+
+        if (System.Threading.Interlocked.Exchange(ref _bufferReturned, 1) == 0)
+            ReturnBuffer(Data);
     }
 }
