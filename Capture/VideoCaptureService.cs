@@ -36,8 +36,10 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     private ID3D11ComputeShader* _nv12ComputeShader;
     private IntPtr _nv12ShaderDevice;
     private readonly IntPtr[] _nv12ReadbackBuffers = new IntPtr[StagingTextureCount];
-    private uint _nv12Width;
-    private uint _nv12Height;
+    private uint _nv12SourceWidth;
+    private uint _nv12SourceHeight;
+    private uint _nv12OutputWidth;
+    private uint _nv12OutputHeight;
     private DXGI_FORMAT _nv12Format;
     private IntPtr _nv12Device;
     private int _nv12DataSize;
@@ -76,16 +78,17 @@ RWByteAddressBuffer Nv12Output : register(u0);
 
 cbuffer Nv12Constants : register(b0)
 {
-    uint Width;
-    uint Height;
-    uint Padding0;
-    uint Padding;
+    uint SourceWidth;
+    uint SourceHeight;
+    uint OutputWidth;
+    uint OutputHeight;
 };
 
 float3 LoadRgb(uint2 p)
 {
-    p.x = min(p.x, Width - 1);
-    p.y = min(p.y, Height - 1);
+    if (p.x >= SourceWidth || p.y >= SourceHeight)
+        return float3(0.0, 0.0, 0.0);
+
     float4 c = SourceTexture.Load(int3(p, 0));
     return c.rgb;
 }
@@ -123,7 +126,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     uint blockX = dispatchThreadId.x * 4u;
     uint blockY = dispatchThreadId.y * 2u;
-    if (blockX >= Width || blockY >= Height)
+    if (blockX >= OutputWidth || blockY >= OutputHeight)
         return;
 
     float3 c00 = LoadRgb(uint2(blockX + 0u, blockY + 0u));
@@ -135,12 +138,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float3 c21 = LoadRgb(uint2(blockX + 2u, blockY + 1u));
     float3 c31 = LoadRgb(uint2(blockX + 3u, blockY + 1u));
 
-    uint yBase0 = blockY * Width + blockX;
-    uint yBase1 = (blockY + 1u) * Width + blockX;
+    uint yBase0 = blockY * OutputWidth + blockX;
+    uint yBase1 = (blockY + 1u) * OutputWidth + blockX;
     Nv12Output.Store(yBase0, Pack4(ToY(c00), ToY(c10), ToY(c20), ToY(c30)));
     Nv12Output.Store(yBase1, Pack4(ToY(c01), ToY(c11), ToY(c21), ToY(c31)));
 
-    uint uvBase = Width * Height + (blockY / 2u) * Width + blockX;
+    uint uvBase = OutputWidth * OutputHeight + (blockY / 2u) * OutputWidth + blockX;
     float3 avg0 = (c00 + c10 + c01 + c11) * 0.25;
     float3 avg1 = (c20 + c30 + c21 + c31) * 0.25;
     Nv12Output.Store(uvBase, Pack4(ToU(avg0), ToV(avg0), ToU(avg1), ToV(avg1)));
@@ -385,16 +388,19 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         if (_lockedOutputPixelFormat is { } lockedFormat && lockedFormat != VideoPixelFormat.Nv12)
             return false;
 
-        if (!IsNv12SupportedInput(format) || (width & 3) != 0 || (height & 1) != 0)
+        if (!IsNv12SupportedInput(format))
         {
             DisableNv12Path($"unsupported source for NV12 path: {width}x{height}, format={format}");
             return _lockedOutputPixelFormat == VideoPixelFormat.Nv12 &&
                    SkipLockedNv12Frame("source format or dimensions no longer support NV12 conversion");
         }
 
+        uint outputWidth = AlignUp(width, 4);
+        uint outputHeight = AlignUp(height, 2);
+
         try
         {
-            if (!EnsureNv12Resources(width, height, format))
+            if (!EnsureNv12Resources(width, height, outputWidth, outputHeight, format))
             {
                 return _lockedOutputPixelFormat == VideoPixelFormat.Nv12 &&
                        SkipLockedNv12Frame("NV12 resources could not be created");
@@ -413,7 +419,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             try
             {
                 ctx->CopyResource((ID3D11Resource*)_nv12SourceTexture, (ID3D11Resource*)srcTexture);
-                DispatchNv12Conversion(ctx, width, height, format);
+                DispatchNv12Conversion(ctx, width, height, outputWidth, outputHeight, format);
 
                 ID3D11Buffer* stagingWrite = (ID3D11Buffer*)_nv12ReadbackBuffers[_nv12WriteIndex];
                 ctx->CopyResource((ID3D11Resource*)stagingWrite, (ID3D11Resource*)writeBuffer);
@@ -436,11 +442,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                 {
                     Marshal.Copy((IntPtr)mapped.pData, buffer, 0, _nv12DataSize);
 
-                    bool isEmptyFrame = IsNv12FrameEmpty(buffer, (int)width, (int)height);
+                    bool isEmptyFrame = IsNv12FrameEmpty(buffer, (int)outputWidth, (int)outputHeight);
                     if (readbackDiagnosticsPending && ClaimReadbackDiagnostic())
                     {
-                        Plugin.Log!.Info($"[Video] NV12 path enabled: {width}x{height}, bytes={_nv12DataSize}, sourceFormat={format}");
-                        DiagnoseNv12Pixels(buffer, (int)width, (int)height);
+                        Plugin.Log!.Info($"[Video] NV12 path enabled: source={width}x{height}, encoded={outputWidth}x{outputHeight}, bytes={_nv12DataSize}, sourceFormat={format}");
+                        DiagnoseNv12Pixels(buffer, (int)outputWidth, (int)outputHeight);
                     }
 
                     if (isEmptyFrame)
@@ -458,7 +464,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                         _consecutiveBlackFrames = 0;
                         long timestampHns = timestampTicks * 10_000_000L / Stopwatch.Frequency;
                         _lockedOutputPixelFormat ??= VideoPixelFormat.Nv12;
-                        frame = new VideoFrame(buffer, _nv12DataSize, (int)width, (int)height, (int)width, timestampHns, VideoPixelFormat.Nv12, ownsBuffer: true);
+                        frame = new VideoFrame(buffer, _nv12DataSize, (int)outputWidth, (int)outputHeight, (int)outputWidth, timestampHns, VideoPixelFormat.Nv12, ownsBuffer: true);
                         rentedBuffer = null;
                     }
                 }
@@ -889,12 +895,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         return true;
     }
 
-    private bool EnsureNv12Resources(uint width, uint height, DXGI_FORMAT format)
+    private bool EnsureNv12Resources(uint sourceWidth, uint sourceHeight, uint outputWidth, uint outputHeight, DXGI_FORMAT format)
     {
-        int dataSize = checked((int)(width * height * 3 / 2));
+        int dataSize = checked((int)(outputWidth * outputHeight * 3 / 2));
         if (_nv12OutputBuffer != null &&
-            width == _nv12Width &&
-            height == _nv12Height &&
+            sourceWidth == _nv12SourceWidth &&
+            sourceHeight == _nv12SourceHeight &&
+            outputWidth == _nv12OutputWidth &&
+            outputHeight == _nv12OutputHeight &&
             format == _nv12Format &&
             _nv12Device == (IntPtr)_device &&
             _nv12DataSize == dataSize)
@@ -906,8 +914,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             return false;
 
         D3D11_TEXTURE2D_DESC textureDesc = default;
-        textureDesc.Width = width;
-        textureDesc.Height = height;
+        textureDesc.Width = sourceWidth;
+        textureDesc.Height = sourceHeight;
         textureDesc.MipLevels = 1;
         textureDesc.ArraySize = 1;
         DXGI_FORMAT shaderFormat = GetNv12ShaderReadableFormat(format);
@@ -1011,8 +1019,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             _nv12ReadbackBuffers[i] = (IntPtr)readbackBuffer;
         }
 
-        _nv12Width = width;
-        _nv12Height = height;
+        _nv12SourceWidth = sourceWidth;
+        _nv12SourceHeight = sourceHeight;
+        _nv12OutputWidth = outputWidth;
+        _nv12OutputHeight = outputHeight;
         _nv12Format = format;
         _nv12Device = (IntPtr)_device;
         _nv12DataSize = dataSize;
@@ -1081,14 +1091,20 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         }
     }
 
-    private void DispatchNv12Conversion(ID3D11DeviceContext* ctx, uint width, uint height, DXGI_FORMAT format)
+    private void DispatchNv12Conversion(
+        ID3D11DeviceContext* ctx,
+        uint sourceWidth,
+        uint sourceHeight,
+        uint outputWidth,
+        uint outputHeight,
+        DXGI_FORMAT format)
     {
         uint[] constants =
         {
-            width,
-            height,
-            0u,
-            0u,
+            sourceWidth,
+            sourceHeight,
+            outputWidth,
+            outputHeight,
         };
 
         fixed (uint* constantData = constants)
@@ -1115,7 +1131,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             ctx->CSSetConstantBuffers(0, 1, &cb);
             ctx->CSSetShaderResources(0, 1, &srv);
             ctx->CSSetUnorderedAccessViews(0, 1, &uav, null);
-            ctx->Dispatch((width / 4 + 15) / 16, (height / 2 + 15) / 16, 1);
+            ctx->Dispatch((outputWidth / 4 + 15) / 16, (outputHeight / 2 + 15) / 16, 1);
         }
         finally
         {
@@ -1170,6 +1186,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM,
             _ => format,
         };
+
+    private static uint AlignUp(uint value, uint alignment)
+        => (value + alignment - 1) / alignment * alignment;
 
     private void DisableNv12Path(string reason)
     {
@@ -1283,8 +1302,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             _nv12ReadbackBuffers[i] = IntPtr.Zero;
         }
 
-        _nv12Width = 0;
-        _nv12Height = 0;
+        _nv12SourceWidth = 0;
+        _nv12SourceHeight = 0;
+        _nv12OutputWidth = 0;
+        _nv12OutputHeight = 0;
         _nv12Format = 0;
         _nv12Device = IntPtr.Zero;
         _nv12DataSize = 0;
