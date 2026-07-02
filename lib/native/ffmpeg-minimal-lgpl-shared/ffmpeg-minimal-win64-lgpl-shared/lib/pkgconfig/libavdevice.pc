@@ -1,0 +1,14 @@
+prefix=/i/repos/Recorder/Recorder/lib/native/ffmpeg-minimal-lgpl-shared/ffmpeg-minimal-win64-lgpl-shared
+exec_prefix=${prefix}
+libdir=/i/repos/Recorder/Recorder/lib/native/ffmpeg-minimal-lgpl-shared/ffmpeg-minimal-win64-lgpl-shared/lib
+includedir=/i/repos/Recorder/Recorder/lib/native/ffmpeg-minimal-lgpl-shared/ffmpeg-minimal-win64-lgpl-shared/include
+
+Name: libavdevice
+Description: FFmpeg device handling library
+Version: 62.3.102
+Requires: 
+Requires.private: libavformat >= 62.12.102, libavcodec >= 62.28.102, libavutil >= 60.26.102
+Conflicts:
+Libs: -L${libdir}  -lavdevice 
+Libs.private: -lm -latomic
+Cflags: -I${includedir}

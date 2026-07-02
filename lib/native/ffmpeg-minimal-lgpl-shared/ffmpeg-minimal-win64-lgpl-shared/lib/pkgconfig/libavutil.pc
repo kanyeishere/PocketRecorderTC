@@ -1,0 +1,14 @@
+prefix=/i/repos/Recorder/Recorder/lib/native/ffmpeg-minimal-lgpl-shared/ffmpeg-minimal-win64-lgpl-shared
+exec_prefix=${prefix}
+libdir=/i/repos/Recorder/Recorder/lib/native/ffmpeg-minimal-lgpl-shared/ffmpeg-minimal-win64-lgpl-shared/lib
+includedir=/i/repos/Recorder/Recorder/lib/native/ffmpeg-minimal-lgpl-shared/ffmpeg-minimal-win64-lgpl-shared/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 60.26.102
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: -lm -luser32 -lbcrypt -latomic
+Cflags: -I${includedir}

@@ -1,5 +1,7 @@
 param(
     [string] $FfmpegUrl = $env:FFMPEG_URL,
+    [string] $FfmpegRootOverride = $env:NATIVE_RECORDER_FFMPEG_ROOT,
+    [string] $UseMinimalFfmpeg = $env:USE_MINIMAL_FFMPEG,
     [string] $VideoCodecSdkUrl = $env:VIDEO_CODEC_SDK_URL,
     [string] $AmfRepo = $env:AMF_REPO,
     [string] $AmfRef = $env:AMF_REF,
@@ -11,6 +13,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $depsRoot = Join-Path $repoRoot "lib\native"
 $ffmpegRoot = Join-Path $depsRoot "ffmpeg-btbn-lgpl-shared"
+$minimalFfmpegRoot = Join-Path $depsRoot "ffmpeg-minimal-lgpl-shared"
 $amfRoot = Join-Path $depsRoot "AMF"
 $videoCodecSdkRoot = Join-Path $depsRoot "VideoCodecSDK"
 $propsPath = Join-Path $depsRoot "NativeRecorderDeps.props"
@@ -29,15 +32,43 @@ if ([string]::IsNullOrWhiteSpace($AmfRef)) {
 
 New-Item -ItemType Directory -Force -Path $depsRoot | Out-Null
 
+function Test-FFmpegRoot([string] $root) {
+    if (-not (Test-Path $root)) { return $false }
+
+    $required = @(
+        "include\libavformat\avformat.h",
+        "include\libavcodec\avcodec.h",
+        "include\libavutil\avutil.h",
+        "include\libswresample\swresample.h",
+        "lib\avformat.lib",
+        "lib\avcodec.lib",
+        "lib\avutil.lib",
+        "lib\swresample.lib"
+    )
+
+    foreach ($relativePath in $required) {
+        if (-not (Test-Path (Join-Path $root $relativePath))) {
+            return $false
+        }
+    }
+
+    foreach ($pattern in @("avformat-*.dll", "avcodec-*.dll", "avutil-*.dll", "swresample-*.dll")) {
+        if (@(Get-ChildItem (Join-Path $root "bin") -Filter $pattern -File -ErrorAction SilentlyContinue).Count -eq 0) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function Find-FFmpegRoot([string] $root) {
     if (-not (Test-Path $root)) { return $null }
 
-    return Get-ChildItem $root -Directory -Recurse |
-        Where-Object {
-            (Test-Path (Join-Path $_.FullName "include\libavformat\avformat.h")) -and
-            (Test-Path (Join-Path $_.FullName "lib\avformat.lib")) -and
-            (Test-Path (Join-Path $_.FullName "bin\avformat-*.dll"))
-        } |
+    $rootItem = Get-Item $root
+    $candidates = @($rootItem) + @(Get-ChildItem $root -Directory -Recurse)
+
+    return $candidates |
+        Where-Object { Test-FFmpegRoot $_.FullName } |
         Select-Object -First 1
 }
 
@@ -60,7 +91,30 @@ function Set-CiEnv([string] $name, [string] $value) {
     }
 }
 
-$ffmpegDir = Find-FFmpegRoot $ffmpegRoot
+function Test-Truthy([string] $value) {
+    if ([string]::IsNullOrWhiteSpace($value)) { return $false }
+
+    return @("1", "true", "yes", "on") -contains $value.Trim().ToLowerInvariant()
+}
+
+$ffmpegDir = $null
+if (-not [string]::IsNullOrWhiteSpace($FfmpegRootOverride)) {
+    $ffmpegDir = Find-FFmpegRoot $FfmpegRootOverride
+    if ($null -eq $ffmpegDir) {
+        throw "NATIVE_RECORDER_FFMPEG_ROOT was set, but no usable FFmpeg root was found under: $FfmpegRootOverride"
+    }
+}
+
+if ($null -eq $ffmpegDir -and (Test-Truthy $UseMinimalFfmpeg)) {
+    $ffmpegDir = Find-FFmpegRoot $minimalFfmpegRoot
+    if ($null -eq $ffmpegDir) {
+        throw "Minimal FFmpeg was requested, but no usable build was found under $minimalFfmpegRoot. Run scripts\Build-MinimalFfmpeg.ps1 locally and commit lib/native/ffmpeg-minimal-lgpl-shared, or unset USE_MINIMAL_FFMPEG to use the BtbN package."
+    }
+}
+
+if ($null -eq $ffmpegDir) {
+    $ffmpegDir = Find-FFmpegRoot $ffmpegRoot
+}
 if ($null -eq $ffmpegDir) {
     $ffmpegZip = Join-Path $depsRoot "ffmpeg-btbn-lgpl-shared.zip"
     Write-Host "Downloading FFmpeg shared package: $FfmpegUrl"

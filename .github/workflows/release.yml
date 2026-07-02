@@ -17,6 +17,8 @@ jobs:
 
     env:
       DALAMUD_HOME: ${{ github.workspace }}\lib
+      USE_MINIMAL_FFMPEG: true
+      FFMPEG_REF: n8.1.2
 
     steps:
       - name: Checkout with submodules

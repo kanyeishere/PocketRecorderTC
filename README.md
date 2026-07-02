@@ -89,6 +89,8 @@ dotnet build PocketRecorder.csproj -c Release -p:Platform=x64
 
 GitHub Actions 会先构建 `NativeRecorder.abi9.dll`，再打包插件，并校验发布 zip 中包含 native DLL 和 `avformat/avcodec/avutil/swresample` 运行时 DLL。
 
+发布构建会设置 `USE_MINIMAL_FFMPEG=true`，直接使用提交在 `lib/native/ffmpeg-minimal-lgpl-shared` 下的裁剪版 LGPL FFmpeg shared 包，不会在 GitHub Actions 中重新下载或构建 FFmpeg。需要更新该依赖时，在本机运行 `scripts/Build-MinimalFfmpeg.ps1` 从 FFmpeg `n8.1.2` 生成；该包只启用 PocketRecorder native 路径需要的 MP4 muxer、AAC encoder、file protocol、基础 parser/bitstream filter 和 `swresample`。未设置该变量时，`scripts/Prepare-NativeRecorderDeps.ps1` 仍会回退到 BtbN 的通用 LGPL shared 包，方便本地开发。
+
 ## 许可
 
 MIT

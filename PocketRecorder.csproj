@@ -38,6 +38,12 @@
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avcodec-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avutil-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\swresample-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(NativeRecorderFfmpegRoot)\bin\libgcc*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(NativeRecorderFfmpegRoot)\bin\libstdc++*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(NativeRecorderFfmpegRoot)\bin\libwinpthread*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(NativeRecorderFfmpegRoot)\LICENSE*" Condition="Exists('$(NativeRecorderFfmpegRoot)')" Link="licenses\FFmpeg\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(NativeRecorderFfmpegRoot)\COPYING*" Condition="Exists('$(NativeRecorderFfmpegRoot)')" Link="licenses\FFmpeg\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(NativeRecorderFfmpegRoot)\BUILDINFO.txt" Condition="Exists('$(NativeRecorderFfmpegRoot)\BUILDINFO.txt')" Link="licenses\FFmpeg\BUILDINFO.txt" CopyToOutputDirectory="PreserveNewest" />
     <Compile Remove="OmenTools\**\*.cs" />
     <EmbeddedResource Remove="OmenTools\**\*" />
     <None Remove="OmenTools\**\*" />

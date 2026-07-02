@@ -1,0 +1,12 @@
+﻿FFmpeg minimal LGPL build
+Repository: https://github.com/FFmpeg/FFmpeg.git
+Ref: n8.1.2
+ResolvedRef: 38b88335f99e76ed89ff3c93f877fdefce736c13
+
+Enabled components:
+  libraries: avcodec, avformat, avutil, swresample
+  muxers: mp4
+  encoders: aac
+  protocols: file
+  parsers: aac, h264, hevc
+  bitstream filters: aac_adtstoasc, extract_extradata, h264_mp4toannexb, hevc_mp4toannexb

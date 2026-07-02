@@ -1,0 +1,14 @@
+prefix=/i/repos/Recorder/Recorder/lib/native/ffmpeg-minimal-lgpl-shared/ffmpeg-minimal-win64-lgpl-shared
+exec_prefix=${prefix}
+libdir=/i/repos/Recorder/Recorder/lib/native/ffmpeg-minimal-lgpl-shared/ffmpeg-minimal-win64-lgpl-shared/lib
+includedir=/i/repos/Recorder/Recorder/lib/native/ffmpeg-minimal-lgpl-shared/ffmpeg-minimal-win64-lgpl-shared/include
+
+Name: libswresample
+Description: FFmpeg audio resampling library
+Version: 6.3.102
+Requires: 
+Requires.private: libavutil >= 60.26.102
+Conflicts:
+Libs: -L${libdir}  -lswresample 
+Libs.private: -lm -latomic
+Cflags: -I${includedir}
