@@ -301,13 +301,23 @@ public sealed class Plugin : IDalamudPlugin
 
     private void HandleAudioCommand(string[] parts)
     {
-        HandleSwitchCommand(
-            parts,
-            Config.CaptureAudio,
-            $"系统音频录制: {OnOff(Config.CaptureAudio)}。",
-            "用法: audio on | off | toggle | status",
-            enabled => Config.CaptureAudio = enabled,
-            enabled => $"系统音频录制已{(enabled ? "开启" : "关闭")}，下次录制生效。");
+        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            Print($"声音来源: {AudioModeText(Config.AudioCaptureMode)}。");
+            return;
+        }
+
+        AudioCaptureMode? mode = ParseAudioMode(parts[1], Config.AudioCaptureMode);
+        if (mode == null)
+        {
+            Print("用法: audio game | system | off | toggle | status");
+            return;
+        }
+
+        Config.AudioCaptureMode = mode.Value;
+        Config.CaptureAudio = mode.Value != AudioCaptureMode.Off;
+        Config.Save(PluginInterface);
+        Print($"声音来源已设为 {AudioModeText(mode.Value)}，下次录制生效。");
     }
 
     private void OpenOutputDirectory()
@@ -333,7 +343,7 @@ public sealed class Plugin : IDalamudPlugin
 
         Print($"录制状态: {RecordingService.Phase.ToDisplayText()}{elapsed}。");
         Print($"倒计时自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}");
-        Print($"参数: {Config.TargetFps} FPS / {Config.VideoBitrate / 1_000_000} Mbps / 音频 {OnOff(Config.CaptureAudio)}。");
+        Print($"参数: {Config.TargetFps} FPS / {Config.VideoBitrate / 1_000_000} Mbps / 声音 {AudioModeText(Config.AudioCaptureMode)}。");
     }
 
     private void HandleSwitchCommand(
@@ -375,6 +385,28 @@ public sealed class Plugin : IDalamudPlugin
 
     private static string OnOff(bool enabled) => enabled ? "开启" : "关闭";
 
+    private static AudioCaptureMode? ParseAudioMode(string value, AudioCaptureMode currentValue)
+    {
+        return value.ToLowerInvariant() switch
+        {
+            "game" or "ffxiv" or "process" or "on" or "enable" or "enabled" or "1" or "true" or "yes" => AudioCaptureMode.Game,
+            "system" or "all" or "desktop" or "loopback" => AudioCaptureMode.System,
+            "off" or "none" or "mute" or "disable" or "disabled" or "0" or "false" or "no" => AudioCaptureMode.Off,
+            "toggle" => currentValue == AudioCaptureMode.Off ? AudioCaptureMode.Game : AudioCaptureMode.Off,
+            _ => null,
+        };
+    }
+
+    private static string AudioModeText(AudioCaptureMode mode)
+    {
+        return mode switch
+        {
+            AudioCaptureMode.Game => "只录制游戏声音",
+            AudioCaptureMode.System => "录制系统声音",
+            _ => "不录制声音",
+        };
+    }
+
     private static void Print(string message)
     {
         ChatGui.Print($"[Pocket Recorder] {message}");
@@ -385,7 +417,7 @@ public sealed class Plugin : IDalamudPlugin
         Print("命令: start, end, toggle, status, config, output");
         Print("自动录制: autorecord on/off/toggle/status");
         Print("悬浮按钮: floating on/off/toggle/status");
-        Print("参数: fps 60, bitrate 32, audio on/off/toggle/status");
+        Print("参数: fps 60, bitrate 32, audio game/system/off/status");
         Print("短命令同样可用: /pktr start, /pktr end");
     }
 

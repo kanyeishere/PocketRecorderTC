@@ -8,7 +8,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 13;
+    public int Version { get; set; } = 14;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
@@ -21,6 +21,9 @@ public class Configuration : IPluginConfiguration
 
     /// <summary>是否录制音频。</summary>
     public bool CaptureAudio { get; set; } = true;
+
+    /// <summary>音频录制来源。</summary>
+    public AudioCaptureMode AudioCaptureMode { get; set; } = AudioCaptureMode.Game;
 
     /// <summary>是否优先使用硬件编码器。</summary>
     public bool UseHardwareEncoder { get; set; } = true;
@@ -178,6 +181,18 @@ public class Configuration : IPluginConfiguration
             config.Version = 13;
             config.Save(pi);
         }
+
+        if (config.Version < 14)
+        {
+            config.AudioCaptureMode = config.CaptureAudio
+                ? AudioCaptureMode.System
+                : AudioCaptureMode.Off;
+
+            config.Version = 14;
+            config.Save(pi);
+        }
+
+        config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
 
         if (!config.EnableNativeRecorderExperimental)
         {

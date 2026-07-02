@@ -128,7 +128,7 @@ internal sealed class RecordingService : IDisposable
                 Plugin.PluginInterface.GetPluginConfigDirectory(),
                 config.VideoBitrate,
                 _videoFps,
-                config.CaptureAudio,
+                config.AudioCaptureMode,
                 config.VideoCodec,
                 config.EncoderPreset,
                 config.UseHardwareEncoder,
@@ -155,14 +155,14 @@ internal sealed class RecordingService : IDisposable
             options.VideoCodec,
             options.EncoderPreset,
             options.UseHardwareEncoder,
-            options.CaptureAudio,
+            options.AudioCaptureMode,
             options.PreferNativeRecorder,
             nativeReason);
 
-        if (options.CaptureAudio)
+        if (options.AudioCaptureMode != AudioCaptureMode.Off)
         {
-            Plugin.Log.Info("[Record] Starting audio capture...");
-            audioCapture = new AudioCaptureService(OnAudioPacket);
+            Plugin.Log.Info($"[Record] Starting audio capture mode={options.AudioCaptureMode}...");
+            audioCapture = new AudioCaptureService(options.AudioCaptureMode, Environment.ProcessId, OnAudioPacket);
             lock (_sync)
             {
                 if (IsCurrentSessionNoLock(options.SessionId))
@@ -212,7 +212,7 @@ internal sealed class RecordingService : IDisposable
         }
 
         Plugin.Log.Info($"[Record] Preparation started -> {options.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
-        Plugin.Log.Info($"[Record] Config: fps={options.TargetFps}, bitrate={options.VideoBitrate}, codec={options.VideoCodec}, preset={options.EncoderPreset}, audio={options.CaptureAudio}, hw={options.UseHardwareEncoder}, native={options.PreferNativeRecorder} ({nativeReason})");
+        Plugin.Log.Info($"[Record] Config: fps={options.TargetFps}, bitrate={options.VideoBitrate}, codec={options.VideoCodec}, preset={options.EncoderPreset}, audio={options.AudioCaptureMode}, hw={options.UseHardwareEncoder}, native={options.PreferNativeRecorder} ({nativeReason})");
         AmdRecordingDiagnosticLog.Write("Record", $"preparation started, startSyncMs={startSw.ElapsedMilliseconds}");
         RecordingStateChanged?.Invoke(true);
         return true;
@@ -326,7 +326,7 @@ internal sealed class RecordingService : IDisposable
                 {
                     AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
                         "NativeRecorder",
-                        $"attempting native writer, firstFrame={DescribeFrame(firstFrame)}, audio={audioFormat != null}");
+                        $"attempting native writer, firstFrame={DescribeFrame(firstFrame)}, audio={audioFormat != null}, audioMode={options.AudioCaptureMode}");
 
                     var nativeWriter = new NativeRecorderWriter(options.VideoBitrate, options.VideoCodec);
                     writer = nativeWriter;
@@ -497,7 +497,7 @@ internal sealed class RecordingService : IDisposable
 
     private AudioFormat? WaitForAudioFormat(RecordingStartOptions options)
     {
-        if (!options.CaptureAudio)
+        if (options.AudioCaptureMode == AudioCaptureMode.Off)
         {
             Plugin.Log.Info("[Record] No audio (disabled), video-only recording.");
             return null;
@@ -520,7 +520,7 @@ internal sealed class RecordingService : IDisposable
 
             if (audioCapture.Initialized)
             {
-                Plugin.Log.Info($"[Record] Audio initialized: {audioCapture.SampleRate}Hz, {audioCapture.Channels}ch, {audioCapture.BitsPerSample}bit");
+                Plugin.Log.Info($"[Record] Audio initialized ({options.AudioCaptureMode}): {audioCapture.SampleRate}Hz, {audioCapture.Channels}ch, {audioCapture.BitsPerSample}bit");
                 var audioFormat = new AudioFormat(
                     audioCapture.SampleRate,
                     audioCapture.Channels,
@@ -862,7 +862,7 @@ internal sealed class RecordingService : IDisposable
         string PluginConfigDirectory,
         int VideoBitrate,
         int TargetFps,
-        bool CaptureAudio,
+        AudioCaptureMode AudioCaptureMode,
         string VideoCodec,
         string EncoderPreset,
         bool UseHardwareEncoder,

@@ -48,7 +48,7 @@ internal static class AmdRecordingDiagnosticLog
         string requestedCodec,
         string encoderPreset,
         bool useHardwareEncoder,
-        bool captureAudio,
+        AudioCaptureMode audioCaptureMode,
         bool preferNativeRecorder,
         string nativeReason)
     {
@@ -56,7 +56,7 @@ internal static class AmdRecordingDiagnosticLog
         [
             $"sessionId={sessionId}",
             $"requestedCodec={requestedCodec}, preset={encoderPreset}, bitrate={videoBitrate}, fps={targetFps}",
-            $"hardware={useHardwareEncoder}, audio={captureAudio}, preferNative={preferNativeRecorder}",
+            $"hardware={useHardwareEncoder}, audio={audioCaptureMode}, preferNative={preferNativeRecorder}",
             $"nativeProbe={nativeReason}",
         ];
 

@@ -223,12 +223,19 @@ internal sealed class ConfigWindow : Window
     private void DrawAudioSettings(Configuration config)
     {
         ImGui.Text("音频设置");
-        bool audio = config.CaptureAudio;
-        if (ImGui.Checkbox("录制系统音频 (WASAPI Loopback)", ref audio))
+        string[] audioModes = { "不录制声音", "只录制游戏声音", "录制系统声音" };
+        AudioCaptureMode[] modeValues = { AudioCaptureMode.Off, AudioCaptureMode.Game, AudioCaptureMode.System };
+        int modeIdx = Array.IndexOf(modeValues, config.AudioCaptureMode);
+        if (modeIdx < 0) modeIdx = 1;
+
+        if (ImGui.Combo("声音来源", ref modeIdx, audioModes, audioModes.Length))
         {
-            config.CaptureAudio = audio;
+            config.AudioCaptureMode = modeValues[modeIdx];
+            config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
             SaveConfig(config);
         }
+
+        ImGui.TextDisabled(GetAudioModeDescription(config.AudioCaptureMode));
     }
 
     private void DrawFFmpegSettings(Configuration config)
@@ -332,6 +339,16 @@ internal sealed class ConfigWindow : Window
         return config.UseHardwareEncoder
             ? "自动选择硬件编码器，失败时回退兼容模式"
             : "兼容模式";
+    }
+
+    private static string GetAudioModeDescription(AudioCaptureMode mode)
+    {
+        return mode switch
+        {
+            AudioCaptureMode.Game => "只录制 FFXIV 进程及其子进程的声音。",
+            AudioCaptureMode.System => "录制默认播放设备上的全部系统声音。",
+            _ => "视频将不包含音轨。",
+        };
     }
 
     private void DrawOutputSettings(Configuration config)
