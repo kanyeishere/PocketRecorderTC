@@ -1,5 +1,6 @@
 using Dalamud.Plugin.Services;
 using Recorder.Capture;
+using Recorder.Diagnostics;
 using Recorder.Encoding;
 using System;
 using System.Diagnostics;
@@ -147,6 +148,17 @@ internal sealed class RecordingService : IDisposable
             _softFps.Reset(log: false);
         }
 
+        AmdRecordingDiagnosticLog.StartSession(
+            options.SessionId,
+            options.TargetFps,
+            options.VideoBitrate,
+            options.VideoCodec,
+            options.EncoderPreset,
+            options.UseHardwareEncoder,
+            options.CaptureAudio,
+            options.PreferNativeRecorder,
+            nativeReason);
+
         if (options.CaptureAudio)
         {
             Plugin.Log.Info("[Record] Starting audio capture...");
@@ -194,12 +206,14 @@ internal sealed class RecordingService : IDisposable
             StopAndDisposeAudioCapture(audioCapture);
 
             Plugin.Log.Warning("[Record] Video capture could not start; recording aborted.");
+            AmdRecordingDiagnosticLog.FinishSession("video capture could not start; recording aborted");
             RecordingStateChanged?.Invoke(false);
             return false;
         }
 
         Plugin.Log.Info($"[Record] Preparation started -> {options.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
         Plugin.Log.Info($"[Record] Config: fps={options.TargetFps}, bitrate={options.VideoBitrate}, codec={options.VideoCodec}, preset={options.EncoderPreset}, audio={options.CaptureAudio}, hw={options.UseHardwareEncoder}, native={options.PreferNativeRecorder} ({nativeReason})");
+        AmdRecordingDiagnosticLog.Write("Record", $"preparation started, startSyncMs={startSw.ElapsedMilliseconds}");
         RecordingStateChanged?.Invoke(true);
         return true;
     }
@@ -310,6 +324,10 @@ internal sealed class RecordingService : IDisposable
             {
                 try
                 {
+                    AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
+                        "NativeRecorder",
+                        $"attempting native writer, firstFrame={DescribeFrame(firstFrame)}, audio={audioFormat != null}");
+
                     var nativeWriter = new NativeRecorderWriter(options.VideoBitrate, options.VideoCodec);
                     writer = nativeWriter;
                     writer.FatalError += OnWriterFatalError;
@@ -341,11 +359,15 @@ internal sealed class RecordingService : IDisposable
                     }
 
                     Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, native=D3D11Texture/{GetNativeRecorderCodecLabel(options.VideoCodec)}, asyncStart={startSw.ElapsedMilliseconds}ms");
+                    AmdRecordingDiagnosticLog.Write("Record", $"native recording started, asyncStartMs={startSw.ElapsedMilliseconds}, backend={_currentBackend}");
                     return;
                 }
                 catch (Exception ex)
                 {
                     Plugin.Log!.Warning($"[NativeRecorder] Native path failed before start; falling back to FFmpeg stdin rawvideo. {ex.Message}");
+                    AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
+                        "NativeRecorder",
+                        $"native path failed before start, fallback=FFmpeg rawvideo, exception={ex}, lastStatus={NativeRecorderBackend.GetLastStatus()}");
                     if (!frameHandedToWriter)
                         firstFrame.ReturnBuffer();
                     try { writer?.Stop(TimeSpan.Zero); } catch { }
@@ -374,6 +396,11 @@ internal sealed class RecordingService : IDisposable
                 firstFrame.ReturnBuffer();
                 return;
             }
+
+            AmdRecordingDiagnosticLog.WriteForAmdCodec(
+                encoder.Codec,
+                "FFmpeg",
+                $"selected encoder codec={encoder.Codec}, preset={encoder.Preset}, isHardware={encoder.IsHardware}, reason={encoder.Reason}, firstFrame={DescribeFrame(firstFrame)}");
 
             writer = new FFmpegWriter(
                 ffmpegPath,
@@ -427,6 +454,10 @@ internal sealed class RecordingService : IDisposable
             }
 
             Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, codec={encoder.Codec}, preset={encoder.Preset}, hw={encoder.IsHardware}, encoderReason={encoder.Reason}, asyncStart={startSw.ElapsedMilliseconds}ms");
+            AmdRecordingDiagnosticLog.WriteForAmdCodec(
+                encoder.Codec,
+                "Record",
+                $"FFmpeg recording started, asyncStartMs={startSw.ElapsedMilliseconds}, backend={_currentBackend}");
         }
         catch (Exception ex)
         {
@@ -434,6 +465,7 @@ internal sealed class RecordingService : IDisposable
                 firstFrame.ReturnBuffer();
 
             Plugin.Log!.Error($"[Record] Failed to start writer: {ex}");
+            AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", $"failed to start writer, exception={ex}");
             AbortStart(options.SessionId);
         }
         finally
@@ -459,6 +491,7 @@ internal sealed class RecordingService : IDisposable
             return;
 
         Plugin.Log!.Warning($"[Record] Writer failed; stopping recording automatically. {message}");
+        AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", $"writer fatal error, message={message}");
         StopRecording();
     }
 
@@ -594,6 +627,8 @@ internal sealed class RecordingService : IDisposable
             _lifecycle = RecordingLifecycle.Preparing;
             _softFps.Reset(log: false);
         }
+
+        AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", "switched capture to FFmpeg fallback; D3D11 texture preference disabled");
     }
 
     public void StopRecording()
@@ -680,6 +715,7 @@ internal sealed class RecordingService : IDisposable
             }
 
             Plugin.Log.Info($"[Record] Saved: {outputPath}, finalize={finalizeSw.ElapsedMilliseconds}ms");
+            AmdRecordingDiagnosticLog.FinishSession($"saved=true, duration={finalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={writer != null}");
             if (outputPath != null)
             {
                 try
@@ -734,6 +770,7 @@ internal sealed class RecordingService : IDisposable
         try { videoCapture?.Stop(); } catch { }
         DisposeVideoCapture(videoCapture);
         StopAndDisposeAudioCapture(audioCapture);
+        AmdRecordingDiagnosticLog.FinishSession("start aborted");
 
         RecordingStateChanged?.Invoke(false);
 
@@ -802,6 +839,15 @@ internal sealed class RecordingService : IDisposable
     {
         try { audioCapture?.Stop(); } catch { }
         try { audioCapture?.Dispose(); } catch { }
+    }
+
+    private static string DescribeFrame(VideoFrame frame)
+    {
+        string description = $"{frame.Width}x{frame.Height}, pixelFormat={frame.PixelFormat}, stride={frame.Stride}, dataLength={frame.DataLength}, timestampHns={frame.TimestampHns}";
+        if (!frame.IsD3D11Texture)
+            return description;
+
+        return $"{description}, dxgiFormat={frame.DxgiFormat}, deviceSet={frame.D3D11DevicePtr != IntPtr.Zero}, textureSet={frame.D3D11TexturePtr != IntPtr.Zero}, sharedHandleSet={frame.D3D11SharedHandle != IntPtr.Zero}";
     }
 
     public void Dispose()

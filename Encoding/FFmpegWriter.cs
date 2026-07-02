@@ -1,4 +1,5 @@
 using Recorder.Capture;
+using Recorder.Diagnostics;
 using Recorder.Recording;
 using System;
 using System.Collections.Concurrent;
@@ -166,6 +167,11 @@ internal sealed class FFmpegWriter : IOutputSink
         args.Add("-movflags"); args.Add("+faststart");
         args.Add(_outputPath);
 
+        AmdRecordingDiagnosticLog.WriteForAmdCodec(
+            _videoCodec,
+            "FFmpeg",
+            $"starting process, input={video.Width}x{video.Height}@{_videoFps}, pixelFormat={video.PixelFormat}/{GetFFmpegPixelFormat(video.PixelFormat)}, audio={audio != null}, bitrate={_videoBitrate}, preset={_preset}, args={BuildDiagnosticArguments(args)}");
+
         // 启动 FFmpeg
         var psi = new ProcessStartInfo
         {
@@ -189,11 +195,18 @@ internal sealed class FFmpegWriter : IOutputSink
         _process.ErrorDataReceived += (s, e) =>
         {
             if (!string.IsNullOrEmpty(e.Data))
+            {
                 Plugin.Log!.Info($"[FFmpeg] {e.Data}");
+                AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg stderr", e.Data);
+            }
         };
         _process.BeginErrorReadLine();
 
         Plugin.Log!.Info($"[FFmpeg] Process started (PID={_process.Id}), codec={_videoCodec}, pix_fmt={GetFFmpegPixelFormat(video.PixelFormat)}, {video.Width}x{video.Height}@{_videoFps}fps");
+        AmdRecordingDiagnosticLog.WriteForAmdCodec(
+            _videoCodec,
+            "FFmpeg",
+            $"process started, pid={_process.Id}, codec={_videoCodec}, pix_fmt={GetFFmpegPixelFormat(video.PixelFormat)}, size={video.Width}x{video.Height}, fps={_videoFps}");
 
         // 启动异步写入线程
         Plugin.Log!.Info("[FFmpeg] Video timing: rawvideo VFR uses wall-clock timestamps; stale queued frames are dropped instead of synthesized.");
@@ -240,6 +253,22 @@ internal sealed class FFmpegWriter : IOutputSink
             VideoPixelFormat.Nv12 => "nv12",
             _ => "bgra",
         };
+    }
+
+    private static string BuildDiagnosticArguments(System.Collections.Generic.IReadOnlyList<string> args)
+    {
+        string[] sanitized = new string[args.Count];
+        for (int i = 0; i < args.Count; i++)
+        {
+            if (i == args.Count - 1)
+                sanitized[i] = "<output>";
+            else if (args[i].StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase))
+                sanitized[i] = @"\\.\pipe\<audio>";
+            else
+                sanitized[i] = args[i];
+        }
+
+        return string.Join(" ", sanitized);
     }
 
     public void WriteVideoFrame(VideoFrame frame)
@@ -353,6 +382,7 @@ internal sealed class FFmpegWriter : IOutputSink
                 else
                 {
                     Plugin.Log!.Warning($"[FFmpeg] Video write failed: {ex.Message}");
+                    AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", $"video write failed, exception={ex}");
                     NotifyFatalError($"FFmpeg video write failed: {ex.Message}");
                 }
                 break;
@@ -652,6 +682,10 @@ internal sealed class FFmpegWriter : IOutputSink
         _stopped = true;
 
         Plugin.Log!.Info($"[FFmpeg] Stopping... input={Volatile.Read(ref _inputFrameCount)}, output={Volatile.Read(ref _frameCount)}, tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, dropped={Volatile.Read(ref _droppedFrameCount)}, staleDrops={Volatile.Read(ref _staleFrameDropCount)}, nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, audioPackets={Volatile.Read(ref _audioPackets)}");
+        AmdRecordingDiagnosticLog.WriteForAmdCodec(
+            _videoCodec,
+            "FFmpeg",
+            $"stopping, input={Volatile.Read(ref _inputFrameCount)}, output={Volatile.Read(ref _frameCount)}, tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, dropped={Volatile.Read(ref _droppedFrameCount)}, staleDrops={Volatile.Read(ref _staleFrameDropCount)}, nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, audioPackets={Volatile.Read(ref _audioPackets)}, finalDuration={finalVideoDuration}");
 
         // 完成视频队列
         try { _videoQueue?.CompleteAdding(); } catch { }
@@ -663,12 +697,19 @@ internal sealed class FFmpegWriter : IOutputSink
         if (!videoWriterFinished)
         {
             Plugin.Log.Warning("[FFmpeg] Video writer did not finish in 5s; closing input to unblock quick stop.");
+            AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", "video writer did not finish in 5s; closing stdin");
             CloseStandardInput();
             if (!_videoWriterThread!.Join(2_000))
+            {
                 Plugin.Log.Warning("[FFmpeg] Video writer still did not exit after stdin close.");
+                AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", "video writer still did not exit after stdin close");
+            }
         }
         if (_audioWriterThread != null && !_audioWriterThread.Join(5_000))
+        {
             Plugin.Log.Warning("[FFmpeg] Audio writer did not finish in 5s; closing input with remaining packets unwritten.");
+            AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", "audio writer did not finish in 5s");
+        }
 
         // 关闭 stdin（发送 EOF）
         CloseStandardInput();
@@ -680,14 +721,18 @@ internal sealed class FFmpegWriter : IOutputSink
         if (_process != null && !_process.HasExited)
         {
             Plugin.Log.Info("[FFmpeg] Waiting for FFmpeg to finalize...");
+            AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", "waiting for process finalize");
             if (!_process.WaitForExit(30_000))
             {
                 Plugin.Log.Warning("[FFmpeg] FFmpeg did not exit in 30s, killing.");
+                AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", "process did not exit in 30s; killing");
                 try { _process.Kill(); } catch { }
             }
         }
 
         Plugin.Log.Info("[FFmpeg] Process exited.");
+        string exitCode = _process is { HasExited: true } ? _process.ExitCode.ToString() : "unknown";
+        AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", $"process exited, exitCode={exitCode}");
     }
 
     private void CloseStandardInput()
