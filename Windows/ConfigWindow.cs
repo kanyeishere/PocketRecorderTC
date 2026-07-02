@@ -218,24 +218,6 @@ internal sealed class ConfigWindow : Window
             }
         }
 
-        bool nativeRecorder = config.EnableNativeRecorderExperimental;
-        if (ImGui.Checkbox("NativeRecorder GPU 路径 (NVIDIA 实验)", ref nativeRecorder))
-        {
-            config.EnableNativeRecorderExperimental = nativeRecorder;
-            SaveConfig(config);
-        }
-
-        bool lowLat = config.LowLatencyMode;
-        if (ImGui.Checkbox("低延迟模式 (WebRTC 预留)", ref lowLat))
-        {
-            config.LowLatencyMode = lowLat;
-            SaveConfig(config);
-        }
-        if (lowLat)
-        {
-            ImGui.SameLine();
-            ImGui.TextDisabled("(实验)");
-        }
     }
 
     private void DrawAudioSettings(Configuration config)
@@ -267,7 +249,7 @@ internal sealed class ConfigWindow : Window
 
         if (config.VideoCodec != "auto")
         {
-            string[] codecs = { "hevc_nvenc", "hevc_qsv", "hevc_amf", "h264_nvenc", "h264_qsv", "h264_amf", "av1_nvenc", "libx264", "libx265" };
+            string[] codecs = { "hevc_nvenc", "hevc_qsv", "hevc_amf", "h264_nvenc", "h264_qsv", "h264_amf", "libx264", "libx265" };
             int codecIdx = Array.IndexOf(codecs, config.VideoCodec);
             if (codecIdx < 0) codecIdx = 0;
             if (ImGui.Combo("视频编码器", ref codecIdx, codecs, codecs.Length))

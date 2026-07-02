@@ -385,7 +385,7 @@ public sealed class Plugin : IDalamudPlugin
         Print("命令: start, end, toggle, status, config, output");
         Print("自动录制: autorecord on/off/toggle/status");
         Print("悬浮按钮: floating on/off/toggle/status");
-        Print("参数: fps 30, bitrate 12, audio on/off/toggle/status");
+        Print("参数: fps 60, bitrate 32, audio on/off/toggle/status");
         Print("短命令同样可用: /pktr start, /pktr end");
     }
 

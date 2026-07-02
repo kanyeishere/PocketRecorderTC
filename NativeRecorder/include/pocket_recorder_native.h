@@ -32,7 +32,6 @@ enum pr_codec
 {
     PR_CODEC_H264 = 1,
     PR_CODEC_HEVC = 2,
-    PR_CODEC_AV1 = 3,
 };
 
 enum pr_pixel_format

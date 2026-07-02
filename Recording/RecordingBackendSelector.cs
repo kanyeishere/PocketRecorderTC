@@ -7,12 +7,6 @@ internal static class RecordingBackendSelector
 {
     public static bool ShouldPreferNativeRecorder(Configuration config, out string reason)
     {
-        if (!config.EnableNativeRecorderExperimental)
-        {
-            reason = "NativeRecorder experimental path is disabled; using FFmpeg fallback.";
-            return false;
-        }
-
         if (!config.UseHardwareEncoder)
         {
             reason = "hardware encoder disabled";

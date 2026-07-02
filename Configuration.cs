@@ -8,16 +8,16 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 10;
+    public int Version { get; set; } = 13;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
 
     /// <summary>目标视频码率（bps），0 表示由编码器自动选择。</summary>
-    public int VideoBitrate { get; set; } = 12_000_000;
+    public int VideoBitrate { get; set; } = 32_000_000;
 
     /// <summary>目标帧率上限。</summary>
-    public int TargetFps { get; set; } = 30;
+    public int TargetFps { get; set; } = 60;
 
     /// <summary>是否录制音频。</summary>
     public bool CaptureAudio { get; set; } = true;
@@ -25,13 +25,13 @@ public class Configuration : IPluginConfiguration
     /// <summary>是否优先使用硬件编码器。</summary>
     public bool UseHardwareEncoder { get; set; } = true;
 
-    /// <summary>是否启用实验 NativeRecorder D3D11 shared texture 路径。</summary>
+    /// <summary>历史配置项；NativeRecorder 现在固定优先启用，不再暴露 UI 开关。</summary>
     public bool EnableNativeRecorderExperimental { get; set; } = true;
 
     /// <summary>FFmpeg 可执行文件路径，空则从 PATH 查找。</summary>
     public string FFmpegPath { get; set; } = string.Empty;
 
-    /// <summary>视频编码器（如 h264_nvenc / hevc_nvenc / av1_nvenc / libx264）。</summary>
+    /// <summary>视频编码器（如 h264_nvenc / hevc_nvenc / libx264）。</summary>
     public string VideoCodec { get; set; } = "auto";
 
     /// <summary>编码器预设（auto 表示按实际编码器自动选择）。</summary>
@@ -140,6 +140,48 @@ public class Configuration : IPluginConfiguration
         {
             config.EnableNativeRecorderExperimental = true;
             config.Version = 10;
+            config.Save(pi);
+        }
+
+        if (config.Version < 11)
+        {
+            config.EnableNativeRecorderExperimental = true;
+
+            if (config.VideoBitrate == 12_000_000)
+                config.VideoBitrate = 24_000_000;
+
+            if (config.TargetFps == 30)
+                config.TargetFps = 60;
+
+            config.Version = 11;
+            config.Save(pi);
+        }
+
+        if (config.Version < 12)
+        {
+            if (config.VideoBitrate == 24_000_000)
+                config.VideoBitrate = 32_000_000;
+
+            config.Version = 12;
+            config.Save(pi);
+        }
+
+        if (config.Version < 13)
+        {
+            if (FFmpegEncoderSelector.IsAv1Codec(config.VideoCodec))
+            {
+                config.VideoCodec = "auto";
+                config.EncoderPreset = "auto";
+                config.UseHardwareEncoder = true;
+            }
+
+            config.Version = 13;
+            config.Save(pi);
+        }
+
+        if (!config.EnableNativeRecorderExperimental)
+        {
+            config.EnableNativeRecorderExperimental = true;
             config.Save(pi);
         }
 

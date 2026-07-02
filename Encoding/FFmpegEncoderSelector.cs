@@ -19,12 +19,19 @@ internal static class FFmpegEncoderSelector
     {
         if (!IsAuto(config.VideoCodec))
         {
-            string preset = ResolvePresetForCodec(config.VideoCodec, config.EncoderPreset);
-            return new EncoderSelection(
-                config.VideoCodec,
-                preset,
-                IsHardwareCodec(config.VideoCodec),
-                "manual");
+            if (IsAv1Codec(config.VideoCodec))
+            {
+                Plugin.Log!.Warning($"[FFmpeg] AV1 codec '{config.VideoCodec}' is disabled; falling back to auto hardware selection.");
+            }
+            else
+            {
+                string preset = ResolvePresetForCodec(config.VideoCodec, config.EncoderPreset);
+                return new EncoderSelection(
+                    config.VideoCodec,
+                    preset,
+                    IsHardwareCodec(config.VideoCodec),
+                    "manual");
+            }
         }
 
         if (!config.UseHardwareEncoder)
@@ -60,8 +67,7 @@ internal static class FFmpegEncoderSelector
             return NormalizeManualPreset(codec, configuredPreset);
 
         if (codec.Equals("h264_nvenc", StringComparison.OrdinalIgnoreCase) ||
-            codec.Equals("hevc_nvenc", StringComparison.OrdinalIgnoreCase) ||
-            codec.Equals("av1_nvenc", StringComparison.OrdinalIgnoreCase))
+            codec.Equals("hevc_nvenc", StringComparison.OrdinalIgnoreCase))
             return "p4";
 
         if (codec.Equals("h264_amf", StringComparison.OrdinalIgnoreCase) ||
@@ -89,6 +95,12 @@ internal static class FFmpegEncoderSelector
     {
         return string.IsNullOrWhiteSpace(value) ||
                value.Equals("auto", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsAv1Codec(string? codec)
+    {
+        return !string.IsNullOrWhiteSpace(codec) &&
+               codec.Contains("av1", StringComparison.OrdinalIgnoreCase);
     }
 
     private static EncoderSelection SelectHardwareEncoder(string ffmpegPath, string configuredPreset)

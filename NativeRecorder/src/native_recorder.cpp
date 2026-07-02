@@ -450,8 +450,6 @@ const char* codec_name(int32_t codec)
         return "H264";
     case PR_CODEC_HEVC:
         return "HEVC";
-    case PR_CODEC_AV1:
-        return "AV1";
     default:
         return "unknown";
     }

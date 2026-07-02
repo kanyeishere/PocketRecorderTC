@@ -54,8 +54,8 @@ FFmpeg fallback 路径会在 GPU 上将 BGRA/RGBA 转换为 NV12 后再 readback
 /pktr output                打开输出目录
 /pktr autorecord on/off     开关 8 人副本自动录制
 /pktr floating on/off       显示或隐藏悬浮录制按钮
-/pktr fps 30                设置目标帧率
-/pktr bitrate 12            设置视频码率，单位 Mbps
+/pktr fps 60                设置目标帧率
+/pktr bitrate 32            设置视频码率，单位 Mbps
 /pktr audio on/off          开关系统音频录制
 ```
 

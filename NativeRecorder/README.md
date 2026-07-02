@@ -56,5 +56,5 @@ Implementation plan:
 
 1. Prove the NvEncoderD3D11 + libavformat path in-game at 60/120/144 fps.
 2. Validate the AMF + libavformat path on a real AMD GPU and tune any driver-specific encoder parameters from logs.
-3. Keep HEVC as the default native codec; add AV1 only when the GPU capability probe confirms hardware support.
+3. Keep HEVC as the default native codec.
 4. Add Intel oneVPL behind the same internal backend and muxer interfaces.
