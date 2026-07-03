@@ -1,4 +1,5 @@
 using Recorder.Encoding;
+using Recorder.Diagnostics;
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -31,14 +32,24 @@ internal sealed unsafe partial class VideoCaptureService
         if (sampleCount != 1)
         {
             _skipCount++;
+            string reason = $"Native D3D11 texture path does not support MSAA sampleCount={sampleCount}; falling back to readback.";
             if (_skipCount <= 3)
-                Plugin.Log!.Warning($"[Video] Native D3D11 texture path does not support MSAA sampleCount={sampleCount}; falling back to readback.");
+                Plugin.Log!.Warning($"[Video] {reason}");
+            RecordingDiagnosticLog.WriteNativeFailure("Video", reason);
             PreferD3D11TextureFrames = false;
             return false;
         }
 
         if (!VideoCaptureFormats.IsSupportedReadbackFormat(format))
+        {
+            string reason = $"Native D3D11 texture path does not support source format={format}; falling back to readback.";
+            Plugin.Log!.Warning($"[Video] {reason}");
+            RecordingDiagnosticLog.WriteNativeFailure(
+                "Video",
+                reason);
+            PreferD3D11TextureFrames = false;
             return false;
+        }
 
         DXGI_FORMAT sharedFormat = VideoCaptureFormats.GetNativeSharedFormat(format);
         if (!EnsureNativeSharedTextures(width, height, sharedFormat))
@@ -471,6 +482,9 @@ internal sealed unsafe partial class VideoCaptureService
 
         _nativeSharedFallbackLogged = true;
         Plugin.Log!.Warning($"[Video] Native D3D11 shared texture path disabled; falling back to readback. {reason}");
+        RecordingDiagnosticLog.WriteNativeFailure(
+            "Video",
+            $"Native D3D11 shared texture path disabled; fallback=readback. {reason}");
     }
 
 

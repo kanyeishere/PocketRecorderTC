@@ -30,8 +30,10 @@ struct pr_recorder_t
                 return S_OK;
             }
 
+            std::string failure_detail = get_last_error_copy();
+            amf_backend.reset();
             set_last_error("NativeRecorder AMF + libavformat path unavailable; using FFmpeg fallback. " +
-                get_last_error_copy());
+                failure_detail);
             return hr;
         }
 
@@ -50,8 +52,10 @@ struct pr_recorder_t
             return S_OK;
         }
 
+        std::string failure_detail = get_last_error_copy();
+        nvenc_backend.reset();
         set_last_error("NativeRecorder NvEncoderD3D11 + libavformat path unavailable; using FFmpeg fallback. " +
-            get_last_error_copy());
+            failure_detail);
         return hr;
     }
 

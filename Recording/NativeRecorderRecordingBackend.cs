@@ -21,15 +21,37 @@ internal sealed class NativeRecorderRecordingBackend : IRecordingBackend
     public RecordingBackendProbeResult Probe(RecordingRequest request)
     {
         if (request.ForceFFmpegFallbackForTesting)
+        {
+            RecordingDiagnosticLog.WriteNativeEvent("NativeRecorder", "probe skipped: FFmpeg fallback forced for local testing");
             return RecordingBackendProbeResult.Unavailable("FFmpeg fallback forced for local testing");
+        }
 
         if (!request.UseHardwareEncoder)
+        {
+            RecordingDiagnosticLog.WriteNativeEvent("NativeRecorder", "probe skipped: hardware encoder disabled");
             return RecordingBackendProbeResult.Unavailable("hardware encoder disabled");
+        }
 
         if (!IsCompatibleCodec(request.VideoCodec))
+        {
+            RecordingDiagnosticLog.WriteNativeEvent("NativeRecorder", $"probe skipped: codec {request.VideoCodec} is not native HEVC/H.264 compatible");
             return RecordingBackendProbeResult.Unavailable($"codec {request.VideoCodec} is not native HEVC/H.264 compatible");
+        }
 
         NativeRecorderProbeResult probe = NativeRecorderBackend.Probe();
+        if (probe.IsAvailable)
+        {
+            RecordingDiagnosticLog.WriteNativeEvent(
+                "NativeRecorder",
+                $"probe available: reason={probe.Message}, diagnostics={probe.DiagnosticDetails}");
+        }
+        else
+        {
+            RecordingDiagnosticLog.WriteNativeFailure(
+                "NativeRecorder",
+                $"probe unavailable: reason={probe.Message}, diagnostics={probe.DiagnosticDetails}");
+        }
+
         return probe.IsAvailable
             ? RecordingBackendProbeResult.Available(probe.Message, probe.DiagnosticDetails)
             : RecordingBackendProbeResult.Unavailable(probe.Message, probe.DiagnosticDetails);
@@ -42,7 +64,12 @@ internal sealed class NativeRecorderRecordingBackend : IRecordingBackend
         Action<IOutputSink, string> fatalErrorHandler)
     {
         if (!firstFrame.IsD3D11Texture)
+        {
+            RecordingDiagnosticLog.WriteNativeFailure(
+                "NativeRecorder",
+                $"start rejected first frame: {DescribeFrame(firstFrame)}");
             throw new InvalidOperationException($"NativeRecorder requires D3D11 texture frames, got {firstFrame.PixelFormat}.");
+        }
 
         NativeRecorderWriter? writer = null;
         bool frameHandedToWriter = false;
@@ -50,6 +77,9 @@ internal sealed class NativeRecorderRecordingBackend : IRecordingBackend
         try
         {
             AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
+                "NativeRecorder",
+                $"attempting native writer, firstFrame={DescribeFrame(firstFrame)}, audio={audioFormat != null}, audioMode={request.AudioCaptureMode}");
+            RecordingDiagnosticLog.WriteNativeEvent(
                 "NativeRecorder",
                 $"attempting native writer, firstFrame={DescribeFrame(firstFrame)}, audio={audioFormat != null}, audioMode={request.AudioCaptureMode}");
 
@@ -73,11 +103,14 @@ internal sealed class NativeRecorderRecordingBackend : IRecordingBackend
                 $"NativeRecorder D3D11 {GetCodecLabel(request.VideoCodec)}",
                 CountFirstVideoFrame: false);
         }
-        catch
+        catch (Exception ex)
         {
             if (!frameHandedToWriter)
                 firstFrame.ReturnBuffer();
 
+            RecordingDiagnosticLog.WriteNativeFailure(
+                "NativeRecorder",
+                $"native path failed before start, fallback=FFmpeg rawvideo, exception={ex}, lastStatus={NativeRecorderBackend.GetLastStatus()}");
             AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
                 "NativeRecorder",
                 $"native path failed before start, fallback=FFmpeg rawvideo, lastStatus={NativeRecorderBackend.GetLastStatus()}");

@@ -690,7 +690,7 @@ struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         clear_common_video_state();
         converter.reset();
 
-        if (SUCCEEDED(result))
+        if (initialized && SUCCEEDED(result))
         {
             set_last_error("NativeRecorder finalized via NvEncoderD3D11 + libavformat. " + finalize_stats());
         }
@@ -711,6 +711,7 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         bool in_use = false;
     };
     std::vector<AmfEncoderInputSlot> encoder_input_pool;
+    std::vector<std::string> amf_optional_property_warnings;
     size_t next_encoder_input_slot = 0;
     std::mutex encoder_input_mutex;
 
@@ -816,126 +817,134 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             ", pad=" + std::to_string(encoded_width - video.width) + "x" + std::to_string(encoded_height - video.height) +
             ", vpSourceSupport=" + hex_uint32(converter.source_format_support) +
             ", vpNv12Support=" + hex_uint32(converter.nv12_format_support) +
-            ", amfInput=shared conversion pool -> AMF-owned DX11 NV12 surfaces" +
-            ", output=" + std::string(codec_name(video.codec)) + "/MP4 via AMF + libavformat.";
+            ", amfInput=shared conversion pool -> AMF-owned DX11 NV12 surfaces";
+        std::string optional_summary = amf_optional_property_summary();
+        if (!optional_summary.empty())
+            message += ", amfOptionalSkipped=" + optional_summary;
+        message += ", output=" + std::string(codec_name(video.codec)) + "/MP4 via AMF + libavformat.";
         set_last_error(message);
         return S_OK;
     }
 
+    HRESULT set_amf_required(const wchar_t* property, const amf::AMFVariant& value, const char* label)
+    {
+        AMF_RESULT result = encoder->SetProperty(property, value);
+        if (amf_result_success(result))
+            return S_OK;
+
+        std::string operation = "AMF SetProperty(";
+        operation += label != nullptr ? label : "required";
+        operation += ")";
+        return fail_amf(operation.c_str(), result);
+    }
+
+    void set_amf_optional(const wchar_t* property, const amf::AMFVariant& value, const char* label)
+    {
+        AMF_RESULT result = encoder->SetProperty(property, value);
+        if (amf_result_success(result))
+            return;
+
+        std::string item = label != nullptr ? label : "optional";
+        item += "=";
+        item += amf_result_to_string(result);
+        amf_optional_property_warnings.push_back(std::move(item));
+    }
+
+    std::string amf_optional_property_summary() const
+    {
+        if (amf_optional_property_warnings.empty())
+            return {};
+
+        std::string summary;
+        const size_t count = std::min<size_t>(amf_optional_property_warnings.size(), 6);
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (!summary.empty())
+                summary += "|";
+            summary += amf_optional_property_warnings[i];
+        }
+        if (amf_optional_property_warnings.size() > count)
+            summary += "|+" + std::to_string(amf_optional_property_warnings.size() - count) + " more";
+        return summary;
+    }
+
     HRESULT configure_encoder(int encoded_width, int encoded_height)
     {
+        amf_optional_property_warnings.clear();
         const int fps = std::max(1, video.fps);
         const int64_t bitrate = video.bitrate_bps > 0 ? video.bitrate_bps : 12'000'000;
         const int64_t vbv_buffer_bits = std::max<int64_t>(1, (bitrate / fps) * 3);
-        AMF_RESULT result = AMF_OK;
 
         if (video.codec == PR_CODEC_H264)
         {
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_USAGE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 Usage)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_PROFILE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PROFILE_HIGH)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 Profile)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMESIZE, amf::AMFVariant(AMFConstructSize(encoded_width, encoded_height)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 FrameSize)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, amf::AMFVariant(AMFConstructRate(fps, 1)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 FrameRate)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 TargetBitrate)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 PeakBitrate)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 RateControl)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 QualityPreset)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_MEMORY_TYPE, amf::AMFVariant(static_cast<amf_int64>(amf::AMF_MEMORY_DX11)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 MemoryType)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_OUTPUT_MODE_FRAME)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 OutputMode)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_MAX_CONSECUTIVE_BPICTURES, amf::AMFVariant(static_cast<amf_int64>(0)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 BFrames)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, amf::AMFVariant(static_cast<amf_int64>(0)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 BPicturePattern)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_B_REFERENCE_ENABLE, amf::AMFVariant(false));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 BReference)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, amf::AMFVariant(static_cast<amf_int64>(1)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 MaxRefFrames)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_MAX_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 MaxTemporalLayers)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE, amf::AMFVariant(false));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 PreAnalysis)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_PREENCODE_ENABLE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PREENCODE_DISABLED)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 PreEncode)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE, amf::AMFVariant(false));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 SkipFrame)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, amf::AMFVariant(static_cast<amf_int64>(vbv_buffer_bits)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 VBV)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_INITIAL_VBV_BUFFER_FULLNESS, amf::AMFVariant(static_cast<amf_int64>(64)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 InitialVBV)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_ENFORCE_HRD, amf::AMFVariant(true));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 EnforceHRD)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_ENABLE_VBAQ, amf::AMFVariant(false));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 VBAQ)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_QUERY_TIMEOUT, amf::AMFVariant(static_cast<amf_int64>(0)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 QueryTimeout)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, amf::AMFVariant(static_cast<amf_int64>(fps * 2)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 IDRPeriod)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING, amf::AMFVariant(static_cast<amf_int64>(fps * 2)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 HeaderInsertion)", result);
+            set_amf_optional(AMF_VIDEO_ENCODER_USAGE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY)), "H264 Usage");
+            set_amf_optional(AMF_VIDEO_ENCODER_PROFILE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PROFILE_HIGH)), "H264 Profile");
+            HRESULT hr = set_amf_required(AMF_VIDEO_ENCODER_FRAMESIZE, amf::AMFVariant(AMFConstructSize(encoded_width, encoded_height)), "H264 FrameSize");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_FRAMERATE, amf::AMFVariant(AMFConstructRate(fps, 1)), "H264 FrameRate");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_TARGET_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)), "H264 TargetBitrate");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_PEAK_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)), "H264 PeakBitrate");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR)), "H264 RateControl");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_QUALITY_PRESET, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED)), "H264 QualityPreset");
+            if (FAILED(hr)) return hr;
+
+            set_amf_optional(AMF_VIDEO_ENCODER_MEMORY_TYPE, amf::AMFVariant(static_cast<amf_int64>(amf::AMF_MEMORY_DX11)), "H264 MemoryType");
+            set_amf_optional(AMF_VIDEO_ENCODER_OUTPUT_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_OUTPUT_MODE_FRAME)), "H264 OutputMode");
+            set_amf_optional(AMF_VIDEO_ENCODER_MAX_CONSECUTIVE_BPICTURES, amf::AMFVariant(static_cast<amf_int64>(0)), "H264 BFrames");
+            set_amf_optional(AMF_VIDEO_ENCODER_B_PIC_PATTERN, amf::AMFVariant(static_cast<amf_int64>(0)), "H264 BPicturePattern");
+            set_amf_optional(AMF_VIDEO_ENCODER_B_REFERENCE_ENABLE, amf::AMFVariant(false), "H264 BReference");
+            set_amf_optional(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, amf::AMFVariant(static_cast<amf_int64>(1)), "H264 MaxRefFrames");
+            set_amf_optional(AMF_VIDEO_ENCODER_MAX_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)), "H264 MaxTemporalLayers");
+            set_amf_optional(AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE, amf::AMFVariant(false), "H264 PreAnalysis");
+            set_amf_optional(AMF_VIDEO_ENCODER_PREENCODE_ENABLE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PREENCODE_DISABLED)), "H264 PreEncode");
+            set_amf_optional(AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE, amf::AMFVariant(false), "H264 SkipFrame");
+            set_amf_optional(AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, amf::AMFVariant(static_cast<amf_int64>(vbv_buffer_bits)), "H264 VBV");
+            set_amf_optional(AMF_VIDEO_ENCODER_INITIAL_VBV_BUFFER_FULLNESS, amf::AMFVariant(static_cast<amf_int64>(64)), "H264 InitialVBV");
+            set_amf_optional(AMF_VIDEO_ENCODER_ENFORCE_HRD, amf::AMFVariant(true), "H264 EnforceHRD");
+            set_amf_optional(AMF_VIDEO_ENCODER_ENABLE_VBAQ, amf::AMFVariant(false), "H264 VBAQ");
+            set_amf_optional(AMF_VIDEO_ENCODER_QUERY_TIMEOUT, amf::AMFVariant(static_cast<amf_int64>(0)), "H264 QueryTimeout");
+            set_amf_optional(AMF_VIDEO_ENCODER_IDR_PERIOD, amf::AMFVariant(static_cast<amf_int64>(fps * 2)), "H264 IDRPeriod");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING, amf::AMFVariant(static_cast<amf_int64>(fps * 2)), "H264 HeaderInsertion");
         }
         else
         {
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_USAGE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_USAGE_ULTRA_LOW_LATENCY)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC Usage)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PROFILE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC Profile)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMESIZE, amf::AMFVariant(AMFConstructSize(encoded_width, encoded_height)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC FrameSize)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMERATE, amf::AMFVariant(AMFConstructRate(fps, 1)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC FrameRate)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC TargetBitrate)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC PeakBitrate)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC RateControl)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC QualityPreset)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_MEMORY_TYPE, amf::AMFVariant(static_cast<amf_int64>(amf::AMF_MEMORY_DX11)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC MemoryType)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE_FRAME)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC OutputMode)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES, amf::AMFVariant(static_cast<amf_int64>(1)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC MaxRefFrames)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC MaxTemporalLayers)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC TemporalLayers)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PRE_ANALYSIS_ENABLE, amf::AMFVariant(false));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC PreAnalysis)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PREENCODE_ENABLE, amf::AMFVariant(false));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC PreEncode)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_SKIP_FRAME_ENABLE, amf::AMFVariant(false));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC SkipFrame)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE, amf::AMFVariant(static_cast<amf_int64>(vbv_buffer_bits)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC VBV)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_INITIAL_VBV_BUFFER_FULLNESS, amf::AMFVariant(static_cast<amf_int64>(64)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC InitialVBV)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD, amf::AMFVariant(true));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC EnforceHRD)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, amf::AMFVariant(false));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC VBAQ)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_HIGH_MOTION_QUALITY_BOOST_ENABLE, amf::AMFVariant(false));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC HighMotionQualityBoost)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_SLICES_PER_FRAME, amf::AMFVariant(static_cast<amf_int64>(1)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC SlicesPerFrame)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT, amf::AMFVariant(static_cast<amf_int64>(0)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC QueryTimeout)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, amf::AMFVariant(static_cast<amf_int64>(fps * 2)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC GOP)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, amf::AMFVariant(static_cast<amf_int64>(1)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC IDR)", result);
-            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED)));
-            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC HeaderInsertion)", result);
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_USAGE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_USAGE_ULTRA_LOW_LATENCY)), "HEVC Usage");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_PROFILE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN)), "HEVC Profile");
+            HRESULT hr = set_amf_required(AMF_VIDEO_ENCODER_HEVC_FRAMESIZE, amf::AMFVariant(AMFConstructSize(encoded_width, encoded_height)), "HEVC FrameSize");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_HEVC_FRAMERATE, amf::AMFVariant(AMFConstructRate(fps, 1)), "HEVC FrameRate");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)), "HEVC TargetBitrate");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)), "HEVC PeakBitrate");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR)), "HEVC RateControl");
+            if (FAILED(hr)) return hr;
+            hr = set_amf_required(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED)), "HEVC QualityPreset");
+            if (FAILED(hr)) return hr;
+
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_MEMORY_TYPE, amf::AMFVariant(static_cast<amf_int64>(amf::AMF_MEMORY_DX11)), "HEVC MemoryType");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE_FRAME)), "HEVC OutputMode");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES, amf::AMFVariant(static_cast<amf_int64>(1)), "HEVC MaxRefFrames");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)), "HEVC MaxTemporalLayers");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)), "HEVC TemporalLayers");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_PRE_ANALYSIS_ENABLE, amf::AMFVariant(false), "HEVC PreAnalysis");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_PREENCODE_ENABLE, amf::AMFVariant(false), "HEVC PreEncode");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_SKIP_FRAME_ENABLE, amf::AMFVariant(false), "HEVC SkipFrame");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE, amf::AMFVariant(static_cast<amf_int64>(vbv_buffer_bits)), "HEVC VBV");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_INITIAL_VBV_BUFFER_FULLNESS, amf::AMFVariant(static_cast<amf_int64>(64)), "HEVC InitialVBV");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD, amf::AMFVariant(true), "HEVC EnforceHRD");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, amf::AMFVariant(false), "HEVC VBAQ");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_HIGH_MOTION_QUALITY_BOOST_ENABLE, amf::AMFVariant(false), "HEVC HighMotionQualityBoost");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_SLICES_PER_FRAME, amf::AMFVariant(static_cast<amf_int64>(1)), "HEVC SlicesPerFrame");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT, amf::AMFVariant(static_cast<amf_int64>(0)), "HEVC QueryTimeout");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, amf::AMFVariant(static_cast<amf_int64>(fps * 2)), "HEVC GOP");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, amf::AMFVariant(static_cast<amf_int64>(1)), "HEVC IDR");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED)), "HEVC HeaderInsertion");
         }
 
         return S_OK;
@@ -1271,7 +1280,7 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         clear_common_video_state();
         converter.reset();
 
-        if (SUCCEEDED(result))
+        if (initialized && SUCCEEDED(result))
         {
             set_last_error("NativeRecorder finalized via AMF + libavformat. " + finalize_stats());
         }

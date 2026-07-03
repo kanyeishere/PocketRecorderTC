@@ -71,6 +71,7 @@ internal sealed class RecordingFinalizer
 
         _log.Info($"[Record] Saved: {job.OutputPath}, finalize={finalizeSw.ElapsedMilliseconds}ms");
         AmdRecordingDiagnosticLog.FinishSession($"saved=true, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}");
+        RecordingDiagnosticLog.FinishSession($"saved=true, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}");
         if (job.OutputPath != null)
         {
             try

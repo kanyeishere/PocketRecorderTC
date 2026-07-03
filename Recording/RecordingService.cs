@@ -139,7 +139,19 @@ internal sealed class RecordingService : IDisposable
                 config.UseHardwareEncoder,
                 config.IncludeOverlay,
                 config.EffectiveForceFFmpegFallbackForTesting);
+            RecordingDiagnosticLog.StartSession(
+                request.SessionId,
+                request.TargetFps,
+                request.VideoBitrate,
+                request.VideoCodec,
+                request.EncoderPreset,
+                request.UseHardwareEncoder,
+                request.AudioCaptureMode,
+                request.IncludeOverlay,
+                request.ForceFFmpegFallbackForTesting,
+                !request.ForceFFmpegFallbackForTesting && request.UseHardwareEncoder);
             backendPlan = _backendSelector.SelectInitial(request);
+            RecordingDiagnosticLog.UpdateBackendSelection(backendPlan.Reason, backendPlan.NativeRecorderProbeReason);
 
             _request = request;
             _backendPlan = backendPlan;
@@ -219,6 +231,7 @@ internal sealed class RecordingService : IDisposable
 
             _environment.Log.Warning("[Record] Video capture could not start; recording aborted.");
             AmdRecordingDiagnosticLog.FinishSession("video capture could not start; recording aborted");
+            RecordingDiagnosticLog.FinishSession("video capture could not start; recording aborted");
             RecordingStateChanged?.Invoke(false);
             return false;
         }
@@ -344,6 +357,9 @@ internal sealed class RecordingService : IDisposable
                 AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
                     backendPlan.Backend.DisplayName,
                     $"backend failed before start, fallback=FFmpeg rawvideo, exception={ex}");
+                RecordingDiagnosticLog.WriteIfEnabled(
+                    backendPlan.Backend.DisplayName,
+                    $"backend failed before start, fallback=FFmpeg rawvideo, exception={ex}");
                 SwitchToFFmpegFallback(request.SessionId, ex.Message);
                 return;
             }
@@ -407,6 +423,7 @@ internal sealed class RecordingService : IDisposable
 
         _environment.Log.Warning($"[Record] Writer failed; stopping recording automatically. {message}");
         AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", $"writer fatal error, message={message}");
+        RecordingDiagnosticLog.WriteIfEnabled("Record", $"writer fatal error, message={message}");
         StopRecording();
     }
 
@@ -533,6 +550,7 @@ internal sealed class RecordingService : IDisposable
         }
 
         AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", "switched capture to FFmpeg fallback; D3D11 texture preference disabled");
+        RecordingDiagnosticLog.WriteIfEnabled("Record", "switched capture to FFmpeg fallback; D3D11 texture preference disabled");
     }
 
     public void StopRecording()
@@ -625,6 +643,7 @@ internal sealed class RecordingService : IDisposable
         DisposeVideoCapture(videoCapture);
         StopAndDisposeAudioCapture(audioCapture);
         AmdRecordingDiagnosticLog.FinishSession("start aborted");
+        RecordingDiagnosticLog.FinishSession("start aborted");
 
         RecordingStateChanged?.Invoke(false);
 

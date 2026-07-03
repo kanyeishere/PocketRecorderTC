@@ -105,28 +105,29 @@ std::string wide_to_utf8(const wchar_t* text)
 
 std::string hresult_to_string(HRESULT hr)
 {
-    char* message = nullptr;
+    wchar_t* message = nullptr;
     DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER |
                   FORMAT_MESSAGE_FROM_SYSTEM |
                   FORMAT_MESSAGE_IGNORE_INSERTS;
-    DWORD length = FormatMessageA(
+    DWORD length = FormatMessageW(
         flags,
         nullptr,
         static_cast<DWORD>(hr),
         MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-        reinterpret_cast<LPSTR>(&message),
+        reinterpret_cast<LPWSTR>(&message),
         0,
         nullptr);
 
-    std::string result = "HRESULT 0x" + std::to_string(static_cast<uint32_t>(hr));
+    char hex[16]{};
+    sprintf_s(hex, "%08X", static_cast<uint32_t>(hr));
+    std::string result = "HRESULT 0x";
+    result += hex;
     if (length > 0 && message != nullptr)
     {
-        result.assign(message, length);
+        result = wide_to_utf8(message);
         while (!result.empty() && (result.back() == '\r' || result.back() == '\n' || result.back() == '.'))
             result.pop_back();
         result += " (0x";
-        char hex[16]{};
-        sprintf_s(hex, "%08X", static_cast<uint32_t>(hr));
         result += hex;
         result += ")";
     }

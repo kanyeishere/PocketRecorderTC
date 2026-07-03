@@ -74,9 +74,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
         _firstVideoFrameException = null;
         _firstVideoFrameSubmitted.Reset();
 
-        AmdRecordingDiagnosticLog.Write(
-            "NativeRecorder",
-            $"starting native writer, video={videoFormat.Width}x{videoFormat.Height}@{_videoFps}, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}");
+        string startMessage = $"starting native writer, video={videoFormat.Width}x{videoFormat.Height}@{_videoFps}, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}";
+        RecordingDiagnosticLog.WriteNativeEvent("NativeRecorder", startMessage);
+        AmdRecordingDiagnosticLog.Write("NativeRecorder", startMessage);
 
         _session = NativeRecorderBackend.Create(
             _outputPath,
@@ -225,6 +225,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
                 else
                 {
                     Plugin.Log!.Warning($"[NativeRecorder] Video submit failed: {ex.Message}");
+                    RecordingDiagnosticLog.WriteNativeFailure(
+                        "NativeRecorder",
+                        $"video submit failed, exception={ex}, lastStatus={_session?.GetLastStatus()}");
                     AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
                         "NativeRecorder",
                         $"video submit failed, exception={ex}, lastStatus={_session?.GetLastStatus()}");
@@ -245,6 +248,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
 
         DrainQueuedVideoFrames();
         Plugin.Log!.Info($"[NativeRecorder] Video writer thread exiting. input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
+        RecordingDiagnosticLog.WriteIfEnabled(
+            "NativeRecorder",
+            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
         AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
             $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
@@ -290,6 +296,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
                 string status = _session.GetLastStatus();
                 string suffix = string.IsNullOrWhiteSpace(status) ? string.Empty : $" lastStatus={status}";
                 Plugin.Log!.Warning($"[NativeRecorder] First texture was not ready after retry. attempts={attempts}, retryMs={retrySw.ElapsedMilliseconds}.{suffix}");
+                RecordingDiagnosticLog.WriteNativeFailure(
+                    "NativeRecorder",
+                    $"first texture was not ready after retry, attempts={attempts}, retryMs={retrySw.ElapsedMilliseconds}, lastStatus={status}");
                 return false;
             }
 
@@ -317,6 +326,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
                 else
                 {
                     Plugin.Log!.Warning($"[NativeRecorder] Audio submit failed: {ex.Message}");
+                    RecordingDiagnosticLog.WriteNativeFailure(
+                        "NativeRecorder",
+                        $"audio submit failed, exception={ex}, lastStatus={_session?.GetLastStatus()}");
                     AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
                         "NativeRecorder",
                         $"audio submit failed, exception={ex}, lastStatus={_session?.GetLastStatus()}");
@@ -335,6 +347,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
 
         _stopped = true;
         Plugin.Log!.Info($"[NativeRecorder] Stopping... input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
+        RecordingDiagnosticLog.WriteIfEnabled(
+            "NativeRecorder",
+            $"stopping, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
         AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
             $"stopping, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
@@ -345,12 +360,14 @@ internal sealed class NativeRecorderWriter : IOutputSink
         if (_videoWriterThread != null && !_videoWriterThread.Join(5_000))
         {
             Plugin.Log!.Warning("[NativeRecorder] Video writer did not finish in 5s.");
+            RecordingDiagnosticLog.WriteNativeFailure("NativeRecorder", "video writer did not finish in 5s");
             AmdRecordingDiagnosticLog.Write("NativeRecorder", "video writer did not finish in 5s");
         }
 
         if (_audioWriterThread != null && !_audioWriterThread.Join(5_000))
         {
             Plugin.Log!.Warning("[NativeRecorder] Audio writer did not finish in 5s.");
+            RecordingDiagnosticLog.WriteNativeFailure("NativeRecorder", "audio writer did not finish in 5s");
             AmdRecordingDiagnosticLog.Write("NativeRecorder", "audio writer did not finish in 5s");
         }
 
@@ -407,6 +424,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private void LogNativeStatusToDiagnostics(string prefix)
     {
         string status = _session?.GetLastStatus() ?? string.Empty;
+        RecordingDiagnosticLog.WriteNativeEvent(
+            "NativeRecorder",
+            string.IsNullOrWhiteSpace(status) ? prefix : $"{prefix}: {status}");
         AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
             "NativeRecorder",
             string.IsNullOrWhiteSpace(status) ? prefix : $"{prefix}: {status}");
