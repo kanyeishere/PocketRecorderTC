@@ -1074,6 +1074,56 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         next_encoder_input_slot = 0;
     }
 
+    HRESULT acquire_encoder_input_slot_with_backpressure(size_t& slot_index, amf::AMFSurfacePtr& surface, ID3D11Texture2D** texture)
+    {
+        const auto start = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            HRESULT hr = acquire_encoder_input_slot(slot_index, surface, texture);
+            if (hr != DXGI_ERROR_WAS_STILL_DRAWING)
+                return hr;
+
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed_ms >= kAmfInputFullRetryTimeoutMs)
+            {
+                set_last_error("NativeRecorder AMF encoder input surface pool stayed full for " +
+                    std::to_string(kAmfInputFullRetryTimeoutMs) + "ms; dropping one frame.");
+                return hr;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(kAmfInputFullRetrySleepMs));
+            hr = drain_output(false);
+            if (FAILED(hr))
+                return hr;
+        }
+    }
+
+    HRESULT submit_input_with_backpressure(const amf::AMFSurfacePtr& surface, AMF_RESULT& result)
+    {
+        const auto start = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            result = encoder->SubmitInput(surface);
+            if (result != AMF_INPUT_FULL)
+                return S_OK;
+
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed_ms >= kAmfInputFullRetryTimeoutMs)
+            {
+                set_last_error("NativeRecorder AMF encoder input queue stayed full for " +
+                    std::to_string(kAmfInputFullRetryTimeoutMs) + "ms; dropping one frame.");
+                return S_OK;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(kAmfInputFullRetrySleepMs));
+            HRESULT hr = drain_output(false);
+            if (FAILED(hr))
+                return hr;
+        }
+    }
+
     HRESULT process_queued_frame(const NativePendingVideoFrame& frame) override
     {
         ComPtr<ID3D11Texture2D> nv12_texture;
@@ -1086,17 +1136,7 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         size_t encoder_slot = 0;
         amf::AMFSurfacePtr surface;
         ID3D11Texture2D* encoder_texture = nullptr;
-        HRESULT hr = acquire_encoder_input_slot(encoder_slot, surface, &encoder_texture);
-        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
-        {
-            HRESULT drain_hr = drain_output(false);
-            if (FAILED(drain_hr))
-            {
-                release_conversion_slot(frame.slot_index);
-                return drain_hr;
-            }
-            hr = acquire_encoder_input_slot(encoder_slot, surface, &encoder_texture);
-        }
+        HRESULT hr = acquire_encoder_input_slot_with_backpressure(encoder_slot, surface, &encoder_texture);
         if (FAILED(hr))
         {
             release_conversion_slot(frame.slot_index);
@@ -1141,22 +1181,16 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             }
         }
 
-        result = encoder->SubmitInput(surface);
-        if (result == AMF_INPUT_FULL)
+        hr = submit_input_with_backpressure(surface, result);
+        if (FAILED(hr))
         {
-            hr = drain_output(false);
-            if (FAILED(hr))
-            {
-                release_encoder_input_slot(encoder_slot);
-                return hr;
-            }
-            result = encoder->SubmitInput(surface);
+            release_encoder_input_slot(encoder_slot);
+            return hr;
         }
         if (result == AMF_INPUT_FULL)
         {
             release_encoder_input_slot(encoder_slot);
             ++counters.encoder_input_full_drops;
-            set_last_error("NativeRecorder AMF encoder input queue is full; dropping one frame.");
             return S_OK;
         }
         if (result != AMF_OK && result != AMF_NEED_MORE_INPUT)

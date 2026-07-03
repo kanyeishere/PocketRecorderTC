@@ -57,6 +57,8 @@ constexpr size_t kNativeNv12ConversionPoolSize = 8;
 constexpr size_t kAmfEncoderInputPoolSize = 8;
 constexpr size_t kMaxNativeVideoQueueItems = 8;
 constexpr size_t kMaxMuxQueueItems = 512;
+constexpr int kAmfInputFullRetryTimeoutMs = 5'000;
+constexpr int kAmfInputFullRetrySleepMs = 1;
 
 std::mutex g_error_mutex;
 std::string g_last_error;
