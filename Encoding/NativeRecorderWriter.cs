@@ -2,7 +2,6 @@ using Recorder.Capture;
 using Recorder.Diagnostics;
 using Recorder.Recording;
 using System;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading;
 
@@ -22,8 +21,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private readonly int _nativeCodec;
     private readonly string _nativeCodecName;
     private NativeRecorderSession? _session;
-    private BlockingCollection<VideoFrame>? _videoQueue;
-    private BlockingCollection<AudioPacket>? _audioQueue;
+    private BoundedMediaQueue<VideoFrame>? _videoQueue;
+    private BoundedMediaQueue<AudioPacket>? _audioQueue;
     private Thread? _videoWriterThread;
     private Thread? _audioWriterThread;
     private readonly ManualResetEventSlim _firstVideoFrameSubmitted = new(false);
@@ -87,7 +86,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             _nativeCodec);
         LogNativeStatusToDiagnostics("NativeRecorder create status");
 
-        _videoQueue = new BlockingCollection<VideoFrame>(MaxVideoQueueSize);
+        _videoQueue = new BoundedMediaQueue<VideoFrame>(MaxVideoQueueSize);
         _videoWriterThread = new Thread(VideoWriterLoop)
         {
             IsBackground = true,
@@ -97,7 +96,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
 
         if (audioFormat != null)
         {
-            _audioQueue = new BlockingCollection<AudioPacket>(MaxAudioQueueSize);
+            _audioQueue = new BoundedMediaQueue<AudioPacket>(MaxAudioQueueSize);
             _audioWriterThread = new Thread(AudioWriterLoop)
             {
                 IsBackground = true,
@@ -125,39 +124,20 @@ internal sealed class NativeRecorderWriter : IOutputSink
             return;
         }
 
-        bool added = false;
-        while (!added)
+        if (_videoQueue.TryEnqueueDropOldest(frame, droppedFrame => droppedFrame.ReturnBuffer(), out int droppedCount))
         {
-            try
+            if (droppedCount > 0)
             {
-                added = _videoQueue.TryAdd(frame, 0);
-            }
-            catch (InvalidOperationException)
-            {
-                frame.ReturnBuffer();
-                return;
-            }
-
-            if (added)
-                break;
-
-            if (_videoQueue.TryTake(out var droppedFrame))
-            {
-                droppedFrame.ReturnBuffer();
-                int dropped = Interlocked.Increment(ref _droppedFrameCount);
+                int dropped = Interlocked.Add(ref _droppedFrameCount, droppedCount);
                 if (dropped <= 5 || dropped % 60 == 0)
                     Plugin.Log!.Warning($"[NativeRecorder] Video queue full, dropped a captured texture frame. dropped={dropped}");
             }
-            else
-            {
-                break;
-            }
+
+            Interlocked.Increment(ref _inputFrameCount);
+            return;
         }
 
-        if (added)
-            Interlocked.Increment(ref _inputFrameCount);
-        else
-            frame.ReturnBuffer();
+        frame.ReturnBuffer();
     }
 
     public void WriteAudioPacket(AudioPacket packet)
@@ -165,7 +145,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
         if (_stopped || _audioQueue == null)
             return;
 
-        if (!_audioQueue.TryAdd(packet, 0))
+        if (!_audioQueue.TryEnqueueDropIncoming(packet))
             Plugin.Log!.Warning("[NativeRecorder] Audio queue full, dropped a packet.");
     }
 
@@ -359,8 +339,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
             "NativeRecorder",
             $"stopping, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
 
-        try { _videoQueue?.CompleteAdding(); } catch { }
-        try { _audioQueue?.CompleteAdding(); } catch { }
+        _videoQueue?.CompleteAdding();
+        _audioQueue?.CompleteAdding();
 
         if (_videoWriterThread != null && !_videoWriterThread.Join(5_000))
         {
@@ -394,14 +374,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
         if (_videoQueue == null)
             return 0;
 
-        int drained = 0;
-        while (_videoQueue.TryTake(out var pendingFrame))
-        {
-            pendingFrame.ReturnBuffer();
-            drained++;
-        }
-
-        return drained;
+        return _videoQueue.Drain(pendingFrame => pendingFrame.ReturnBuffer());
     }
 
     private bool IsSubmitPressureActive()

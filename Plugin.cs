@@ -26,6 +26,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IDutyState DutyState { get; private set; } = null!;
 
     internal Configuration Config { get; }
+    internal IRecorderEnvironment Environment { get; }
     internal RecordingService RecordingService { get; }
     internal AutoDutyRecordingService AutoDutyRecordingService { get; }
     internal ConfigWindow ConfigWindow { get; }
@@ -40,9 +41,10 @@ public sealed class Plugin : IDalamudPlugin
     {
         DService.Init(pluginInterface);
         NativeRecorderBackend.ConfigureFromPluginInterface(pluginInterface);
+        Environment = new DalamudRecorderEnvironment(pluginInterface, Log);
         Config = Configuration.Load(pluginInterface);
 
-        RecordingService = new RecordingService(this, GameInterop);
+        RecordingService = new RecordingService(this, GameInterop, Environment);
         AutoDutyRecordingService = new AutoDutyRecordingService(this, ClientState, DutyState, Framework);
         ConfigWindow = new ConfigWindow(this);
         FloatingRecordWindow = new FloatingRecordWindow(this);

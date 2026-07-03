@@ -23,13 +23,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
 
     // D3D11 对象
     private ID3D11Device* _device;
-    private readonly IntPtr[] _stagingTextures = new IntPtr[StagingTextureCount];
-    private uint _stagingWidth;
-    private uint _stagingHeight;
-    private DXGI_FORMAT _stagingFormat;
-    private IntPtr _stagingDevice;
-    private int _stagingWriteIndex;
-    private int _stagingReadyCount;
+    private readonly D3D11ReadbackTextureRing _stagingReadback = new(StagingTextureCount);
     private ID3D11Texture2D* _nv12SourceTexture;
     private ID3D11ShaderResourceView* _nv12SourceSrv;
     private ID3D11Buffer* _nv12OutputBuffer;
@@ -78,8 +72,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private bool _disposed;
     private int _stopStarted;
     private int _targetFps = 60;
-    private long _minFrameIntervalTicks;
-    private long _nextFrameDueTicks;
+    private readonly VideoCaptureFramePacer _framePacer = new();
     private readonly Stopwatch _sw = new();
     private int _frameCount;
     private int _skipCount;
@@ -111,84 +104,6 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private const uint D3D11ResourceMiscSharedKeyedMutex = 0x100;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
     private const int WAIT_TIMEOUT = 0x00000102;
-    private const string Nv12ComputeShaderSource = @"
-Texture2D<float4> SourceTexture : register(t0);
-RWByteAddressBuffer Nv12Output : register(u0);
-
-cbuffer Nv12Constants : register(b0)
-{
-    uint SourceWidth;
-    uint SourceHeight;
-    uint OutputWidth;
-    uint OutputHeight;
-};
-
-float3 LoadRgb(uint2 p)
-{
-    if (p.x >= SourceWidth || p.y >= SourceHeight)
-        return float3(0.0, 0.0, 0.0);
-
-    float4 c = SourceTexture.Load(int3(p, 0));
-    return c.rgb;
-}
-
-uint PackByte(uint value, uint byteIndex)
-{
-    return (value & 0xffu) << (byteIndex * 8u);
-}
-
-uint Pack4(uint b0, uint b1, uint b2, uint b3)
-{
-    return PackByte(b0, 0u) | PackByte(b1, 1u) | PackByte(b2, 2u) | PackByte(b3, 3u);
-}
-
-uint ToY(float3 rgb)
-{
-    float y = 16.0 + 219.0 * dot(rgb, float3(0.2126, 0.7152, 0.0722));
-    return (uint)clamp(round(y), 16.0, 235.0);
-}
-
-uint ToU(float3 rgb)
-{
-    float u = 128.0 + 224.0 * dot(rgb, float3(-0.114572, -0.385428, 0.500000));
-    return (uint)clamp(round(u), 16.0, 240.0);
-}
-
-uint ToV(float3 rgb)
-{
-    float v = 128.0 + 224.0 * dot(rgb, float3(0.500000, -0.454153, -0.045847));
-    return (uint)clamp(round(v), 16.0, 240.0);
-}
-
-[numthreads(16, 16, 1)]
-void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
-{
-    uint blockX = dispatchThreadId.x * 4u;
-    uint blockY = dispatchThreadId.y * 2u;
-    if (blockX >= OutputWidth || blockY >= OutputHeight)
-        return;
-
-    float3 c00 = LoadRgb(uint2(blockX + 0u, blockY + 0u));
-    float3 c10 = LoadRgb(uint2(blockX + 1u, blockY + 0u));
-    float3 c20 = LoadRgb(uint2(blockX + 2u, blockY + 0u));
-    float3 c30 = LoadRgb(uint2(blockX + 3u, blockY + 0u));
-    float3 c01 = LoadRgb(uint2(blockX + 0u, blockY + 1u));
-    float3 c11 = LoadRgb(uint2(blockX + 1u, blockY + 1u));
-    float3 c21 = LoadRgb(uint2(blockX + 2u, blockY + 1u));
-    float3 c31 = LoadRgb(uint2(blockX + 3u, blockY + 1u));
-
-    uint yBase0 = blockY * OutputWidth + blockX;
-    uint yBase1 = (blockY + 1u) * OutputWidth + blockX;
-    Nv12Output.Store(yBase0, Pack4(ToY(c00), ToY(c10), ToY(c20), ToY(c30)));
-    Nv12Output.Store(yBase1, Pack4(ToY(c01), ToY(c11), ToY(c21), ToY(c31)));
-
-    uint uvBase = OutputWidth * OutputHeight + (blockY / 2u) * OutputWidth + blockX;
-    float3 avg0 = (c00 + c10 + c01 + c11) * 0.25;
-    float3 avg1 = (c20 + c30 + c21 + c31) * 0.25;
-    Nv12Output.Store(uvBase, Pack4(ToU(avg0), ToV(avg0), ToU(avg1), ToV(avg1)));
-}
-";
-
     private static readonly Guid IID_ID3D11Texture2D = new(0x6F15AAF2, 0xD208, 0x4E89, 0x9A, 0xB4, 0x48, 0x95, 0x35, 0xD3, 0x4F, 0x9C);
     private static readonly Guid IID_ID3D11Device = new(0xdb6f6ddb, 0xac77, 0x4e88, 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40);
     public int CurrentWidth { get; private set; }
@@ -208,7 +123,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     public bool Start(int targetFps)
     {
         _targetFps = Math.Max(1, targetFps);
-        _minFrameIntervalTicks = Math.Max(1, Stopwatch.Frequency / _targetFps);
+        _framePacer.Reset(_targetFps);
         _capturing = false;
         _frameCount = 0;
         _skipCount = 0;
@@ -236,7 +151,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         Array.Clear(_nv12ReadbackSlotStates);
         Array.Clear(_nativeSharedSlotStates);
         _nv12PerfStats.Reset();
-        _nextFrameDueTicks = 0;
         _sw.Restart();
 
         if (TryInstallPresentHook(enable: true))
@@ -450,23 +364,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     }
 
     private bool ShouldCaptureThisPresent(long now)
-    {
-        if (_nextFrameDueTicks == 0)
-        {
-            _nextFrameDueTicks = now + _minFrameIntervalTicks;
-            return true;
-        }
-
-        if (now < _nextFrameDueTicks)
-            return false;
-
-        long nextDue = _nextFrameDueTicks + _minFrameIntervalTicks;
-        if (now - _nextFrameDueTicks > _minFrameIntervalTicks)
-            nextDue = now + _minFrameIntervalTicks;
-
-        _nextFrameDueTicks = nextDue;
-        return true;
-    }
+        => _framePacer.ShouldCapture(now);
 
     // ──────────────────────────────────────────────────────────
     //  共享：纹理处理
@@ -514,13 +412,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             if (TryProcessTextureAsNv12(ctx, srcTexture, width, height, format, timestampTicks, readbackDiagnosticsPending))
                 return;
 
-            if (!EnsureStagingTextures(width, height, format))
+            if (!_stagingReadback.Ensure(_device, width, height, format, message => Plugin.Log!.Error(message)))
                 return;
 
-            ID3D11Texture2D* writeTexture = (ID3D11Texture2D*)_stagingTextures[_stagingWriteIndex];
-            ID3D11Texture2D* readTexture = _stagingReadyCount >= StagingTextureCount - 1
-                ? (ID3D11Texture2D*)_stagingTextures[(_stagingWriteIndex + 1) % StagingTextureCount]
-                : null;
+            ID3D11Texture2D* writeTexture = _stagingReadback.GetWriteTexture();
+            ID3D11Texture2D* readTexture = _stagingReadback.GetReadTexture();
 
             bool mappedOk = false;
             VideoFrame? frame = null;
@@ -539,9 +435,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                     0,
                     null);
 
-                _stagingWriteIndex = (_stagingWriteIndex + 1) % StagingTextureCount;
-                if (_stagingReadyCount < StagingTextureCount)
-                    _stagingReadyCount++;
+                _stagingReadback.MarkWriteSubmitted();
 
                 if (readTexture == null)
                     return;
@@ -789,69 +683,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             Plugin.Log.Warning("[Video] ⚠ ALL sample RGB values are black, but alpha is non-zero.");
     }
 
-    private bool EnsureStagingTextures(uint width, uint height, DXGI_FORMAT format)
-    {
-        if (_stagingTextures[0] != IntPtr.Zero &&
-            width == _stagingWidth &&
-            height == _stagingHeight &&
-            format == _stagingFormat &&
-            _stagingDevice == (IntPtr)_device)
-            return true;
-
-        ReleaseStagingTextures();
-
-        D3D11_TEXTURE2D_DESC desc = default;
-        desc.Width = width;
-        desc.Height = height;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = format;
-        desc.SampleDesc.Count = 1;
-        desc.SampleDesc.Quality = 0;
-        desc.Usage = D3D11_USAGE.D3D11_USAGE_STAGING;
-        desc.BindFlags = 0;
-        desc.CPUAccessFlags = (uint)D3D11_CPU_ACCESS_FLAG.D3D11_CPU_ACCESS_READ;
-        desc.MiscFlags = 0;
-
-        for (int i = 0; i < StagingTextureCount; i++)
-        {
-            ID3D11Texture2D* newTexture;
-            int hr = _device->CreateTexture2D(&desc, null, &newTexture);
-            if (hr < 0)
-            {
-                Plugin.Log!.Error($"[Video] CreateTexture2D(staging #{i}) failed: 0x{hr:X8}");
-                ReleaseStagingTextures();
-                return false;
-            }
-
-            _stagingTextures[i] = (IntPtr)newTexture;
-        }
-
-        _stagingWidth = width;
-        _stagingHeight = height;
-        _stagingFormat = format;
-        _stagingDevice = (IntPtr)_device;
-        _stagingWriteIndex = 0;
-        _stagingReadyCount = 0;
-        return true;
-    }
-
-    private void ReleaseStagingTextures()
-    {
-        for (int i = 0; i < _stagingTextures.Length; i++)
-        {
-            if (_stagingTextures[i] == IntPtr.Zero)
-                continue;
-
-            ((ID3D11Texture2D*)_stagingTextures[i])->Release();
-            _stagingTextures[i] = IntPtr.Zero;
-        }
-
-        _stagingDevice = IntPtr.Zero;
-        _stagingWriteIndex = 0;
-        _stagingReadyCount = 0;
-    }
-
     private void WaitForPresentDetoursToDrain()
     {
         if (Volatile.Read(ref _presentDetourDepth) == 0)
@@ -873,7 +704,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         Stop();
 
         ReleaseNativeSharedTextures();
-        ReleaseStagingTextures();
+        _stagingReadback.Release();
         ReleaseNv12Resources();
         ReleaseNv12Shader();
     }

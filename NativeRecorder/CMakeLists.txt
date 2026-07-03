@@ -4,6 +4,7 @@ project(NativeRecorder LANGUAGES CXX)
 
 add_library(NativeRecorder SHARED
     src/native_recorder.cpp
+    src/native_recorder_exports.cpp
 )
 
 target_compile_features(NativeRecorder PRIVATE cxx_std_20)
@@ -34,4 +35,3 @@ target_compile_definitions(NativeRecorder PRIVATE
 if (MSVC)
     target_compile_options(NativeRecorder PRIVATE /W4 /permissive- /EHsc)
 endif()
-

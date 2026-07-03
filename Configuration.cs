@@ -34,6 +34,18 @@ public class Configuration : IPluginConfiguration
     /// <summary>本地测试开关；启用时强制跳过 NativeRecorder，走 FFmpeg fallback。</summary>
     public bool ForceFFmpegFallbackForTesting { get; set; } = false;
 
+    internal bool EffectiveForceFFmpegFallbackForTesting
+    {
+        get
+        {
+#if DEBUG
+            return ForceFFmpegFallbackForTesting;
+#else
+            return false;
+#endif
+        }
+    }
+
     /// <summary>FFmpeg 可执行文件路径，空则从 PATH 查找。</summary>
     public string FFmpegPath { get; set; } = string.Empty;
 
@@ -67,149 +79,7 @@ public class Configuration : IPluginConfiguration
     public static Configuration Load(IDalamudPluginInterface pi)
     {
         var config = (pi.GetPluginConfig() as Configuration) ?? new Configuration();
-        if (config.Version < 3)
-        {
-            config.UseHardwareEncoder = true;
-            if (config.VideoCodec == "auto" &&
-                (string.IsNullOrEmpty(config.EncoderPreset) ||
-                 config.EncoderPreset.Equals("veryfast", StringComparison.OrdinalIgnoreCase) ||
-                 config.EncoderPreset.Equals("ultrafast", StringComparison.OrdinalIgnoreCase)))
-            {
-                config.EncoderPreset = "p4";
-            }
-
-            config.Version = 3;
-            config.Save(pi);
-        }
-
-        if (config.Version < 4)
-        {
-            if (config.VideoCodec == "auto")
-                config.EncoderPreset = "auto";
-
-            config.Version = 4;
-            config.Save(pi);
-        }
-
-        if (config.Version < 5)
-        {
-            config.ShowFloatingRecordButton = true;
-            config.AutoRecordEightPlayerDuty = true;
-            config.Version = 5;
-            config.Save(pi);
-        }
-
-        if (config.Version < 6)
-        {
-            if (string.IsNullOrWhiteSpace(config.ToggleCommand) ||
-                config.ToggleCommand.Equals("/record", StringComparison.OrdinalIgnoreCase))
-            {
-                config.ToggleCommand = "/pocketrecorder";
-            }
-
-            config.Version = 6;
-            config.Save(pi);
-        }
-
-        if (config.Version < 7)
-        {
-            if (config.VideoBitrate == 8_000_000)
-                config.VideoBitrate = 32_000_000;
-
-            if (config.TargetFps == 30)
-                config.TargetFps = 60;
-
-            config.Version = 7;
-            config.Save(pi);
-        }
-
-        if (config.Version < 8)
-        {
-            if (config.VideoBitrate == 32_000_000)
-                config.VideoBitrate = 12_000_000;
-
-            if (config.TargetFps == 60)
-                config.TargetFps = 30;
-
-            config.Version = 8;
-            config.Save(pi);
-        }
-
-        if (config.Version < 9)
-        {
-            config.EnableNativeRecorderExperimental = false;
-            config.Version = 9;
-            config.Save(pi);
-        }
-
-        if (config.Version < 10)
-        {
-            config.EnableNativeRecorderExperimental = true;
-            config.Version = 10;
-            config.Save(pi);
-        }
-
-        if (config.Version < 11)
-        {
-            config.EnableNativeRecorderExperimental = true;
-
-            if (config.VideoBitrate == 12_000_000)
-                config.VideoBitrate = 24_000_000;
-
-            if (config.TargetFps == 30)
-                config.TargetFps = 60;
-
-            config.Version = 11;
-            config.Save(pi);
-        }
-
-        if (config.Version < 12)
-        {
-            if (config.VideoBitrate == 24_000_000)
-                config.VideoBitrate = 32_000_000;
-
-            config.Version = 12;
-            config.Save(pi);
-        }
-
-        if (config.Version < 13)
-        {
-            if (FFmpegEncoderSelector.IsAv1Codec(config.VideoCodec))
-            {
-                config.VideoCodec = "auto";
-                config.EncoderPreset = "auto";
-                config.UseHardwareEncoder = true;
-            }
-
-            config.Version = 13;
-            config.Save(pi);
-        }
-
-        if (config.Version < 14)
-        {
-            config.AudioCaptureMode = config.CaptureAudio
-                ? AudioCaptureMode.System
-                : AudioCaptureMode.Off;
-
-            config.Version = 14;
-            config.Save(pi);
-        }
-
-        if (config.Version < 15)
-        {
-            config.ForceFFmpegFallbackForTesting = false;
-            config.Version = 15;
-            config.Save(pi);
-        }
-
-        config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
-
-        if (!config.EnableNativeRecorderExperimental)
-        {
-            config.EnableNativeRecorderExperimental = true;
-            config.Save(pi);
-        }
-
+        ConfigurationMigrator.Migrate(config, pi);
         return config;
     }
 

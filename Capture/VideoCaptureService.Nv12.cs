@@ -360,7 +360,7 @@ internal sealed unsafe partial class VideoCaptureService
         if (_nv12ComputeShader != null)
             ReleaseNv12Shader();
 
-        byte[] shaderBytes = System.Text.Encoding.ASCII.GetBytes(Nv12ComputeShaderSource);
+        byte[] shaderBytes = System.Text.Encoding.ASCII.GetBytes(Nv12ComputeShader.Source);
         IntPtr entryPoint = Marshal.StringToHGlobalAnsi("CSMain");
         IntPtr target = Marshal.StringToHGlobalAnsi("cs_5_0");
         fixed (byte* shaderSource = shaderBytes)

@@ -252,12 +252,14 @@ internal sealed class ConfigWindow : Window
         ImGui.TextDisabled($"当前: {config.GetEffectiveFFmpegPath(Plugin.PluginInterface)}");
         DrawBundledFFmpegControls(config);
 
+#if DEBUG
         bool forceFFmpeg = config.ForceFFmpegFallbackForTesting;
         if (ImGui.Checkbox("本地测试 FFmpeg fallback", ref forceFFmpeg))
         {
             config.ForceFFmpegFallbackForTesting = forceFFmpeg;
             SaveConfig(config);
         }
+#endif
 
         ImGui.TextDisabled($"编码模式: {GetEncodingModeText(config)}");
 
@@ -340,7 +342,7 @@ internal sealed class ConfigWindow : Window
 
     private static string GetEncodingModeText(Configuration config)
     {
-        if (config.ForceFFmpegFallbackForTesting)
+        if (config.EffectiveForceFFmpegFallbackForTesting)
             return "本地测试 FFmpeg fallback";
 
         if (config.VideoCodec != "auto")

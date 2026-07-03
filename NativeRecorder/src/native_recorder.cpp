@@ -1,8 +1,2 @@
-#define PR_NATIVE_RECORDER_BUILD
-#include "pocket_recorder_native.h"
-
-#include "native_recorder_common.inl"
-#include "native_recorder_converter.inl"
-#include "native_recorder_muxer.inl"
-#include "native_recorder_backends.inl"
-#include "native_recorder_exports.inl"
+// NativeRecorder's exported ABI is compiled from native_recorder_exports.cpp.
+// This file remains as a stable project anchor for IDEs and older build scripts.

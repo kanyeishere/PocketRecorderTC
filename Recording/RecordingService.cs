@@ -1,7 +1,6 @@
 using Dalamud.Plugin.Services;
 using Recorder.Capture;
 using Recorder.Diagnostics;
-using Recorder.Encoding;
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -16,13 +15,17 @@ internal sealed class RecordingService : IDisposable
 {
     private readonly Plugin _plugin;
     private readonly IGameInteropProvider _gameInterop;
+    private readonly IRecorderEnvironment _environment;
     private readonly object _sync = new();
     private readonly SoftFpsGovernor _softFps;
 
     private VideoCaptureService? _videoCapture;
     private AudioCaptureService? _audioCapture;
     private IOutputSink? _writer;
-    private RecordingStartOptions? _startOptions;
+    private RecordingRequest? _request;
+    private RecordingBackendPlan? _backendPlan;
+    private readonly RecordingBackendSelector _backendSelector;
+    private readonly RecordingFinalizer _finalizer;
 
     private int _sessionId;
     private RecordingLifecycle _lifecycle = RecordingLifecycle.Idle;
@@ -71,11 +74,14 @@ internal sealed class RecordingService : IDisposable
 
     public event Action<bool>? RecordingStateChanged;
 
-    public RecordingService(Plugin plugin, IGameInteropProvider gameInterop)
+    public RecordingService(Plugin plugin, IGameInteropProvider gameInterop, IRecorderEnvironment environment)
     {
         _plugin = plugin;
         _gameInterop = gameInterop;
-        _softFps = new SoftFpsGovernor(message => Plugin.Log!.Info(message));
+        _environment = environment;
+        _backendSelector = new RecordingBackendSelector(environment.Log);
+        _finalizer = new RecordingFinalizer(environment.Log);
+        _softFps = new SoftFpsGovernor(message => _environment.Log.Info(message));
     }
 
     public void ToggleRecording()
@@ -95,14 +101,14 @@ internal sealed class RecordingService : IDisposable
     public bool StartRecording(string? outputPath, Action<RecordingFinishedEventArgs>? finishedCallback = null)
     {
         Stopwatch startSw = Stopwatch.StartNew();
-        RecordingStartOptions options;
+        RecordingRequest request;
+        RecordingBackendPlan backendPlan;
         AudioCaptureService? audioCapture = null;
         VideoCaptureService videoCapture;
-        string nativeReason = "not evaluated";
 
         if (!_plugin.IsFFmpegBootstrapComplete)
         {
-            Plugin.Log.Warning($"[Record] FFmpeg is not ready yet: {_plugin.FFmpegBootstrapStatus}");
+            _environment.Log.Warning($"[Record] FFmpeg is not ready yet: {_plugin.FFmpegBootstrapStatus}");
             return false;
         }
 
@@ -114,34 +120,35 @@ internal sealed class RecordingService : IDisposable
             var config = _plugin.Config;
             int sessionId = ++_sessionId;
             _videoFps = Math.Max(1, config.TargetFps);
-            bool preferNativeRecorder = RecordingBackendSelector.ShouldPreferNativeRecorder(config, out nativeReason);
 
             string dir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
             _currentFilePath = string.IsNullOrWhiteSpace(outputPath)
                 ? Path.Combine(dir, $"FFXIV_{DateTime.Now:yyyyMMdd_HHmmss}.mp4")
                 : outputPath;
 
-            options = new RecordingStartOptions(
+            request = new RecordingRequest(
                 sessionId,
                 _currentFilePath,
                 config.FFmpegPath,
-                Plugin.PluginInterface.GetPluginConfigDirectory(),
+                _environment.Paths.PluginConfigDirectory,
                 config.VideoBitrate,
                 _videoFps,
                 config.AudioCaptureMode,
                 config.VideoCodec,
                 config.EncoderPreset,
                 config.UseHardwareEncoder,
-                preferNativeRecorder);
+                config.EffectiveForceFFmpegFallbackForTesting);
+            backendPlan = _backendSelector.SelectInitial(request);
 
-            _startOptions = options;
+            _request = request;
+            _backendPlan = backendPlan;
             _writer = null;
             _audioCapture = null;
             _videoCapture = null;
             _lifecycle = RecordingLifecycle.Preparing;
             _finishedCallback = finishedCallback;
             _frameCount = 0;
-            _currentBackend = preferNativeRecorder ? "NativeRecorder 准备中" : "FFmpeg 准备中";
+            _currentBackend = backendPlan.PreparingText;
             _videoWidth = 0;
             _videoHeight = 0;
             _videoPixelFormat = VideoPixelFormat.Bgra;
@@ -149,23 +156,23 @@ internal sealed class RecordingService : IDisposable
         }
 
         AmdRecordingDiagnosticLog.StartSession(
-            options.SessionId,
-            options.TargetFps,
-            options.VideoBitrate,
-            options.VideoCodec,
-            options.EncoderPreset,
-            options.UseHardwareEncoder,
-            options.AudioCaptureMode,
-            options.PreferNativeRecorder,
-            nativeReason);
+            request.SessionId,
+            request.TargetFps,
+            request.VideoBitrate,
+            request.VideoCodec,
+            request.EncoderPreset,
+            request.UseHardwareEncoder,
+            request.AudioCaptureMode,
+            backendPlan.PrefersD3D11TextureFrames,
+            backendPlan.Reason);
 
-        if (options.AudioCaptureMode != AudioCaptureMode.Off)
+        if (request.AudioCaptureMode != AudioCaptureMode.Off)
         {
-            Plugin.Log.Info($"[Record] Starting audio capture mode={options.AudioCaptureMode}...");
-            audioCapture = new AudioCaptureService(options.AudioCaptureMode, Environment.ProcessId, OnAudioPacket);
+            _environment.Log.Info($"[Record] Starting audio capture mode={request.AudioCaptureMode}...");
+            audioCapture = new AudioCaptureService(request.AudioCaptureMode, Environment.ProcessId, OnAudioPacket);
             lock (_sync)
             {
-                if (IsCurrentSessionNoLock(options.SessionId))
+                if (IsCurrentSessionNoLock(request.SessionId))
                     _audioCapture = audioCapture;
             }
 
@@ -176,11 +183,11 @@ internal sealed class RecordingService : IDisposable
             _gameInterop,
             OnVideoFrame,
             ShouldCaptureVideoFrame);
-        videoCapture.PreferD3D11TextureFrames = options.PreferNativeRecorder;
+        videoCapture.PreferD3D11TextureFrames = backendPlan.PrefersD3D11TextureFrames;
 
         lock (_sync)
         {
-            if (!IsCurrentSessionNoLock(options.SessionId))
+            if (!IsCurrentSessionNoLock(request.SessionId))
             {
                 audioCapture?.Stop();
                 audioCapture?.Dispose();
@@ -191,11 +198,11 @@ internal sealed class RecordingService : IDisposable
             _videoCapture = videoCapture;
         }
 
-        if (!videoCapture.Start(options.TargetFps))
+        if (!videoCapture.Start(request.TargetFps))
         {
             lock (_sync)
             {
-                if (IsCurrentSessionNoLock(options.SessionId))
+                if (IsCurrentSessionNoLock(request.SessionId))
                 {
                     _sessionId++;
                     ClearSessionNoLock(RecordingLifecycle.Idle);
@@ -205,14 +212,14 @@ internal sealed class RecordingService : IDisposable
             DisposeVideoCapture(videoCapture);
             StopAndDisposeAudioCapture(audioCapture);
 
-            Plugin.Log.Warning("[Record] Video capture could not start; recording aborted.");
+            _environment.Log.Warning("[Record] Video capture could not start; recording aborted.");
             AmdRecordingDiagnosticLog.FinishSession("video capture could not start; recording aborted");
             RecordingStateChanged?.Invoke(false);
             return false;
         }
 
-        Plugin.Log.Info($"[Record] Preparation started -> {options.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
-        Plugin.Log.Info($"[Record] Config: fps={options.TargetFps}, bitrate={options.VideoBitrate}, codec={options.VideoCodec}, preset={options.EncoderPreset}, audio={options.AudioCaptureMode}, hw={options.UseHardwareEncoder}, native={options.PreferNativeRecorder} ({nativeReason})");
+        _environment.Log.Info($"[Record] Preparation started -> {request.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
+        _environment.Log.Info($"[Record] Config: fps={request.TargetFps}, bitrate={request.VideoBitrate}, codec={request.VideoCodec}, preset={request.EncoderPreset}, audio={request.AudioCaptureMode}, hw={request.UseHardwareEncoder}, backend={backendPlan.Backend.DisplayName} ({backendPlan.Reason})");
         AmdRecordingDiagnosticLog.Write("Record", $"preparation started, startSyncMs={startSw.ElapsedMilliseconds}");
         RecordingStateChanged?.Invoke(true);
         return true;
@@ -221,7 +228,8 @@ internal sealed class RecordingService : IDisposable
     private void OnVideoFrame(VideoFrame frame)
     {
         IOutputSink? writer;
-        RecordingStartOptions? options;
+        RecordingRequest? request;
+        RecordingBackendPlan? backendPlan;
         bool startWriter;
         int expectedWidth;
         int expectedHeight;
@@ -229,7 +237,7 @@ internal sealed class RecordingService : IDisposable
 
         lock (_sync)
         {
-            if (_startOptions == null || _lifecycle == RecordingLifecycle.Finalizing)
+            if (_request == null || _lifecycle == RecordingLifecycle.Finalizing)
             {
                 frame.ReturnBuffer();
                 return;
@@ -248,7 +256,8 @@ internal sealed class RecordingService : IDisposable
                 _videoWidth = frame.Width;
                 _videoHeight = frame.Height;
                 _videoPixelFormat = frame.PixelFormat;
-                options = _startOptions;
+                request = _request;
+                backendPlan = _backendPlan;
                 startWriter = true;
                 expectedWidth = frame.Width;
                 expectedHeight = frame.Height;
@@ -256,7 +265,8 @@ internal sealed class RecordingService : IDisposable
             }
             else
             {
-                options = null;
+                request = null;
+                backendPlan = null;
                 startWriter = false;
                 expectedWidth = _videoWidth;
                 expectedHeight = _videoHeight;
@@ -266,20 +276,20 @@ internal sealed class RecordingService : IDisposable
 
         if (startWriter)
         {
-            StartWriterInBackground(options!, frame);
+            StartWriterInBackground(request!, backendPlan!, frame);
             return;
         }
 
         if (frame.Width != expectedWidth || frame.Height != expectedHeight)
         {
-            Plugin.Log!.Warning($"Frame size changed {frame.Width}x{frame.Height} != {expectedWidth}x{expectedHeight}, skipping.");
+            _environment.Log.Warning($"Frame size changed {frame.Width}x{frame.Height} != {expectedWidth}x{expectedHeight}, skipping.");
             frame.ReturnBuffer();
             return;
         }
 
         if (frame.PixelFormat != expectedPixelFormat)
         {
-            Plugin.Log!.Warning($"Frame pixel format changed {frame.PixelFormat} != {expectedPixelFormat}, skipping.");
+            _environment.Log.Warning($"Frame pixel format changed {frame.PixelFormat} != {expectedPixelFormat}, skipping.");
             frame.ReturnBuffer();
             return;
         }
@@ -288,9 +298,9 @@ internal sealed class RecordingService : IDisposable
         Interlocked.Increment(ref _frameCount);
     }
 
-    private void StartWriterInBackground(RecordingStartOptions options, VideoFrame firstFrame)
+    private void StartWriterInBackground(RecordingRequest request, RecordingBackendPlan backendPlan, VideoFrame firstFrame)
     {
-        var thread = new Thread(() => StartWriterWorker(options, firstFrame))
+        var thread = new Thread(() => StartWriterWorker(request, backendPlan, firstFrame))
         {
             IsBackground = true,
             Name = "Recorder-StartWriter",
@@ -298,182 +308,82 @@ internal sealed class RecordingService : IDisposable
         thread.Start();
     }
 
-    private void StartWriterWorker(RecordingStartOptions options, VideoFrame firstFrame)
+    private void StartWriterWorker(RecordingRequest request, RecordingBackendPlan backendPlan, VideoFrame firstFrame)
     {
         Stopwatch startSw = Stopwatch.StartNew();
-        IOutputSink? writer = null;
-        bool frameHandedToWriter = false;
+        RecordingBackendStartResult? startResult = null;
         bool writerPublished = false;
 
         try
         {
-            if (!IsCurrentSession(options.SessionId))
+            if (!IsCurrentSession(request.SessionId))
             {
                 firstFrame.ReturnBuffer();
                 return;
             }
 
-            AudioFormat? audioFormat = WaitForAudioFormat(options);
-            if (!IsCurrentSession(options.SessionId))
+            AudioFormat? audioFormat = WaitForAudioFormat(request);
+            if (!IsCurrentSession(request.SessionId))
             {
                 firstFrame.ReturnBuffer();
                 return;
             }
 
-            if (options.PreferNativeRecorder && firstFrame.IsD3D11Texture)
+            try
             {
-                try
-                {
-                    AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
-                        "NativeRecorder",
-                        $"attempting native writer, firstFrame={DescribeFrame(firstFrame)}, audio={audioFormat != null}, audioMode={options.AudioCaptureMode}");
-
-                    var nativeWriter = new NativeRecorderWriter(options.VideoBitrate, options.VideoCodec);
-                    writer = nativeWriter;
-                    writer.FatalError += OnWriterFatalError;
-                    writer.SetOutputPath(options.OutputPath);
-                    writer.Start(
-                        new VideoFormat(firstFrame.Width, firstFrame.Height, options.TargetFps, VideoPixelFormat.D3D11Texture),
-                        audioFormat);
-
-                    writer.WriteVideoFrame(firstFrame);
-                    frameHandedToWriter = true;
-                    nativeWriter.WaitForFirstVideoFrameSubmitted(2_000);
-
-                    lock (_sync)
-                    {
-                        if (!IsCurrentSessionNoLock(options.SessionId) ||
-                            _lifecycle != RecordingLifecycle.StartingWriter)
-                        {
-                            return;
-                        }
-
-                        _writer = writer;
-                        _videoWidth = firstFrame.Width;
-                        _videoHeight = firstFrame.Height;
-                        _videoPixelFormat = VideoPixelFormat.D3D11Texture;
-                        _currentBackend = $"NativeRecorder D3D11 {GetNativeRecorderCodecLabel(options.VideoCodec)}";
-                        writerPublished = true;
-                        _lifecycle = RecordingLifecycle.Recording;
-                        _recordStart = DateTime.Now;
-                    }
-
-                    Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, native=D3D11Texture/{GetNativeRecorderCodecLabel(options.VideoCodec)}, asyncStart={startSw.ElapsedMilliseconds}ms");
-                    AmdRecordingDiagnosticLog.Write("Record", $"native recording started, asyncStartMs={startSw.ElapsedMilliseconds}, backend={_currentBackend}");
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    Plugin.Log!.Warning($"[NativeRecorder] Native path failed before start; falling back to FFmpeg stdin rawvideo. {ex.Message}");
-                    AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
-                        "NativeRecorder",
-                        $"native path failed before start, fallback=FFmpeg rawvideo, exception={ex}, lastStatus={NativeRecorderBackend.GetLastStatus()}");
-                    if (!frameHandedToWriter)
-                        firstFrame.ReturnBuffer();
-                    try { writer?.Stop(TimeSpan.Zero); } catch { }
-                    try { writer?.Dispose(); } catch { }
-                    writer = null;
-                    writerPublished = false;
-                    SwitchToFFmpegFallback(options.SessionId);
-                    return;
-                }
+                startResult = backendPlan.Backend.Start(request, firstFrame, audioFormat, OnWriterFatalError);
             }
-
-            firstFrame = firstFrame.DetachToManagedCopyIfNative();
-
-            var encoderConfig = new Configuration
+            catch (Exception ex) when (!string.Equals(backendPlan.Backend.Id, "ffmpeg", StringComparison.OrdinalIgnoreCase))
             {
-                VideoBitrate = options.VideoBitrate,
-                VideoCodec = options.VideoCodec,
-                EncoderPreset = options.EncoderPreset,
-                UseHardwareEncoder = options.UseHardwareEncoder,
-            };
-
-            string ffmpegPath = FFmpegBootstrapper.ResolveOrInstall(options.FFmpegPath, options.PluginConfigDirectory);
-            EncoderSelection encoder = FFmpegEncoderSelector.Select(ffmpegPath, encoderConfig);
-            if (!IsCurrentSession(options.SessionId))
-            {
-                firstFrame.ReturnBuffer();
+                _environment.Log.Warning($"[{backendPlan.Backend.DisplayName}] Backend failed before start; falling back to FFmpeg stdin rawvideo. {ex.Message}");
+                AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
+                    backendPlan.Backend.DisplayName,
+                    $"backend failed before start, fallback=FFmpeg rawvideo, exception={ex}");
+                SwitchToFFmpegFallback(request.SessionId, ex.Message);
                 return;
             }
-
-            AmdRecordingDiagnosticLog.WriteForAmdCodec(
-                encoder.Codec,
-                "FFmpeg",
-                $"selected encoder codec={encoder.Codec}, preset={encoder.Preset}, isHardware={encoder.IsHardware}, reason={encoder.Reason}, firstFrame={DescribeFrame(firstFrame)}");
-
-            writer = new FFmpegWriter(
-                ffmpegPath,
-                options.VideoBitrate,
-                encoder.Codec,
-                encoder.Preset);
-            writer.FatalError += OnWriterFatalError;
-            writer.SetOutputPath(options.OutputPath);
-
-            writer.Start(
-                new VideoFormat(firstFrame.Width, firstFrame.Height, options.TargetFps, firstFrame.PixelFormat),
-                audioFormat);
 
             lock (_sync)
             {
-                if (!IsCurrentSessionNoLock(options.SessionId) ||
+                if (!IsCurrentSessionNoLock(request.SessionId) ||
                     _lifecycle != RecordingLifecycle.StartingWriter)
                 {
-                    firstFrame.ReturnBuffer();
                     return;
                 }
 
-                _writer = writer;
-                _videoWidth = firstFrame.Width;
-                _videoHeight = firstFrame.Height;
-                _videoPixelFormat = firstFrame.PixelFormat;
-                _currentBackend = $"FFmpeg {encoder.Codec}";
+                _writer = startResult.Sink;
+                _videoWidth = startResult.VideoFormat.Width;
+                _videoHeight = startResult.VideoFormat.Height;
+                _videoPixelFormat = startResult.VideoFormat.PixelFormat;
+                _currentBackend = startResult.BackendLabel;
                 writerPublished = true;
-            }
-
-            writer!.WriteVideoFrame(firstFrame);
-            frameHandedToWriter = true;
-            Interlocked.Increment(ref _frameCount);
-
-            if (writer is FFmpegWriter ffmpegWriter &&
-                !ffmpegWriter.WaitForFirstVideoFrameWritten(1_000))
-            {
-                Plugin.Log!.Warning("[Record] FFmpeg did not accept the first video frame within 1000ms; starting capture anyway.");
-            }
-
-            lock (_sync)
-            {
-                if (!IsCurrentSessionNoLock(options.SessionId) ||
-                    !ReferenceEquals(_writer, writer))
-                {
-                    return;
-                }
-
                 _lifecycle = RecordingLifecycle.Recording;
                 _recordStart = DateTime.Now;
             }
 
-            Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, codec={encoder.Codec}, preset={encoder.Preset}, hw={encoder.IsHardware}, encoderReason={encoder.Reason}, asyncStart={startSw.ElapsedMilliseconds}ms");
-            AmdRecordingDiagnosticLog.WriteForAmdCodec(
-                encoder.Codec,
+            if (startResult.CountFirstVideoFrame)
+                Interlocked.Increment(ref _frameCount);
+
+            _environment.Log.Info($"[Record] Recording started: {startResult.VideoFormat.Width}x{startResult.VideoFormat.Height}@{request.TargetFps}fps, audio={audioFormat != null}, backend={startResult.BackendLabel}, asyncStart={startSw.ElapsedMilliseconds}ms");
+            AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
                 "Record",
-                $"FFmpeg recording started, asyncStartMs={startSw.ElapsedMilliseconds}, backend={_currentBackend}");
+                $"recording started, asyncStartMs={startSw.ElapsedMilliseconds}, backend={startResult.BackendLabel}");
         }
         catch (Exception ex)
         {
-            if (!frameHandedToWriter)
+            if (startResult == null)
                 firstFrame.ReturnBuffer();
 
-            Plugin.Log!.Error($"[Record] Failed to start writer: {ex}");
+            _environment.Log.Error($"[Record] Failed to start writer: {ex}");
             AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", $"failed to start writer, exception={ex}");
-            AbortStart(options.SessionId);
+            AbortStart(request.SessionId);
         }
         finally
         {
-            if (writer != null && !writerPublished)
+            if (startResult?.Sink != null && !writerPublished)
             {
-                try { writer.Stop(TimeSpan.Zero); } catch { }
-                try { writer.Dispose(); } catch { }
+                try { startResult.Sink.Stop(TimeSpan.Zero); } catch { }
+                try { startResult.Sink.Dispose(); } catch { }
             }
         }
     }
@@ -490,16 +400,16 @@ internal sealed class RecordingService : IDisposable
         if (!shouldStop)
             return;
 
-        Plugin.Log!.Warning($"[Record] Writer failed; stopping recording automatically. {message}");
+        _environment.Log.Warning($"[Record] Writer failed; stopping recording automatically. {message}");
         AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", $"writer fatal error, message={message}");
         StopRecording();
     }
 
-    private AudioFormat? WaitForAudioFormat(RecordingStartOptions options)
+    private AudioFormat? WaitForAudioFormat(RecordingRequest request)
     {
-        if (options.AudioCaptureMode == AudioCaptureMode.Off)
+        if (request.AudioCaptureMode == AudioCaptureMode.Off)
         {
-            Plugin.Log.Info("[Record] No audio (disabled), video-only recording.");
+            _environment.Log.Info("[Record] No audio (disabled), video-only recording.");
             return null;
         }
 
@@ -509,7 +419,7 @@ internal sealed class RecordingService : IDisposable
             AudioCaptureService? audioCapture;
             lock (_sync)
             {
-                if (!IsCurrentSessionNoLock(options.SessionId))
+                if (!IsCurrentSessionNoLock(request.SessionId))
                     return null;
 
                 audioCapture = _audioCapture;
@@ -520,13 +430,13 @@ internal sealed class RecordingService : IDisposable
 
             if (audioCapture.Initialized)
             {
-                Plugin.Log.Info($"[Record] Audio initialized ({options.AudioCaptureMode}): {audioCapture.SampleRate}Hz, {audioCapture.Channels}ch, {audioCapture.BitsPerSample}bit");
+                _environment.Log.Info($"[Record] Audio initialized ({request.AudioCaptureMode}): {audioCapture.SampleRate}Hz, {audioCapture.Channels}ch, {audioCapture.BitsPerSample}bit");
                 var audioFormat = new AudioFormat(
                     audioCapture.SampleRate,
                     audioCapture.Channels,
                     audioCapture.BitsPerSample,
                     audioCapture.BitsPerSample == 32);
-                Plugin.Log.Info($"[Record] Audio format: {audioFormat.SampleRate}Hz, {audioFormat.Channels}ch, {audioFormat.BitsPerSample}bit, float={audioFormat.IsFloat}");
+                _environment.Log.Info($"[Record] Audio format: {audioFormat.SampleRate}Hz, {audioFormat.Channels}ch, {audioFormat.BitsPerSample}bit, float={audioFormat.IsFloat}");
                 return audioFormat;
             }
 
@@ -539,7 +449,7 @@ internal sealed class RecordingService : IDisposable
         AudioCaptureService? audioToStop = null;
         lock (_sync)
         {
-            if (IsCurrentSessionNoLock(options.SessionId))
+            if (IsCurrentSessionNoLock(request.SessionId))
             {
                 audioToStop = _audioCapture;
                 _audioCapture = null;
@@ -548,22 +458,11 @@ internal sealed class RecordingService : IDisposable
 
         if (audioToStop != null)
         {
-            Plugin.Log.Warning($"[Record] Audio init failed or timed out (LastError={audioToStop.LastError}), continuing video-only.");
+            _environment.Log.Warning($"[Record] Audio init failed or timed out (LastError={audioToStop.LastError}), continuing video-only.");
             StopAndDisposeAudioCapture(audioToStop);
         }
 
         return null;
-    }
-
-    private static string GetNativeRecorderCodecLabel(string codec)
-    {
-        if (string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(codec, "h264_nvenc", StringComparison.OrdinalIgnoreCase))
-        {
-            return "H.264";
-        }
-
-        return "HEVC";
     }
 
     private void OnAudioPacket(AudioPacket packet)
@@ -584,7 +483,7 @@ internal sealed class RecordingService : IDisposable
     {
         lock (_sync)
         {
-            if (_startOptions == null || _lifecycle == RecordingLifecycle.StartingWriter)
+            if (_request == null || _lifecycle == RecordingLifecycle.StartingWriter)
                 return false;
 
             if (_writer == null)
@@ -606,15 +505,15 @@ internal sealed class RecordingService : IDisposable
         }
     }
 
-    private void SwitchToFFmpegFallback(int sessionId)
+    private void SwitchToFFmpegFallback(int sessionId, string reason)
     {
         lock (_sync)
         {
             if (!IsCurrentSessionNoLock(sessionId))
                 return;
 
-            if (_startOptions != null)
-                _startOptions = _startOptions with { PreferNativeRecorder = false };
+            if (_request != null)
+                _backendPlan = _backendSelector.SelectFFmpeg(_request, reason);
 
             if (_videoCapture != null)
                 _videoCapture.PreferD3D11TextureFrames = false;
@@ -623,7 +522,7 @@ internal sealed class RecordingService : IDisposable
             _videoWidth = 0;
             _videoHeight = 0;
             _videoPixelFormat = VideoPixelFormat.Bgra;
-            _currentBackend = "FFmpeg fallback 准备中";
+            _currentBackend = _backendPlan?.PreparingText ?? "FFmpeg fallback 准备中";
             _lifecycle = RecordingLifecycle.Preparing;
             _softFps.Reset(log: false);
         }
@@ -659,7 +558,8 @@ internal sealed class RecordingService : IDisposable
             writer = _writer;
 
             _sessionId++;
-            _startOptions = null;
+            _request = null;
+            _backendPlan = null;
             _videoCapture = null;
             _audioCapture = null;
             _writer = null;
@@ -669,81 +569,30 @@ internal sealed class RecordingService : IDisposable
             _finishedCallback = null;
         }
 
-        Plugin.Log.Info($"[Record] Stopping... frames={FrameCount}, duration={finalDuration}");
+        _environment.Log.Info($"[Record] Stopping... frames={FrameCount}, duration={finalDuration}");
 
         try { videoCapture?.RequestStop(); } catch { }
-        string finalizeMode = waitForFinalize ? "synchronously" : "in background";
-        Plugin.Log.Info($"[Record] Capture stop requested in {stopSw.ElapsedMilliseconds}ms; finalizing {finalizeMode}.");
-
-        void FinalizeRecording()
-        {
-            Stopwatch finalizeSw = Stopwatch.StartNew();
-            Plugin.Log.Info($"[Record] Capture input paused after {stopSw.ElapsedMilliseconds}ms; finalizing writer.");
-
-            StopAndDisposeAudioCapture(audioCapture);
-
-            try
-            {
-                writer?.Stop(finalDuration);
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.Warning($"[Record] Writer stop failed: {ex.Message}");
-            }
-
-            try
-            {
-                videoCapture?.Stop();
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.Warning($"[Record] Video capture stop failed: {ex.Message}");
-            }
-            finally
-            {
-                DisposeVideoCapture(videoCapture);
-            }
-
-            Plugin.Log.Info($"[Record] Capture stopped after {stopSw.ElapsedMilliseconds}ms.");
-
-            try { writer?.Dispose(); } catch { }
-
-            lock (_sync)
-            {
-                if (_lifecycle == RecordingLifecycle.Finalizing)
-                    _lifecycle = RecordingLifecycle.Idle;
-            }
-
-            Plugin.Log.Info($"[Record] Saved: {outputPath}, finalize={finalizeSw.ElapsedMilliseconds}ms");
-            AmdRecordingDiagnosticLog.FinishSession($"saved=true, duration={finalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={writer != null}");
-            if (outputPath != null)
-            {
-                try
-                {
-                    finishedCallback?.Invoke(new RecordingFinishedEventArgs(outputPath, finalDuration, writer != null));
-                }
-                catch (Exception ex)
-                {
-                    Plugin.Log.Warning($"[Record] Finished callback failed: {ex.Message}");
-                }
-            }
-        }
-
-        if (waitForFinalize)
-        {
-            FinalizeRecording();
-        }
-        else
-        {
-            var thread = new Thread(FinalizeRecording)
-            {
-                IsBackground = true,
-                Name = "Recorder-Finalize",
-            };
-            thread.Start();
-        }
+        var job = new RecordingFinalizationJob(
+            videoCapture,
+            audioCapture,
+            writer,
+            outputPath,
+            finishedCallback,
+            finalDuration,
+            stopSw,
+            MarkFinalized);
+        _finalizer.Finalize(job, waitForFinalize);
 
         RecordingStateChanged?.Invoke(false);
+    }
+
+    private void MarkFinalized()
+    {
+        lock (_sync)
+        {
+            if (_lifecycle == RecordingLifecycle.Finalizing)
+                _lifecycle = RecordingLifecycle.Idle;
+        }
     }
 
     private void AbortStart(int sessionId)
@@ -755,7 +604,7 @@ internal sealed class RecordingService : IDisposable
 
         lock (_sync)
         {
-            if (_startOptions?.SessionId != sessionId)
+            if (_request?.SessionId != sessionId)
                 return;
 
             videoCapture = _videoCapture;
@@ -782,14 +631,14 @@ internal sealed class RecordingService : IDisposable
             }
             catch (Exception ex)
             {
-                Plugin.Log.Warning($"[Record] Abort callback failed: {ex.Message}");
+                _environment.Log.Warning($"[Record] Abort callback failed: {ex.Message}");
             }
         }
     }
 
     private bool HasActiveSessionNoLock()
     {
-        return _startOptions != null ||
+        return _request != null ||
                _videoCapture != null ||
                _audioCapture != null ||
                _writer != null ||
@@ -804,7 +653,7 @@ internal sealed class RecordingService : IDisposable
 
     private bool IsCurrentSessionNoLock(int sessionId)
     {
-        return _startOptions?.SessionId == sessionId &&
+        return _request?.SessionId == sessionId &&
                _lifecycle is RecordingLifecycle.Preparing or RecordingLifecycle.StartingWriter or RecordingLifecycle.Recording;
     }
 
@@ -821,7 +670,8 @@ internal sealed class RecordingService : IDisposable
 
     private void ClearSessionNoLock(RecordingLifecycle nextLifecycle)
     {
-        _startOptions = null;
+        _request = null;
+        _backendPlan = null;
         _videoCapture = null;
         _audioCapture = null;
         _writer = null;
@@ -841,32 +691,10 @@ internal sealed class RecordingService : IDisposable
         try { audioCapture?.Dispose(); } catch { }
     }
 
-    private static string DescribeFrame(VideoFrame frame)
-    {
-        string description = $"{frame.Width}x{frame.Height}, pixelFormat={frame.PixelFormat}, stride={frame.Stride}, dataLength={frame.DataLength}, timestampHns={frame.TimestampHns}";
-        if (!frame.IsD3D11Texture)
-            return description;
-
-        return $"{description}, dxgiFormat={frame.DxgiFormat}, deviceSet={frame.D3D11DevicePtr != IntPtr.Zero}, textureSet={frame.D3D11TexturePtr != IntPtr.Zero}, sharedHandleSet={frame.D3D11SharedHandle != IntPtr.Zero}";
-    }
-
     public void Dispose()
     {
         StopRecording(waitForFinalize: true);
     }
-
-    private sealed record RecordingStartOptions(
-        int SessionId,
-        string OutputPath,
-        string FFmpegPath,
-        string PluginConfigDirectory,
-        int VideoBitrate,
-        int TargetFps,
-        AudioCaptureMode AudioCaptureMode,
-        string VideoCodec,
-        string EncoderPreset,
-        bool UseHardwareEncoder,
-        bool PreferNativeRecorder);
 }
 
 internal enum RecordingLifecycle

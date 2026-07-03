@@ -86,6 +86,7 @@
 
   <ItemGroup>
     <ClCompile Include="src\native_recorder.cpp" />
+    <ClCompile Include="src\native_recorder_exports.cpp" />
     <ClCompile Include="$(VideoCodecSdkDir)\Samples\NvCodec\NvEncoder\NvEncoder.cpp" />
     <ClCompile Include="$(VideoCodecSdkDir)\Samples\NvCodec\NvEncoder\NvEncoderD3D11.cpp" />
     <ClCompile Include="$(AmfSdkDir)\public\common\AMFFactory.cpp" />

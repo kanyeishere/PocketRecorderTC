@@ -2,7 +2,6 @@ using Recorder.Capture;
 using Recorder.Diagnostics;
 using Recorder.Recording;
 using System;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -39,9 +38,9 @@ internal sealed class FFmpegWriter : IOutputSink
     private long _managedNativeCopyUntilTicks;
 
     // 异步写入队列
-    private BlockingCollection<VideoFrame>? _videoQueue;
+    private BoundedMediaQueue<VideoFrame>? _videoQueue;
     private Thread? _videoWriterThread;
-    private BlockingCollection<byte[]>? _audioQueue;
+    private BoundedMediaQueue<byte[]>? _audioQueue;
     private Thread? _audioWriterThread;
     private const int MaxQueueSize = 10; // 限制队列深度，避免内存暴涨
     private const int MaxAudioQueueSize = 100;
@@ -221,7 +220,7 @@ internal sealed class FFmpegWriter : IOutputSink
 
         // 启动异步写入线程
         Plugin.Log!.Info("[FFmpeg] Video timing: rawvideo VFR uses wall-clock timestamps; stale queued frames are dropped instead of synthesized.");
-        _videoQueue = new BlockingCollection<VideoFrame>(MaxQueueSize);
+        _videoQueue = new BoundedMediaQueue<VideoFrame>(MaxQueueSize);
         _videoWriterThread = new Thread(VideoWriterLoop)
         {
             IsBackground = true,
@@ -231,7 +230,7 @@ internal sealed class FFmpegWriter : IOutputSink
 
         if (audio != null)
         {
-            _audioQueue = new BlockingCollection<byte[]>(MaxAudioQueueSize);
+            _audioQueue = new BoundedMediaQueue<byte[]>(MaxAudioQueueSize);
             _audioWriterThread = new Thread(AudioWriterLoop)
             {
                 IsBackground = true,
@@ -319,80 +318,42 @@ internal sealed class FFmpegWriter : IOutputSink
             }
         }
 
-        bool added = false;
         // 非阻塞入队：如果队列满则丢弃最旧帧（避免阻塞渲染线程）
-        while (!added)
+        if (_videoQueue.TryEnqueueDropOldest(frame, droppedFrame => droppedFrame.ReturnBuffer(), out int droppedCount))
         {
-            try
+            if (droppedCount > 0)
             {
-                added = _videoQueue.TryAdd(frame, 0);
-            }
-            catch (InvalidOperationException)
-            {
-                frame.ReturnBuffer();
-                return;
-            }
-
-            if (added)
-                break;
-
-            // 队列满，丢弃一帧
-            if (_videoQueue.TryTake(out var droppedFrame))
-            {
-                droppedFrame.ReturnBuffer();
-                int dropped = Interlocked.Increment(ref _droppedFrameCount);
+                int dropped = Interlocked.Add(ref _droppedFrameCount, droppedCount);
                 if (dropped <= 5 || dropped % 60 == 0)
                     Plugin.Log!.Warning($"[FFmpeg] Video queue full, dropped a captured frame. dropped={dropped}");
             }
-            else
-            {
-                break;
-            }
+
+            Interlocked.Increment(ref _inputFrameCount);
+            return;
         }
 
-        if (added)
-        {
-            Interlocked.Increment(ref _inputFrameCount);
-        }
-        else
-        {
-            frame.ReturnBuffer();
-        }
+        frame.ReturnBuffer();
     }
 
     public void WriteAudioPacket(AudioPacket packet)
     {
         if (_stopped || _audioQueue == null) return;
 
-        bool added = false;
-        while (!added)
+        if (_audioQueue.TryEnqueueDropOldest(packet.Data, _ => { }, out int droppedCount))
         {
-            try
+            if (droppedCount > 0)
             {
-                added = _audioQueue.TryAdd(packet.Data, 0);
-            }
-            catch (InvalidOperationException)
-            {
-                return;
-            }
-
-            if (added)
-                return;
-
-            if (_audioQueue.TryTake(out _))
-            {
-                int dropped = Interlocked.Increment(ref _droppedAudioPacketCount);
+                int dropped = Interlocked.Add(ref _droppedAudioPacketCount, droppedCount);
                 if (dropped <= 5 || dropped % 100 == 0)
                     Plugin.Log!.Warning($"[FFmpeg] Audio queue full, dropped oldest packet to catch up. droppedAudio={dropped}");
             }
-            else
-            {
-                int dropped = Interlocked.Increment(ref _droppedAudioPacketCount);
-                if (dropped <= 5 || dropped % 100 == 0)
-                    Plugin.Log!.Warning($"[FFmpeg] Audio queue full, dropped incoming packet. droppedAudio={dropped}");
-                return;
-            }
+
+            return;
         }
+
+        int incomingDropped = Interlocked.Increment(ref _droppedAudioPacketCount);
+        if (incomingDropped <= 5 || incomingDropped % 100 == 0)
+            Plugin.Log!.Warning($"[FFmpeg] Audio queue full, dropped incoming packet. droppedAudio={incomingDropped}");
     }
 
     /// <summary>视频写入线程：从队列取帧写入 FFmpeg stdin。</summary>
@@ -561,14 +522,7 @@ internal sealed class FFmpegWriter : IOutputSink
         if (_videoQueue == null)
             return 0;
 
-        int drained = 0;
-        while (_videoQueue.TryTake(out var pendingFrame))
-        {
-            pendingFrame.ReturnBuffer();
-            drained++;
-        }
-
-        return drained;
+        return _videoQueue.Drain(pendingFrame => pendingFrame.ReturnBuffer());
     }
 
     private sealed class LastVideoFrameCache : IDisposable
@@ -728,9 +682,9 @@ internal sealed class FFmpegWriter : IOutputSink
             $"stopping, input={Volatile.Read(ref _inputFrameCount)}, output={Volatile.Read(ref _frameCount)}, tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, dropped={Volatile.Read(ref _droppedFrameCount)}, staleDrops={Volatile.Read(ref _staleFrameDropCount)}, nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, audioPackets={Volatile.Read(ref _audioPackets)}, droppedAudio={Volatile.Read(ref _droppedAudioPacketCount)}, finalDuration={finalVideoDuration}");
 
         // 完成视频队列
-        try { _videoQueue?.CompleteAdding(); } catch { }
+        _videoQueue?.CompleteAdding();
         // 完成音频队列
-        try { _audioQueue?.CompleteAdding(); } catch { }
+        _audioQueue?.CompleteAdding();
 
         // 停止时优先快速收尾；如果 writer 卡在 stdin.Write，则关闭 stdin 解除阻塞。
         bool videoWriterFinished = _videoWriterThread == null || _videoWriterThread.Join(5_000);

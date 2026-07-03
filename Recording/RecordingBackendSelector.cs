@@ -1,44 +1,57 @@
-using Recorder.Encoding;
-using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace Recorder.Recording;
 
-internal static class RecordingBackendSelector
+internal sealed class RecordingBackendSelector
 {
-    public static bool ShouldPreferNativeRecorder(Configuration config, out string reason)
+    private readonly NativeRecorderRecordingBackend _nativeRecorder = new();
+    private readonly FFmpegRecordingBackend _ffmpeg;
+    private readonly IRecorderLogger _log;
+
+    public RecordingBackendSelector(IRecorderLogger log)
     {
-        if (config.ForceFFmpegFallbackForTesting)
-        {
-            reason = "FFmpeg fallback forced for local testing";
-            return false;
-        }
-
-        if (!config.UseHardwareEncoder)
-        {
-            reason = "hardware encoder disabled";
-            return false;
-        }
-
-        if (!IsNativeRecorderCompatibleCodec(config.VideoCodec))
-        {
-            reason = $"codec {config.VideoCodec} is not native HEVC/H.264 compatible";
-            return false;
-        }
-
-        NativeRecorderProbeResult probe = NativeRecorderBackend.Probe();
-        reason = probe.Message;
-        return probe.IsAvailable;
+        _log = log;
+        _ffmpeg = new FFmpegRecordingBackend(log);
     }
 
-    private static bool IsNativeRecorderCompatibleCodec(string codec)
+    public RecordingBackendPlan SelectInitial(RecordingRequest request)
     {
-        return string.Equals(codec, "auto", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(codec, "hevc_nvenc", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(codec, "hevc_amf", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(codec, "h265", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(codec, "h264_nvenc", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(codec, "h264_amf", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase);
+        foreach (IRecordingBackend backend in EnumeratePreferredBackends())
+        {
+            RecordingBackendProbeResult probe = backend.Probe(request);
+            if (probe.IsAvailable)
+                return new RecordingBackendPlan(backend, probe);
+
+            if (backend.Id == _nativeRecorder.Id)
+                _log.Info($"[Record] NativeRecorder unavailable: {probe.Reason}");
+        }
+
+        return SelectFFmpeg(request, "no preferred backend available");
+    }
+
+    public RecordingBackendPlan SelectFFmpeg(RecordingRequest request, string reason)
+    {
+        RecordingBackendProbeResult probe = _ffmpeg.Probe(request);
+        string probeReason = string.IsNullOrWhiteSpace(reason)
+            ? probe.Reason
+            : $"{reason}; {probe.Reason}";
+        return new RecordingBackendPlan(
+            _ffmpeg,
+            probe with { Reason = probeReason });
+    }
+
+    private IEnumerable<IRecordingBackend> EnumeratePreferredBackends()
+        => new IRecordingBackend[] { _nativeRecorder, _ffmpeg };
+
+    public string DescribeAvailableBackends(RecordingRequest request)
+    {
+        return string.Join(
+            ", ",
+            EnumeratePreferredBackends().Select(backend =>
+            {
+                RecordingBackendProbeResult probe = backend.Probe(request);
+                return $"{backend.DisplayName}:{(probe.IsAvailable ? "available" : probe.Reason)}";
+            }));
     }
 }
