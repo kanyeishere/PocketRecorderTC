@@ -97,6 +97,32 @@ struct pr_recorder_t
     }
 };
 
+int32_t fail_export_exception(const char* operation, const std::exception& ex)
+{
+    std::string message = "NativeRecorder ";
+    message += operation != nullptr ? operation : "export";
+    message += " threw a C++ exception: ";
+    message += ex.what();
+    set_last_error(message);
+    return PR_E_ENCODER_FAILED;
+}
+
+int32_t fail_export_unknown_exception(const char* operation)
+{
+    std::string message = "NativeRecorder ";
+    message += operation != nullptr ? operation : "export";
+    message += " threw an unknown C++ exception.";
+    set_last_error(message);
+    return PR_E_ENCODER_FAILED;
+}
+
+void copy_export_exception(pr_probe_info* info, const std::string& message)
+{
+    if (info != nullptr)
+        copy_text(info->message, sizeof(info->message), message.c_str());
+    set_last_error(message);
+}
+
 PR_API int32_t PR_CALL pr_get_abi_version(void)
 {
     return PR_ABI_VERSION;
@@ -104,119 +130,160 @@ PR_API int32_t PR_CALL pr_get_abi_version(void)
 
 PR_API int32_t PR_CALL pr_probe(pr_probe_info* info)
 {
-    if (info == nullptr)
-        return PR_E_INVALID_ARGUMENT;
-
-    std::memset(info, 0, sizeof(*info));
-
-    HRESULT hr = ensure_thread_com_initialized();
-    if (FAILED(hr))
+    try
     {
-        std::string message = "COM initialization failed: " + hresult_to_string(hr);
-        copy_text(info->message, sizeof(info->message), message.c_str());
-        set_last_error(message);
-        return PR_OK;
-    }
+        if (info == nullptr)
+            return PR_E_INVALID_ARGUMENT;
 
-    std::string adapter_name;
-    hr = find_nvidia_adapter(&adapter_name);
-    if (SUCCEEDED(hr))
-    {
-        if (!nvenc_runtime_present())
+        std::memset(info, 0, sizeof(*info));
+
+        HRESULT hr = ensure_thread_com_initialized();
+        if (FAILED(hr))
+        {
+            std::string message = "COM initialization failed: " + hresult_to_string(hr);
+            copy_text(info->message, sizeof(info->message), message.c_str());
+            set_last_error(message);
+            return PR_OK;
+        }
+
+        std::string adapter_name;
+        hr = find_nvidia_adapter(&adapter_name);
+        if (SUCCEEDED(hr))
+        {
+            if (!nvenc_runtime_present())
+            {
+                copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
+                copy_text(info->message, sizeof(info->message), "NVIDIA adapter was found, but nvEncodeAPI64.dll was not found.");
+                info->is_supported_adapter = 1;
+                set_last_error(info->message);
+                return PR_OK;
+            }
+
+            copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
+            copy_text(info->message, sizeof(info->message), "NativeRecorder NVIDIA D3D11 texture path is available (NvEncoderD3D11 + libavformat, FFmpeg fallback on runtime failure).");
+            info->is_supported_adapter = 1;
+            info->supports_d3d11_texture_input = 1;
+            set_last_error(info->message);
+            return PR_OK;
+        }
+
+        hr = find_amd_adapter(&adapter_name);
+        if (FAILED(hr))
+        {
+            copy_text(info->message, sizeof(info->message), "No NVIDIA or AMD DXGI adapter was found.");
+            set_last_error(info->message);
+            return PR_OK;
+        }
+
+        if (!amf_runtime_present())
         {
             copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-            copy_text(info->message, sizeof(info->message), "NVIDIA adapter was found, but nvEncodeAPI64.dll was not found.");
-            info->is_supported_adapter = 1;
+            copy_text(info->message, sizeof(info->message), "AMD adapter was found, but amfrt64.dll was not found.");
+            info->is_supported_adapter = 0;
             set_last_error(info->message);
             return PR_OK;
         }
 
         copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-        copy_text(info->message, sizeof(info->message), "NativeRecorder NVIDIA D3D11 texture path is available (NvEncoderD3D11 + libavformat, FFmpeg fallback on runtime failure).");
+        copy_text(info->message, sizeof(info->message), "NativeRecorder AMD D3D11 texture path is available (AMF + libavformat preferred, FFmpeg fallback on runtime failure).");
         info->is_supported_adapter = 1;
         info->supports_d3d11_texture_input = 1;
         set_last_error(info->message);
         return PR_OK;
     }
-
-    hr = find_amd_adapter(&adapter_name);
-    if (FAILED(hr))
+    catch (const std::exception& ex)
     {
-        copy_text(info->message, sizeof(info->message), "No NVIDIA or AMD DXGI adapter was found.");
-        set_last_error(info->message);
-        return PR_OK;
+        std::string message = "NativeRecorder probe threw a C++ exception: ";
+        message += ex.what();
+        copy_export_exception(info, message);
+        return PR_E_ENCODER_FAILED;
     }
-
-    if (!amf_runtime_present())
+    catch (...)
     {
-        copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-        copy_text(info->message, sizeof(info->message), "AMD adapter was found, but amfrt64.dll was not found.");
-        info->is_supported_adapter = 0;
-        set_last_error(info->message);
-        return PR_OK;
+        copy_export_exception(info, "NativeRecorder probe threw an unknown C++ exception.");
+        return PR_E_ENCODER_FAILED;
     }
-
-    copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-    copy_text(info->message, sizeof(info->message), "NativeRecorder AMD D3D11 texture path is available (AMF + libavformat preferred, FFmpeg fallback on runtime failure).");
-    info->is_supported_adapter = 1;
-    info->supports_d3d11_texture_input = 1;
-    set_last_error(info->message);
-    return PR_OK;
 }
 
 PR_API int32_t PR_CALL pr_get_diagnostics_report(char* buffer, int32_t buffer_size)
 {
-    if (buffer == nullptr || buffer_size <= 0)
-        return PR_E_INVALID_ARGUMENT;
+    try
+    {
+        if (buffer == nullptr || buffer_size <= 0)
+            return PR_E_INVALID_ARGUMENT;
 
-    HRESULT hr = ensure_thread_com_initialized();
-    std::string report;
-    if (FAILED(hr))
-        report = "com=failed: " + hresult_to_string(hr) + "; ";
-    else
-        report = "com=ok; ";
+        HRESULT hr = ensure_thread_com_initialized();
+        std::string report;
+        if (FAILED(hr))
+            report = "com=failed: " + hresult_to_string(hr) + "; ";
+        else
+            report = "com=ok; ";
 
-    report += native_runtime_report();
-    report += "; ";
-    report += dxgi_adapter_report();
+        report += native_runtime_report();
+        report += "; ";
+        report += dxgi_adapter_report();
 
-    copy_text(buffer, static_cast<size_t>(buffer_size), report.c_str());
-    return PR_OK;
+        copy_text(buffer, static_cast<size_t>(buffer_size), report.c_str());
+        return PR_OK;
+    }
+    catch (const std::exception& ex)
+    {
+        return fail_export_exception("diagnostics report", ex);
+    }
+    catch (...)
+    {
+        return fail_export_unknown_exception("diagnostics report");
+    }
 }
 
 PR_API int32_t PR_CALL pr_create(const pr_video_config* video, const pr_audio_config* audio, pr_recorder_t** recorder)
 {
-    if (video == nullptr || recorder == nullptr)
-        return PR_E_INVALID_ARGUMENT;
-
-    *recorder = nullptr;
-    if (video->output_path == nullptr || video->width <= 0 || video->height <= 0 || video->fps <= 0)
+    try
     {
-        set_last_error("Invalid NativeRecorder video configuration.");
-        return PR_E_INVALID_ARGUMENT;
-    }
+        if (video == nullptr || recorder == nullptr)
+            return PR_E_INVALID_ARGUMENT;
 
-    if (!is_supported_recording_codec(video->codec))
+        *recorder = nullptr;
+        if (video->output_path == nullptr || video->width <= 0 || video->height <= 0 || video->fps <= 0)
+        {
+            set_last_error("Invalid NativeRecorder video configuration.");
+            return PR_E_INVALID_ARGUMENT;
+        }
+
+        if (!is_supported_recording_codec(video->codec))
+        {
+            set_last_error("NativeRecorder currently supports H.264 and HEVC only.");
+            return PR_E_NOT_AVAILABLE;
+        }
+
+        auto* instance = new (std::nothrow) pr_recorder_t();
+        if (instance == nullptr)
+        {
+            set_last_error("Failed to allocate NativeRecorder instance.");
+            return E_OUTOFMEMORY;
+        }
+
+        instance->video = *video;
+        if (audio != nullptr)
+            instance->audio = *audio;
+        instance->output_path = video->output_path;
+
+        *recorder = instance;
+        set_last_error("NativeRecorder instance created; waiting for first D3D11 texture.");
+        return PR_OK;
+    }
+    catch (const std::exception& ex)
     {
-        set_last_error("NativeRecorder currently supports H.264 and HEVC only.");
-        return PR_E_NOT_AVAILABLE;
+        if (recorder != nullptr)
+            *recorder = nullptr;
+        return fail_export_exception("create", ex);
     }
-
-    auto* instance = new (std::nothrow) pr_recorder_t();
-    if (instance == nullptr)
+    catch (...)
     {
-        set_last_error("Failed to allocate NativeRecorder instance.");
-        return E_OUTOFMEMORY;
+        if (recorder != nullptr)
+            *recorder = nullptr;
+        return fail_export_unknown_exception("create");
     }
-
-    instance->video = *video;
-    if (audio != nullptr)
-        instance->audio = *audio;
-    instance->output_path = video->output_path;
-
-    *recorder = instance;
-    set_last_error("NativeRecorder instance created; waiting for first D3D11 texture.");
-    return PR_OK;
 }
 
 PR_API int32_t PR_CALL pr_submit_d3d11_texture(
@@ -226,13 +293,24 @@ PR_API int32_t PR_CALL pr_submit_d3d11_texture(
     int32_t dxgi_format,
     int64_t timestamp_hns)
 {
-    (void)recorder;
-    (void)d3d11_device;
-    (void)d3d11_texture;
-    (void)dxgi_format;
-    (void)timestamp_hns;
-    set_last_error("Direct D3D11 texture pointer submission is disabled; use shared texture ABI v5.");
-    return PR_E_NOT_IMPLEMENTED;
+    try
+    {
+        (void)recorder;
+        (void)d3d11_device;
+        (void)d3d11_texture;
+        (void)dxgi_format;
+        (void)timestamp_hns;
+        set_last_error("Direct D3D11 texture pointer submission is disabled; use shared texture ABI v5.");
+        return PR_E_NOT_IMPLEMENTED;
+    }
+    catch (const std::exception& ex)
+    {
+        return fail_export_exception("direct texture submit", ex);
+    }
+    catch (...)
+    {
+        return fail_export_unknown_exception("direct texture submit");
+    }
 }
 
 PR_API int32_t PR_CALL pr_submit_d3d11_shared_texture(
@@ -242,62 +320,117 @@ PR_API int32_t PR_CALL pr_submit_d3d11_shared_texture(
     int32_t dxgi_format,
     int64_t timestamp_hns)
 {
-    if (recorder == nullptr || d3d11_device == nullptr || shared_handle == nullptr)
-        return PR_E_INVALID_ARGUMENT;
+    try
+    {
+        if (recorder == nullptr || d3d11_device == nullptr || shared_handle == nullptr)
+            return PR_E_INVALID_ARGUMENT;
 
-    HRESULT hr = ensure_thread_com_initialized();
-    if (FAILED(hr))
-        return fail_hr("COM initialization failed", hr);
+        HRESULT hr = ensure_thread_com_initialized();
+        if (FAILED(hr))
+            return fail_hr("COM initialization failed", hr);
 
-    hr = recorder->submit_shared_texture(
-        static_cast<ID3D11Device*>(d3d11_device),
-        static_cast<HANDLE>(shared_handle),
-        static_cast<DXGI_FORMAT>(dxgi_format),
-        timestamp_hns);
-    if (FAILED(hr))
-        return fail_hr("NativeRecorder texture submit failed", hr);
+        hr = recorder->submit_shared_texture(
+            static_cast<ID3D11Device*>(d3d11_device),
+            static_cast<HANDLE>(shared_handle),
+            static_cast<DXGI_FORMAT>(dxgi_format),
+            timestamp_hns);
+        if (FAILED(hr))
+            return fail_hr("NativeRecorder texture submit failed", hr);
 
-    return PR_OK;
+        return PR_OK;
+    }
+    catch (const std::exception& ex)
+    {
+        return fail_export_exception("shared texture submit", ex);
+    }
+    catch (...)
+    {
+        return fail_export_unknown_exception("shared texture submit");
+    }
 }
 
 PR_API int32_t PR_CALL pr_submit_audio(pr_recorder_t* recorder, const void* data, int32_t byte_count, int64_t timestamp_hns)
 {
-    if (recorder == nullptr)
-        return PR_E_INVALID_ARGUMENT;
+    try
+    {
+        if (recorder == nullptr)
+            return PR_E_INVALID_ARGUMENT;
 
-    HRESULT hr = recorder->submit_audio(data, byte_count, timestamp_hns);
-    if (FAILED(hr))
-        return fail_hr("NativeRecorder audio submit failed", hr);
+        HRESULT hr = recorder->submit_audio(data, byte_count, timestamp_hns);
+        if (FAILED(hr))
+            return fail_hr("NativeRecorder audio submit failed", hr);
 
-    return PR_OK;
+        return PR_OK;
+    }
+    catch (const std::exception& ex)
+    {
+        return fail_export_exception("audio submit", ex);
+    }
+    catch (...)
+    {
+        return fail_export_unknown_exception("audio submit");
+    }
 }
 
 PR_API int32_t PR_CALL pr_stop(pr_recorder_t* recorder)
 {
-    if (recorder == nullptr)
-        return PR_E_INVALID_ARGUMENT;
+    try
+    {
+        if (recorder == nullptr)
+            return PR_E_INVALID_ARGUMENT;
 
-    HRESULT hr = recorder->stop();
+        HRESULT hr = recorder->stop();
 
-    if (FAILED(hr))
-        return fail_hr("NativeRecorder finalize failed", hr);
+        if (FAILED(hr))
+            return fail_hr("NativeRecorder finalize failed", hr);
 
-    if (get_last_error_copy().empty())
-        set_last_error("NativeRecorder finalized.");
-    return PR_OK;
+        if (get_last_error_copy().empty())
+            set_last_error("NativeRecorder finalized.");
+        return PR_OK;
+    }
+    catch (const std::exception& ex)
+    {
+        return fail_export_exception("stop", ex);
+    }
+    catch (...)
+    {
+        return fail_export_unknown_exception("stop");
+    }
 }
 
 PR_API void PR_CALL pr_destroy(pr_recorder_t* recorder)
 {
-    delete recorder;
+    try
+    {
+        delete recorder;
+    }
+    catch (const std::exception& ex)
+    {
+        (void)fail_export_exception("destroy", ex);
+    }
+    catch (...)
+    {
+        (void)fail_export_unknown_exception("destroy");
+    }
 }
 
 PR_API int32_t PR_CALL pr_get_last_error(char* buffer, int32_t buffer_size)
 {
-    if (buffer == nullptr || buffer_size <= 0)
-        return PR_E_INVALID_ARGUMENT;
+    try
+    {
+        if (buffer == nullptr || buffer_size <= 0)
+            return PR_E_INVALID_ARGUMENT;
 
-    std::lock_guard lock(g_error_mutex);
-    copy_text(buffer, static_cast<size_t>(buffer_size), g_last_error.c_str());
-    return PR_OK;
+        std::lock_guard lock(g_error_mutex);
+        copy_text(buffer, static_cast<size_t>(buffer_size), g_last_error.c_str());
+        return PR_OK;
+    }
+    catch (const std::exception& ex)
+    {
+        return fail_export_exception("get last error", ex);
+    }
+    catch (...)
+    {
+        return fail_export_unknown_exception("get last error");
+    }
 }

@@ -1,45 +1,453 @@
-struct NvencLibavRecorderBackend final : NativeRecorderBackend
+struct NativeEncoderCounters
+{
+    uint64_t submitted_frames = 0;
+    uint64_t encoder_input_frames = 0;
+    uint64_t written_packets = 0;
+    uint64_t encoder_input_full_drops = 0;
+    uint64_t query_repeat_returns = 0;
+    uint64_t audio_packets = 0;
+};
+
+struct NativePendingVideoFrame
+{
+    size_t slot_index = 0;
+    int64_t timestamp_hns = 0;
+    bool force_idr = false;
+};
+
+struct NativeD3D11TexturePool
+{
+    struct Slot
+    {
+        ComPtr<ID3D11Texture2D> texture;
+        bool in_use = false;
+    };
+
+    std::vector<Slot> slots;
+    size_t next_slot = 0;
+    std::mutex mutex;
+
+    template <typename CreateTexture>
+    HRESULT ensure(size_t slot_count, CreateTexture&& create_texture)
+    {
+        std::lock_guard lock(mutex);
+        if (!slots.empty())
+            return S_OK;
+
+        slots.reserve(slot_count);
+        for (size_t i = 0; i < slot_count; ++i)
+        {
+            Slot slot{};
+            HRESULT hr = create_texture(slot.texture);
+            if (FAILED(hr))
+            {
+                slots.clear();
+                next_slot = 0;
+                return hr;
+            }
+            slots.push_back(std::move(slot));
+        }
+
+        next_slot = 0;
+        return S_OK;
+    }
+
+    HRESULT acquire(size_t& slot_index, ID3D11Texture2D** texture, const std::string& full_message)
+    {
+        if (texture == nullptr)
+            return E_POINTER;
+
+        std::lock_guard lock(mutex);
+        for (size_t offset = 0; offset < slots.size(); ++offset)
+        {
+            size_t index = (next_slot + offset) % slots.size();
+            if (slots[index].in_use || !slots[index].texture)
+                continue;
+
+            slots[index].in_use = true;
+            next_slot = (index + 1) % slots.size();
+            slot_index = index;
+            *texture = slots[index].texture.Get();
+            return S_OK;
+        }
+
+        set_last_error(full_message);
+        return DXGI_ERROR_WAS_STILL_DRAWING;
+    }
+
+    bool get_texture(size_t slot_index, ComPtr<ID3D11Texture2D>& texture)
+    {
+        std::lock_guard lock(mutex);
+        if (slot_index >= slots.size() || !slots[slot_index].texture)
+            return false;
+
+        texture = slots[slot_index].texture;
+        return true;
+    }
+
+    void release(size_t slot_index)
+    {
+        std::lock_guard lock(mutex);
+        if (slot_index < slots.size())
+            slots[slot_index].in_use = false;
+    }
+
+    void clear()
+    {
+        std::lock_guard lock(mutex);
+        slots.clear();
+        next_slot = 0;
+    }
+};
+
+struct NativeVideoFrameQueue
+{
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<NativePendingVideoFrame> queue;
+    bool accepting = false;
+    bool stopping = false;
+
+    void start()
+    {
+        std::lock_guard lock(mutex);
+        queue.clear();
+        accepting = true;
+        stopping = false;
+    }
+
+    HRESULT enqueue(NativePendingVideoFrame frame, const std::string& full_message)
+    {
+        std::unique_lock lock(mutex);
+        if (!accepting)
+            return E_ABORT;
+        if (queue.size() >= kMaxNativeVideoQueueItems)
+        {
+            set_last_error(full_message);
+            return DXGI_ERROR_WAS_STILL_DRAWING;
+        }
+
+        queue.push_back(frame);
+        lock.unlock();
+        cv.notify_one();
+        return S_OK;
+    }
+
+    bool wait_pop(NativePendingVideoFrame& frame)
+    {
+        for (;;)
+        {
+            std::unique_lock lock(mutex);
+            cv.wait(lock, [this] { return stopping || !queue.empty(); });
+            if (!queue.empty())
+            {
+                frame = queue.front();
+                queue.pop_front();
+                return true;
+            }
+            if (stopping)
+                return false;
+        }
+    }
+
+    void request_stop()
+    {
+        {
+            std::lock_guard lock(mutex);
+            accepting = false;
+            stopping = true;
+        }
+        cv.notify_one();
+    }
+
+    std::vector<size_t> fail_and_take_slots()
+    {
+        std::vector<size_t> slots;
+        {
+            std::lock_guard lock(mutex);
+            accepting = false;
+            stopping = true;
+            while (!queue.empty())
+            {
+                slots.push_back(queue.front().slot_index);
+                queue.pop_front();
+            }
+        }
+        cv.notify_one();
+        return slots;
+    }
+
+    void clear()
+    {
+        std::lock_guard lock(mutex);
+        queue.clear();
+        accepting = false;
+        stopping = false;
+    }
+};
+
+struct NativeOutputTimestampQueue
+{
+    struct Entry
+    {
+        int64_t timestamp_hns = 0;
+        size_t resource_slot = 0;
+        bool has_resource_slot = false;
+    };
+
+    std::deque<Entry> entries;
+
+    void push(int64_t timestamp_hns)
+    {
+        entries.push_back(Entry{std::max<int64_t>(0, timestamp_hns), 0, false});
+    }
+
+    void push_with_resource(int64_t timestamp_hns, size_t resource_slot)
+    {
+        entries.push_back(Entry{std::max<int64_t>(0, timestamp_hns), resource_slot, true});
+    }
+
+    template <typename ReleaseResource>
+    int64_t take(int64_t encoder_timestamp_hns, uint64_t written_packets, int64_t duration_hns, ReleaseResource release_resource)
+    {
+        if (!entries.empty())
+        {
+            Entry entry = entries.front();
+            entries.pop_front();
+            if (entry.has_resource_slot)
+                release_resource(entry.resource_slot);
+            return entry.timestamp_hns;
+        }
+
+        if (encoder_timestamp_hns >= 0)
+            return encoder_timestamp_hns;
+
+        return static_cast<int64_t>(written_packets) * duration_hns;
+    }
+
+    void clear()
+    {
+        entries.clear();
+    }
+
+    template <typename ReleaseResource>
+    void clear(ReleaseResource release_resource)
+    {
+        while (!entries.empty())
+        {
+            Entry entry = entries.front();
+            entries.pop_front();
+            if (entry.has_resource_slot)
+                release_resource(entry.resource_slot);
+        }
+    }
+
+    size_t size() const
+    {
+        return entries.size();
+    }
+};
+
+struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
 {
     pr_video_config video{};
     pr_audio_config audio{};
     std::wstring output_path;
     SharedTextureNv12Converter converter;
-    std::unique_ptr<NvEncoderD3D11> encoder;
     AsyncLibavMp4Muxer muxer;
     bool initialized = false;
     bool stopped = false;
-    uint64_t submitted_frames = 0;
-    uint64_t written_packets = 0;
-    uint64_t audio_packets = 0;
+    NativeEncoderCounters counters{};
     int64_t video_sample_duration_hns = 0;
-    std::deque<int64_t> pending_video_timestamps_hns;
-    struct NvencInputSlot
-    {
-        ComPtr<ID3D11Texture2D> texture;
-        bool in_use = false;
-    };
-    struct PendingVideoFrame
-    {
-        size_t slot_index = 0;
-        int64_t timestamp_hns = 0;
-        bool force_idr = false;
-    };
-    std::vector<NvencInputSlot> nv12_pool;
-    size_t next_nv12_slot = 0;
-    std::mutex input_mutex;
+    NativeD3D11TexturePool conversion_nv12_pool;
+    NativeVideoFrameQueue video_queue;
+    NativeOutputTimestampQueue pending_output_timestamps;
     std::mutex d3d_context_mutex;
-    std::mutex video_queue_mutex;
-    std::condition_variable video_queue_cv;
-    std::deque<PendingVideoFrame> video_queue;
     std::thread video_worker;
     std::atomic<HRESULT> video_worker_result{S_OK};
-    bool accepting_video = false;
-    bool stopping_video = false;
+    std::string backend_tag;
 
-    NvencLibavRecorderBackend(const pr_video_config& video_config, const pr_audio_config& audio_config, std::wstring output)
-        : video(video_config), audio(audio_config), output_path(std::move(output))
+    NativeD3D11LibavRecorderBackend(
+        const pr_video_config& video_config,
+        const pr_audio_config& audio_config,
+        std::wstring output,
+        std::string tag)
+        : video(video_config), audio(audio_config), output_path(std::move(output)), backend_tag(std::move(tag))
     {
         converter.video = video;
+    }
+
+    HRESULT submit_shared_texture(ID3D11Device* source_device, HANDLE shared_handle, DXGI_FORMAT source_format, int64_t timestamp_hns) override
+    {
+        if (stopped)
+            return E_ABORT;
+        if (source_device == nullptr || shared_handle == nullptr)
+            return E_POINTER;
+
+        HRESULT hr = initialize(source_device, source_format);
+        if (FAILED(hr))
+            return hr;
+
+        hr = video_worker_result.load();
+        if (FAILED(hr))
+            return hr;
+
+        size_t slot_index = 0;
+        ID3D11Texture2D* nv12_texture = nullptr;
+        hr = conversion_nv12_pool.acquire(slot_index, &nv12_texture, conversion_pool_full_message());
+        if (FAILED(hr))
+            return hr;
+
+        {
+            std::lock_guard context_lock(d3d_context_mutex);
+            hr = converter.convert_shared_texture_to(shared_handle, source_format, nv12_texture);
+        }
+        if (FAILED(hr))
+        {
+            conversion_nv12_pool.release(slot_index);
+            return hr;
+        }
+
+        const bool force_idr = counters.submitted_frames == 0;
+        hr = video_queue.enqueue(
+            NativePendingVideoFrame{slot_index, std::max<int64_t>(0, timestamp_hns), force_idr},
+            input_queue_full_message());
+        if (FAILED(hr))
+        {
+            conversion_nv12_pool.release(slot_index);
+            return hr;
+        }
+
+        ++counters.submitted_frames;
+        return S_OK;
+    }
+
+    HRESULT submit_audio(const void* data, int32_t byte_count, int64_t timestamp_hns) override
+    {
+        if (!audio.enabled)
+            return S_OK;
+        if (!initialized)
+            return S_OK;
+
+        HRESULT hr = muxer.enqueue_audio(data, byte_count, timestamp_hns);
+        if (FAILED(hr))
+            return hr;
+
+        ++counters.audio_packets;
+        return S_OK;
+    }
+
+    HRESULT ensure_conversion_pool()
+    {
+        return conversion_nv12_pool.ensure(
+            kNativeNv12ConversionPoolSize,
+            [this](ComPtr<ID3D11Texture2D>& texture)
+            {
+                return converter.create_nv12_texture(texture);
+            });
+    }
+
+    bool get_conversion_texture(size_t slot_index, ComPtr<ID3D11Texture2D>& texture)
+    {
+        return conversion_nv12_pool.get_texture(slot_index, texture);
+    }
+
+    void release_conversion_slot(size_t slot_index)
+    {
+        conversion_nv12_pool.release(slot_index);
+    }
+
+    void start_video_worker()
+    {
+        video_worker_result.store(S_OK);
+        video_queue.start();
+        video_worker = std::thread([this] { video_worker_loop(); });
+    }
+
+    HRESULT stop_video_worker()
+    {
+        video_queue.request_stop();
+
+        if (video_worker.joinable())
+            video_worker.join();
+
+        return video_worker_result.load();
+    }
+
+    void video_worker_loop()
+    {
+        for (;;)
+        {
+            NativePendingVideoFrame frame{};
+            if (!video_queue.wait_pop(frame))
+                return;
+
+            HRESULT hr = process_queued_frame(frame);
+            if (SUCCEEDED(hr))
+                hr = drain_after_queued_frame();
+
+            if (FAILED(hr))
+            {
+                video_worker_result.store(hr);
+                std::vector<size_t> abandoned_slots = video_queue.fail_and_take_slots();
+                for (size_t slot : abandoned_slots)
+                    release_conversion_slot(slot);
+                return;
+            }
+        }
+    }
+
+    int64_t take_output_timestamp(int64_t encoder_timestamp_hns)
+    {
+        return pending_output_timestamps.take(
+            encoder_timestamp_hns,
+            counters.written_packets,
+            video_sample_duration_hns,
+            [](size_t) {});
+    }
+
+    void clear_common_video_state()
+    {
+        pending_output_timestamps.clear();
+        video_queue.clear();
+        conversion_nv12_pool.clear();
+    }
+
+    std::string finalize_stats() const
+    {
+        return "submitted=" + std::to_string(counters.submitted_frames) +
+            ", encoderInput=" + std::to_string(counters.encoder_input_frames) +
+            ", packets=" + std::to_string(counters.written_packets) +
+            ", inputFullDrops=" + std::to_string(counters.encoder_input_full_drops) +
+            ", queryRepeats=" + std::to_string(counters.query_repeat_returns) +
+            ", audioPackets=" + std::to_string(counters.audio_packets);
+    }
+
+    std::string conversion_pool_full_message() const
+    {
+        return "NativeRecorder " + backend_tag + " NV12 conversion pool is full; dropping one frame.";
+    }
+
+    std::string input_queue_full_message() const
+    {
+        return "NativeRecorder " + backend_tag + " input queue is full; dropping one frame.";
+    }
+
+    virtual HRESULT process_queued_frame(const NativePendingVideoFrame& frame) = 0;
+
+    virtual HRESULT drain_after_queued_frame()
+    {
+        return S_OK;
+    }
+};
+
+struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
+{
+    std::unique_ptr<NvEncoderD3D11> encoder;
+
+    NvencLibavRecorderBackend(const pr_video_config& video_config, const pr_audio_config& audio_config, std::wstring output)
+        : NativeD3D11LibavRecorderBackend(video_config, audio_config, std::move(output), "NVENC")
+    {
     }
 
     ~NvencLibavRecorderBackend() override
@@ -148,7 +556,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
             if (FAILED(hr))
                 return hr;
 
-            hr = ensure_nv12_pool();
+            hr = ensure_conversion_pool();
             if (FAILED(hr))
                 return hr;
         }
@@ -159,12 +567,8 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                 ", encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height));
         }
 
-        video_worker_result.store(S_OK);
-        accepting_video = true;
-        stopping_video = false;
-        video_worker = std::thread([this] { video_worker_loop(); });
-
         initialized = true;
+        start_video_worker();
         std::string message = "NativeRecorder initialized: source NVIDIA adapter=" + converter.adapter_name +
             ", luid=" + std::to_string(static_cast<uint32_t>(converter.adapter_luid.HighPart)) + ":" +
             std::to_string(converter.adapter_luid.LowPart) +
@@ -179,159 +583,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
         return S_OK;
     }
 
-    HRESULT submit_shared_texture(ID3D11Device* source_device, HANDLE shared_handle, DXGI_FORMAT source_format, int64_t timestamp_hns) override
-    {
-        if (stopped)
-            return E_ABORT;
-        if (source_device == nullptr || shared_handle == nullptr)
-            return E_POINTER;
-
-        HRESULT hr = initialize(source_device, source_format);
-        if (FAILED(hr))
-            return hr;
-
-        hr = video_worker_result.load();
-        if (FAILED(hr))
-            return hr;
-
-        size_t slot_index = 0;
-        ID3D11Texture2D* nv12_texture = nullptr;
-        hr = acquire_nv12_slot(slot_index, &nv12_texture);
-        if (FAILED(hr))
-            return hr;
-
-        {
-            std::lock_guard context_lock(d3d_context_mutex);
-            hr = converter.convert_shared_texture_to(shared_handle, source_format, nv12_texture);
-        }
-        if (FAILED(hr))
-        {
-            release_nv12_slot(slot_index);
-            return hr;
-        }
-
-        const bool force_idr = submitted_frames == 0;
-        hr = enqueue_video_frame(slot_index, std::max<int64_t>(0, timestamp_hns), force_idr);
-        if (FAILED(hr))
-        {
-            release_nv12_slot(slot_index);
-            return hr;
-        }
-
-        ++submitted_frames;
-        return S_OK;
-    }
-
-    HRESULT ensure_nv12_pool()
-    {
-        std::lock_guard lock(input_mutex);
-        if (!nv12_pool.empty())
-            return S_OK;
-
-        nv12_pool.reserve(kNvencNv12PoolSize);
-        for (size_t i = 0; i < kNvencNv12PoolSize; ++i)
-        {
-            NvencInputSlot slot{};
-            HRESULT hr = converter.create_nv12_texture(slot.texture);
-            if (FAILED(hr))
-                return hr;
-            nv12_pool.push_back(std::move(slot));
-        }
-
-        next_nv12_slot = 0;
-        return S_OK;
-    }
-
-    HRESULT acquire_nv12_slot(size_t& slot_index, ID3D11Texture2D** texture)
-    {
-        if (texture == nullptr)
-            return E_POINTER;
-
-        std::lock_guard lock(input_mutex);
-        for (size_t offset = 0; offset < nv12_pool.size(); ++offset)
-        {
-            size_t index = (next_nv12_slot + offset) % nv12_pool.size();
-            if (nv12_pool[index].in_use)
-                continue;
-
-            nv12_pool[index].in_use = true;
-            next_nv12_slot = (index + 1) % nv12_pool.size();
-            slot_index = index;
-            *texture = nv12_pool[index].texture.Get();
-            return S_OK;
-        }
-
-        set_last_error("NativeRecorder NVENC NV12 input pool is full; dropping one frame.");
-        return DXGI_ERROR_WAS_STILL_DRAWING;
-    }
-
-    void release_nv12_slot(size_t slot_index)
-    {
-        std::lock_guard lock(input_mutex);
-        if (slot_index < nv12_pool.size())
-            nv12_pool[slot_index].in_use = false;
-    }
-
-    HRESULT enqueue_video_frame(size_t slot_index, int64_t timestamp_hns, bool force_idr)
-    {
-        std::unique_lock lock(video_queue_mutex);
-        if (!accepting_video)
-            return E_ABORT;
-        if (video_queue.size() >= kMaxNativeVideoQueueItems)
-        {
-            set_last_error("NativeRecorder NVENC input queue is full; dropping one frame.");
-            return DXGI_ERROR_WAS_STILL_DRAWING;
-        }
-
-        video_queue.push_back(PendingVideoFrame{slot_index, timestamp_hns, force_idr});
-        lock.unlock();
-        video_queue_cv.notify_one();
-        return S_OK;
-    }
-
-    void video_worker_loop()
-    {
-        for (;;)
-        {
-            PendingVideoFrame frame{};
-            {
-                std::unique_lock lock(video_queue_mutex);
-                video_queue_cv.wait(lock, [this] { return stopping_video || !video_queue.empty(); });
-                if (video_queue.empty())
-                {
-                    if (stopping_video)
-                        return;
-                    continue;
-                }
-
-                frame = video_queue.front();
-                video_queue.pop_front();
-            }
-
-            HRESULT hr = encode_queued_frame(frame);
-            if (FAILED(hr))
-            {
-                video_worker_result.store(hr);
-                std::vector<size_t> abandoned_slots;
-                {
-                    std::lock_guard lock(video_queue_mutex);
-                    accepting_video = false;
-                    stopping_video = true;
-                    while (!video_queue.empty())
-                    {
-                        abandoned_slots.push_back(video_queue.front().slot_index);
-                        video_queue.pop_front();
-                    }
-                }
-                for (size_t slot : abandoned_slots)
-                    release_nv12_slot(slot);
-                video_queue_cv.notify_one();
-                return;
-            }
-        }
-    }
-
-    HRESULT encode_queued_frame(const PendingVideoFrame& frame)
+    HRESULT process_queued_frame(const NativePendingVideoFrame& frame) override
     {
         try
         {
@@ -339,22 +591,14 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
             auto* input_texture = reinterpret_cast<ID3D11Texture2D*>(input_frame->inputPtr);
             if (input_texture == nullptr)
             {
-                release_nv12_slot(frame.slot_index);
+                release_conversion_slot(frame.slot_index);
                 return E_POINTER;
             }
 
             ComPtr<ID3D11Texture2D> nv12_texture;
-            bool invalid_slot = false;
+            if (!get_conversion_texture(frame.slot_index, nv12_texture))
             {
-                std::lock_guard lock(input_mutex);
-                if (frame.slot_index >= nv12_pool.size() || !nv12_pool[frame.slot_index].texture)
-                    invalid_slot = true;
-                else
-                    nv12_texture = nv12_pool[frame.slot_index].texture;
-            }
-            if (invalid_slot)
-            {
-                release_nv12_slot(frame.slot_index);
+                release_conversion_slot(frame.slot_index);
                 return E_INVALIDARG;
             }
 
@@ -364,7 +608,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                     reinterpret_cast<ID3D11Resource*>(input_texture),
                     reinterpret_cast<ID3D11Resource*>(nv12_texture.Get()));
             }
-            release_nv12_slot(frame.slot_index);
+            release_conversion_slot(frame.slot_index);
 
             NV_ENC_PIC_PARAMS picture_params = { NV_ENC_PIC_PARAMS_VER };
             picture_params.inputTimeStamp = static_cast<uint64_t>(std::max<int64_t>(0, frame.timestamp_hns));
@@ -372,7 +616,8 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                 picture_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
 
             std::vector<NvEncOutputFrame> packets;
-            pending_video_timestamps_hns.push_back(std::max<int64_t>(0, frame.timestamp_hns));
+            pending_output_timestamps.push(frame.timestamp_hns);
+            ++counters.encoder_input_frames;
             encoder->EncodeFrame(packets, &picture_params);
             for (const NvEncOutputFrame& packet : packets)
             {
@@ -387,62 +632,17 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                     video_sample_duration_hns);
                 if (FAILED(hr))
                     return hr;
-                ++written_packets;
+                ++counters.written_packets;
             }
         }
         catch (const std::exception& ex)
         {
             return fail_exception("NvEncoderD3D11 worker encode", ex,
-                "submitted=" + std::to_string(submitted_frames) +
-                ", written=" + std::to_string(written_packets));
+                "submitted=" + std::to_string(counters.submitted_frames) +
+                ", written=" + std::to_string(counters.written_packets));
         }
 
         return S_OK;
-    }
-
-    int64_t take_output_timestamp(int64_t encoder_timestamp_hns)
-    {
-        if (!pending_video_timestamps_hns.empty())
-        {
-            int64_t timestamp = pending_video_timestamps_hns.front();
-            pending_video_timestamps_hns.pop_front();
-            return timestamp;
-        }
-
-        if (encoder_timestamp_hns >= 0)
-            return encoder_timestamp_hns;
-
-        return static_cast<int64_t>(written_packets) * video_sample_duration_hns;
-    }
-
-    HRESULT submit_audio(const void* data, int32_t byte_count, int64_t timestamp_hns) override
-    {
-        if (!audio.enabled)
-            return S_OK;
-        if (!initialized)
-            return S_OK;
-
-        HRESULT hr = muxer.enqueue_audio(data, byte_count, timestamp_hns);
-        if (FAILED(hr))
-            return hr;
-
-        ++audio_packets;
-        return S_OK;
-    }
-
-    HRESULT stop_video_worker()
-    {
-        {
-            std::lock_guard lock(video_queue_mutex);
-            accepting_video = false;
-            stopping_video = true;
-        }
-        video_queue_cv.notify_one();
-
-        if (video_worker.joinable())
-            video_worker.join();
-
-        return video_worker_result.load();
     }
 
     HRESULT stop() override
@@ -471,7 +671,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                         video_sample_duration_hns);
                     if (FAILED(hr) && SUCCEEDED(result))
                         result = hr;
-                    ++written_packets;
+                    ++counters.written_packets;
                 }
                 encoder->DestroyEncoder();
             }
@@ -487,70 +687,36 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
             result = mux_hr;
 
         encoder.reset();
+        clear_common_video_state();
         converter.reset();
-        {
-            std::lock_guard lock(input_mutex);
-            nv12_pool.clear();
-            next_nv12_slot = 0;
-        }
 
         if (SUCCEEDED(result))
         {
-            set_last_error("NativeRecorder finalized via NvEncoderD3D11 + libavformat. submitted=" +
-                std::to_string(submitted_frames) +
-                ", packets=" + std::to_string(written_packets) +
-                ", audioPackets=" + std::to_string(audio_packets));
+            set_last_error("NativeRecorder finalized via NvEncoderD3D11 + libavformat. " + finalize_stats());
         }
 
         return result;
     }
 };
 
-struct AmfLibavRecorderBackend final : NativeRecorderBackend
+struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
 {
-    pr_video_config video{};
-    pr_audio_config audio{};
-    std::wstring output_path;
-    SharedTextureNv12Converter converter;
     amf::AMFContextPtr context;
     amf::AMFComponentPtr encoder;
-    AsyncLibavMp4Muxer muxer;
-    bool initialized = false;
-    bool stopped = false;
     bool factory_initialized = false;
-    uint64_t submitted_frames = 0;
-    uint64_t written_packets = 0;
-    uint64_t audio_packets = 0;
-    int64_t video_sample_duration_hns = 0;
-    std::deque<int64_t> pending_video_timestamps_hns;
-    struct AmfInputSlot
+    struct AmfEncoderInputSlot
     {
-        ComPtr<ID3D11Texture2D> texture;
+        amf::AMFSurfacePtr surface;
+        ID3D11Texture2D* texture = nullptr;
         bool in_use = false;
     };
-    std::vector<AmfInputSlot> nv12_pool;
-    std::deque<size_t> pending_video_slots;
-    size_t next_nv12_slot = 0;
-    struct PendingVideoFrame
-    {
-        size_t slot_index = 0;
-        int64_t timestamp_hns = 0;
-        bool force_idr = false;
-    };
-    std::mutex input_mutex;
-    std::mutex d3d_context_mutex;
-    std::mutex video_queue_mutex;
-    std::condition_variable video_queue_cv;
-    std::deque<PendingVideoFrame> video_queue;
-    std::thread video_worker;
-    std::atomic<HRESULT> video_worker_result{S_OK};
-    bool accepting_video = false;
-    bool stopping_video = false;
+    std::vector<AmfEncoderInputSlot> encoder_input_pool;
+    size_t next_encoder_input_slot = 0;
+    std::mutex encoder_input_mutex;
 
     AmfLibavRecorderBackend(const pr_video_config& video_config, const pr_audio_config& audio_config, std::wstring output)
-        : video(video_config), audio(audio_config), output_path(std::move(output))
+        : NativeD3D11LibavRecorderBackend(video_config, audio_config, std::move(output), "AMF")
     {
-        converter.video = video;
         converter.required_vendor_id = kAmdVendorId;
         converter.required_vendor_name = "AMD";
     }
@@ -631,15 +797,16 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         if (FAILED(hr))
             return hr;
 
-        hr = ensure_nv12_pool();
+        hr = ensure_conversion_pool();
+        if (FAILED(hr))
+            return hr;
+
+        hr = ensure_encoder_input_pool(encoded_width, encoded_height);
         if (FAILED(hr))
             return hr;
 
         initialized = true;
-        video_worker_result.store(S_OK);
-        accepting_video = true;
-        stopping_video = false;
-        video_worker = std::thread([this] { video_worker_loop(); });
+        start_video_worker();
 
         std::string message = "NativeRecorder initialized: source AMD adapter=" + converter.adapter_name +
             ", luid=" + std::to_string(static_cast<uint32_t>(converter.adapter_luid.HighPart)) + ":" +
@@ -649,6 +816,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
             ", pad=" + std::to_string(encoded_width - video.width) + "x" + std::to_string(encoded_height - video.height) +
             ", vpSourceSupport=" + hex_uint32(converter.source_format_support) +
             ", vpNv12Support=" + hex_uint32(converter.nv12_format_support) +
+            ", amfInput=shared conversion pool -> AMF-owned DX11 NV12 surfaces" +
             ", output=" + std::string(codec_name(video.codec)) + "/MP4 via AMF + libavformat.";
         set_last_error(message);
         return S_OK;
@@ -658,6 +826,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
     {
         const int fps = std::max(1, video.fps);
         const int64_t bitrate = video.bitrate_bps > 0 ? video.bitrate_bps : 12'000'000;
+        const int64_t vbv_buffer_bits = std::max<int64_t>(1, (bitrate / fps) * 3);
         AMF_RESULT result = AMF_OK;
 
         if (video.codec == PR_CODEC_H264)
@@ -678,8 +847,36 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
             if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 RateControl)", result);
             result = encoder->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED)));
             if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 QualityPreset)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_MEMORY_TYPE, amf::AMFVariant(static_cast<amf_int64>(amf::AMF_MEMORY_DX11)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 MemoryType)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_OUTPUT_MODE_FRAME)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 OutputMode)", result);
             result = encoder->SetProperty(AMF_VIDEO_ENCODER_MAX_CONSECUTIVE_BPICTURES, amf::AMFVariant(static_cast<amf_int64>(0)));
             if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 BFrames)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, amf::AMFVariant(static_cast<amf_int64>(0)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 BPicturePattern)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_B_REFERENCE_ENABLE, amf::AMFVariant(false));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 BReference)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, amf::AMFVariant(static_cast<amf_int64>(1)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 MaxRefFrames)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_MAX_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 MaxTemporalLayers)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE, amf::AMFVariant(false));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 PreAnalysis)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_PREENCODE_ENABLE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PREENCODE_DISABLED)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 PreEncode)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE, amf::AMFVariant(false));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 SkipFrame)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, amf::AMFVariant(static_cast<amf_int64>(vbv_buffer_bits)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 VBV)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_INITIAL_VBV_BUFFER_FULLNESS, amf::AMFVariant(static_cast<amf_int64>(64)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 InitialVBV)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_ENFORCE_HRD, amf::AMFVariant(true));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 EnforceHRD)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_ENABLE_VBAQ, amf::AMFVariant(false));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 VBAQ)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_QUERY_TIMEOUT, amf::AMFVariant(static_cast<amf_int64>(0)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 QueryTimeout)", result);
             result = encoder->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, amf::AMFVariant(static_cast<amf_int64>(fps * 2)));
             if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 IDRPeriod)", result);
             result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING, amf::AMFVariant(static_cast<amf_int64>(fps * 2)));
@@ -703,6 +900,36 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
             if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC RateControl)", result);
             result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED)));
             if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC QualityPreset)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_MEMORY_TYPE, amf::AMFVariant(static_cast<amf_int64>(amf::AMF_MEMORY_DX11)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC MemoryType)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE_FRAME)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC OutputMode)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES, amf::AMFVariant(static_cast<amf_int64>(1)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC MaxRefFrames)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC MaxTemporalLayers)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC TemporalLayers)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PRE_ANALYSIS_ENABLE, amf::AMFVariant(false));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC PreAnalysis)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PREENCODE_ENABLE, amf::AMFVariant(false));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC PreEncode)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_SKIP_FRAME_ENABLE, amf::AMFVariant(false));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC SkipFrame)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE, amf::AMFVariant(static_cast<amf_int64>(vbv_buffer_bits)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC VBV)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_INITIAL_VBV_BUFFER_FULLNESS, amf::AMFVariant(static_cast<amf_int64>(64)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC InitialVBV)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD, amf::AMFVariant(true));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC EnforceHRD)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, amf::AMFVariant(false));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC VBAQ)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_HIGH_MOTION_QUALITY_BOOST_ENABLE, amf::AMFVariant(false));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC HighMotionQualityBoost)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_SLICES_PER_FRAME, amf::AMFVariant(static_cast<amf_int64>(1)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC SlicesPerFrame)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT, amf::AMFVariant(static_cast<amf_int64>(0)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC QueryTimeout)", result);
             result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, amf::AMFVariant(static_cast<amf_int64>(fps * 2)));
             if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC GOP)", result);
             result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, amf::AMFVariant(static_cast<amf_int64>(1)));
@@ -743,187 +970,148 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         return S_OK;
     }
 
-    HRESULT ensure_nv12_pool()
+    HRESULT ensure_encoder_input_pool(int encoded_width, int encoded_height)
     {
-        if (!nv12_pool.empty())
+        std::lock_guard lock(encoder_input_mutex);
+        if (!encoder_input_pool.empty())
             return S_OK;
 
-        nv12_pool.reserve(kAmfNv12PoolSize);
-        for (size_t i = 0; i < kAmfNv12PoolSize; ++i)
+        encoder_input_pool.reserve(kAmfEncoderInputPoolSize);
+        for (size_t i = 0; i < kAmfEncoderInputPoolSize; ++i)
         {
-            AmfInputSlot slot{};
-            HRESULT hr = converter.create_nv12_texture(slot.texture);
-            if (FAILED(hr))
-                return hr;
-            nv12_pool.push_back(std::move(slot));
+            AmfEncoderInputSlot slot{};
+            AMF_RESULT result = context->AllocSurface(
+                amf::AMF_MEMORY_DX11,
+                amf::AMF_SURFACE_NV12,
+                encoded_width,
+                encoded_height,
+                &slot.surface);
+            if (!amf_result_success(result))
+            {
+                encoder_input_pool.clear();
+                next_encoder_input_slot = 0;
+                return fail_amf("AMF AllocSurface(input)", result,
+                    "encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height));
+            }
+
+            if (slot.surface == nullptr || slot.surface->GetPlanesCount() == 0)
+            {
+                encoder_input_pool.clear();
+                next_encoder_input_slot = 0;
+                set_last_error("NativeRecorder AMF AllocSurface returned an invalid NV12 surface.");
+                return E_FAIL;
+            }
+
+            amf::AMFPlane* plane = slot.surface->GetPlaneAt(0);
+            slot.texture = plane != nullptr ? static_cast<ID3D11Texture2D*>(plane->GetNative()) : nullptr;
+            if (slot.texture == nullptr)
+            {
+                encoder_input_pool.clear();
+                next_encoder_input_slot = 0;
+                set_last_error("NativeRecorder AMF input surface did not expose a DX11 texture.");
+                return E_FAIL;
+            }
+
+            encoder_input_pool.push_back(std::move(slot));
         }
 
-        next_nv12_slot = 0;
+        next_encoder_input_slot = 0;
         return S_OK;
     }
 
-    HRESULT acquire_nv12_slot(size_t& slot_index, ID3D11Texture2D** texture)
+    HRESULT acquire_encoder_input_slot(size_t& slot_index, amf::AMFSurfacePtr& surface, ID3D11Texture2D** texture)
     {
         if (texture == nullptr)
             return E_POINTER;
 
-        HRESULT hr = ensure_nv12_pool();
-        if (FAILED(hr))
-            return hr;
-
-        std::lock_guard lock(input_mutex);
-        for (size_t offset = 0; offset < nv12_pool.size(); ++offset)
+        std::lock_guard lock(encoder_input_mutex);
+        for (size_t offset = 0; offset < encoder_input_pool.size(); ++offset)
         {
-            size_t index = (next_nv12_slot + offset) % nv12_pool.size();
-            if (nv12_pool[index].in_use)
+            size_t index = (next_encoder_input_slot + offset) % encoder_input_pool.size();
+            if (encoder_input_pool[index].in_use || encoder_input_pool[index].surface == nullptr || encoder_input_pool[index].texture == nullptr)
                 continue;
 
-            nv12_pool[index].in_use = true;
-            next_nv12_slot = (index + 1) % nv12_pool.size();
+            encoder_input_pool[index].in_use = true;
+            next_encoder_input_slot = (index + 1) % encoder_input_pool.size();
             slot_index = index;
-            *texture = nv12_pool[index].texture.Get();
+            surface = encoder_input_pool[index].surface;
+            *texture = encoder_input_pool[index].texture;
             return S_OK;
         }
 
-        set_last_error("NativeRecorder AMF NV12 texture pool is full; dropping one frame.");
+        set_last_error("NativeRecorder AMF encoder input surface pool is full; dropping one frame.");
         return DXGI_ERROR_WAS_STILL_DRAWING;
     }
 
-    void release_nv12_slot(size_t slot_index)
+    void release_encoder_input_slot(size_t slot_index)
     {
-        std::lock_guard lock(input_mutex);
-        if (slot_index < nv12_pool.size())
-            nv12_pool[slot_index].in_use = false;
+        std::lock_guard lock(encoder_input_mutex);
+        if (slot_index < encoder_input_pool.size())
+            encoder_input_pool[slot_index].in_use = false;
     }
 
-    HRESULT submit_shared_texture(ID3D11Device* source_device, HANDLE shared_handle, DXGI_FORMAT source_format, int64_t timestamp_hns) override
+    void release_pending_encoder_inputs()
     {
-        if (stopped)
-            return E_ABORT;
-        if (source_device == nullptr || shared_handle == nullptr)
-            return E_POINTER;
-
-        HRESULT hr = initialize(source_device, source_format);
-        if (FAILED(hr))
-            return hr;
-
-        hr = video_worker_result.load();
-        if (FAILED(hr))
-            return hr;
-
-        size_t slot_index = 0;
-        ID3D11Texture2D* nv12_texture = nullptr;
-        hr = acquire_nv12_slot(slot_index, &nv12_texture);
-        if (FAILED(hr))
-            return hr;
-
+        pending_output_timestamps.clear([this](size_t slot_index)
         {
-            std::lock_guard context_lock(d3d_context_mutex);
-            hr = converter.convert_shared_texture_to(shared_handle, source_format, nv12_texture);
-        }
-        if (FAILED(hr))
-        {
-            release_nv12_slot(slot_index);
-            return hr;
-        }
-
-        const bool force_idr = submitted_frames == 0;
-        hr = enqueue_video_frame(slot_index, std::max<int64_t>(0, timestamp_hns), force_idr);
-        if (FAILED(hr))
-        {
-            release_nv12_slot(slot_index);
-            return hr;
-        }
-
-        ++submitted_frames;
-        return S_OK;
+            release_encoder_input_slot(slot_index);
+        });
     }
 
-    HRESULT enqueue_video_frame(size_t slot_index, int64_t timestamp_hns, bool force_idr)
+    void clear_encoder_input_pool()
     {
-        std::unique_lock lock(video_queue_mutex);
-        if (!accepting_video)
-            return E_ABORT;
-        if (video_queue.size() >= kMaxNativeVideoQueueItems)
-        {
-            set_last_error("NativeRecorder AMF input queue is full; dropping one frame.");
-            return DXGI_ERROR_WAS_STILL_DRAWING;
-        }
-
-        video_queue.push_back(PendingVideoFrame{slot_index, timestamp_hns, force_idr});
-        lock.unlock();
-        video_queue_cv.notify_one();
-        return S_OK;
+        std::lock_guard lock(encoder_input_mutex);
+        encoder_input_pool.clear();
+        next_encoder_input_slot = 0;
     }
 
-    void video_worker_loop()
-    {
-        for (;;)
-        {
-            PendingVideoFrame frame{};
-            {
-                std::unique_lock lock(video_queue_mutex);
-                video_queue_cv.wait(lock, [this] { return stopping_video || !video_queue.empty(); });
-                if (video_queue.empty())
-                {
-                    if (stopping_video)
-                        return;
-                    continue;
-                }
-
-                frame = video_queue.front();
-                video_queue.pop_front();
-            }
-
-            HRESULT hr = submit_queued_frame(frame);
-            if (SUCCEEDED(hr))
-                hr = drain_output(false);
-
-            if (FAILED(hr))
-            {
-                video_worker_result.store(hr);
-                std::vector<size_t> abandoned_slots;
-                {
-                    std::lock_guard lock(video_queue_mutex);
-                    accepting_video = false;
-                    stopping_video = true;
-                    while (!video_queue.empty())
-                    {
-                        abandoned_slots.push_back(video_queue.front().slot_index);
-                        video_queue.pop_front();
-                    }
-                }
-                for (size_t slot : abandoned_slots)
-                    release_nv12_slot(slot);
-                video_queue_cv.notify_one();
-                return;
-            }
-        }
-    }
-
-    HRESULT submit_queued_frame(const PendingVideoFrame& frame)
+    HRESULT process_queued_frame(const NativePendingVideoFrame& frame) override
     {
         ComPtr<ID3D11Texture2D> nv12_texture;
-        bool invalid_slot = false;
+        if (!get_conversion_texture(frame.slot_index, nv12_texture))
         {
-            std::lock_guard lock(input_mutex);
-            if (frame.slot_index >= nv12_pool.size() || !nv12_pool[frame.slot_index].texture)
-                invalid_slot = true;
-            else
-                nv12_texture = nv12_pool[frame.slot_index].texture;
-        }
-        if (invalid_slot)
-        {
-            release_nv12_slot(frame.slot_index);
+            release_conversion_slot(frame.slot_index);
             return E_INVALIDARG;
         }
 
+        size_t encoder_slot = 0;
         amf::AMFSurfacePtr surface;
-        AMF_RESULT result = context->CreateSurfaceFromDX11Native(nv12_texture.Get(), &surface, nullptr);
+        ID3D11Texture2D* encoder_texture = nullptr;
+        HRESULT hr = acquire_encoder_input_slot(encoder_slot, surface, &encoder_texture);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+        {
+            HRESULT drain_hr = drain_output(false);
+            if (FAILED(drain_hr))
+            {
+                release_conversion_slot(frame.slot_index);
+                return drain_hr;
+            }
+            hr = acquire_encoder_input_slot(encoder_slot, surface, &encoder_texture);
+        }
+        if (FAILED(hr))
+        {
+            release_conversion_slot(frame.slot_index);
+            if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+            {
+                ++counters.encoder_input_full_drops;
+                return S_OK;
+            }
+            return hr;
+        }
+
+        {
+            std::lock_guard context_lock(d3d_context_mutex);
+            converter.device_context->CopyResource(
+                reinterpret_cast<ID3D11Resource*>(encoder_texture),
+                reinterpret_cast<ID3D11Resource*>(nv12_texture.Get()));
+        }
+        release_conversion_slot(frame.slot_index);
+
+        AMF_RESULT result = surface->Clear();
         if (!amf_result_success(result))
         {
-            release_nv12_slot(frame.slot_index);
-            return fail_amf("AMF CreateSurfaceFromDX11Native", result);
+            release_encoder_input_slot(encoder_slot);
+            return fail_amf("AMF input surface Clear", result);
         }
 
         surface->SetPts(static_cast<amf_pts>(std::max<int64_t>(0, frame.timestamp_hns)));
@@ -947,29 +1135,35 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         result = encoder->SubmitInput(surface);
         if (result == AMF_INPUT_FULL)
         {
-            HRESULT hr = drain_output(false);
+            hr = drain_output(false);
             if (FAILED(hr))
             {
-                release_nv12_slot(frame.slot_index);
+                release_encoder_input_slot(encoder_slot);
                 return hr;
             }
             result = encoder->SubmitInput(surface);
         }
         if (result == AMF_INPUT_FULL)
         {
-            release_nv12_slot(frame.slot_index);
-            set_last_error("NativeRecorder AMF input queue is full; dropping one frame.");
+            release_encoder_input_slot(encoder_slot);
+            ++counters.encoder_input_full_drops;
+            set_last_error("NativeRecorder AMF encoder input queue is full; dropping one frame.");
             return S_OK;
         }
         if (result != AMF_OK && result != AMF_NEED_MORE_INPUT)
         {
-            release_nv12_slot(frame.slot_index);
+            release_encoder_input_slot(encoder_slot);
             return fail_amf("AMF SubmitInput", result);
         }
 
-        pending_video_timestamps_hns.push_back(std::max<int64_t>(0, frame.timestamp_hns));
-        pending_video_slots.push_back(frame.slot_index);
+        pending_output_timestamps.push_with_resource(frame.timestamp_hns, encoder_slot);
+        ++counters.encoder_input_frames;
         return S_OK;
+    }
+
+    HRESULT drain_after_queued_frame() override
+    {
+        return drain_output(false);
     }
 
     HRESULT drain_output(bool flushing)
@@ -984,6 +1178,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
             AMF_RESULT result = encoder->QueryOutput(&data);
             if (result == AMF_REPEAT)
             {
+                ++counters.query_repeat_returns;
                 if (!flushing || repeat_count++ >= 1000)
                     return S_OK;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -995,6 +1190,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
                 return fail_amf("AMF QueryOutput", result);
             if (data == nullptr)
             {
+                ++counters.query_repeat_returns;
                 if (!flushing || repeat_count++ >= 1000)
                     return S_OK;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1028,59 +1224,20 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
             HRESULT hr = muxer.enqueue_video_packet(packet, key_frame, timestamp, video_sample_duration_hns);
             if (FAILED(hr))
                 return hr;
-            ++written_packets;
+            ++counters.written_packets;
         }
     }
 
     int64_t take_output_timestamp(int64_t encoder_timestamp_hns)
     {
-        if (!pending_video_timestamps_hns.empty())
-        {
-            int64_t timestamp = pending_video_timestamps_hns.front();
-            pending_video_timestamps_hns.pop_front();
-            if (!pending_video_slots.empty())
+        return pending_output_timestamps.take(
+            encoder_timestamp_hns,
+            counters.written_packets,
+            video_sample_duration_hns,
+            [this](size_t slot_index)
             {
-                size_t slot_index = pending_video_slots.front();
-                pending_video_slots.pop_front();
-                release_nv12_slot(slot_index);
-            }
-            return timestamp;
-        }
-
-        if (encoder_timestamp_hns >= 0)
-            return encoder_timestamp_hns;
-
-        return static_cast<int64_t>(written_packets) * video_sample_duration_hns;
-    }
-
-    HRESULT submit_audio(const void* data, int32_t byte_count, int64_t timestamp_hns) override
-    {
-        if (!audio.enabled)
-            return S_OK;
-        if (!initialized)
-            return S_OK;
-
-        HRESULT hr = muxer.enqueue_audio(data, byte_count, timestamp_hns);
-        if (FAILED(hr))
-            return hr;
-
-        ++audio_packets;
-        return S_OK;
-    }
-
-    HRESULT stop_video_worker()
-    {
-        {
-            std::lock_guard lock(video_queue_mutex);
-            accepting_video = false;
-            stopping_video = true;
-        }
-        video_queue_cv.notify_one();
-
-        if (video_worker.joinable())
-            video_worker.join();
-
-        return video_worker_result.load();
+                release_encoder_input_slot(slot_index);
+            });
     }
 
     HRESULT stop() override
@@ -1093,7 +1250,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         if (encoder)
         {
             AMF_RESULT amf_result = encoder->Drain();
-            if (!amf_result_success(amf_result) && amf_result != AMF_INPUT_FULL)
+            if (!amf_result_success(amf_result) && amf_result != AMF_INPUT_FULL && SUCCEEDED(result))
                 result = fail_amf("AMF encoder Drain", amf_result);
 
             if (SUCCEEDED(result))
@@ -1103,26 +1260,20 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
             encoder.Release();
         }
 
+        release_pending_encoder_inputs();
+        clear_encoder_input_pool();
+
         HRESULT mux_hr = muxer.close();
         if (FAILED(mux_hr) && SUCCEEDED(result))
             result = mux_hr;
 
         context.Release();
-        pending_video_timestamps_hns.clear();
-        pending_video_slots.clear();
-        {
-            std::lock_guard lock(input_mutex);
-            nv12_pool.clear();
-            next_nv12_slot = 0;
-        }
+        clear_common_video_state();
         converter.reset();
 
         if (SUCCEEDED(result))
         {
-            set_last_error("NativeRecorder finalized via AMF + libavformat. submitted=" +
-                std::to_string(submitted_frames) +
-                ", packets=" + std::to_string(written_packets) +
-                ", audioPackets=" + std::to_string(audio_packets));
+            set_last_error("NativeRecorder finalized via AMF + libavformat. " + finalize_stats());
         }
 
         return result;

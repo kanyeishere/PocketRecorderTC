@@ -12,6 +12,7 @@
 #include <new>
 #include <thread>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <windows.h>
@@ -52,8 +53,8 @@ constexpr DWORD kInvalidStream = 0xFFFFFFFFu;
 constexpr UINT64 kGameWriteKey = 0;
 constexpr UINT64 kEncoderReadKey = 1;
 constexpr DWORD kSharedTextureAcquireTimeoutMs = 16;
-constexpr size_t kNvencNv12PoolSize = 8;
-constexpr size_t kAmfNv12PoolSize = 8;
+constexpr size_t kNativeNv12ConversionPoolSize = 8;
+constexpr size_t kAmfEncoderInputPoolSize = 8;
 constexpr size_t kMaxNativeVideoQueueItems = 8;
 constexpr size_t kMaxMuxQueueItems = 512;
 
