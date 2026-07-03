@@ -9,6 +9,9 @@ lib/native/_*/
 lib/native/*.zip
 lib/native/*.7z
 
+## Local crash analysis logs
+.crash-analysis/
+
 ## Visual Studio / Rider
 .vs/
 .idea/
