@@ -130,7 +130,27 @@ internal static class ConfigurationMigrator
             SaveVersion(config, pi, 15);
         }
 
+        if (config.Version < 16)
+        {
+            if (string.IsNullOrWhiteSpace(config.InstallId))
+                config.InstallId = Guid.NewGuid().ToString("N");
+
+            config.EnablePocketBackendTelemetry = true;
+            SaveVersion(config, pi, 16);
+        }
+
+        if (config.Version < 17)
+        {
+            SaveVersion(config, pi, 17);
+        }
+
         config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
+
+        if (string.IsNullOrWhiteSpace(config.InstallId))
+        {
+            config.InstallId = Guid.NewGuid().ToString("N");
+            config.Save(pi);
+        }
 
         if (!config.EnableNativeRecorderExperimental)
         {

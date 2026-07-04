@@ -8,7 +8,13 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 15;
+    public int Version { get; set; } = 17;
+
+    /// <summary>匿名安装标识，仅用于 Pocket Backend 独立用户统计。</summary>
+    public string InstallId { get; set; } = Guid.NewGuid().ToString("N");
+
+    /// <summary>是否向 Pocket Backend 发送匿名统计与诊断报告。</summary>
+    public bool EnablePocketBackendTelemetry { get; set; } = true;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;

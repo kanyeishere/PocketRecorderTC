@@ -5,6 +5,7 @@ using Dalamud.Plugin.Services;
 using OmenTools;
 using Recorder.Encoding;
 using Recorder.Recording;
+using Recorder.Telemetry;
 using Recorder.Windows;
 using System;
 using System.Threading;
@@ -43,6 +44,7 @@ public sealed class Plugin : IDalamudPlugin
         NativeRecorderBackend.ConfigureFromPluginInterface(pluginInterface);
         Environment = new DalamudRecorderEnvironment(pluginInterface, Log);
         Config = Configuration.Load(pluginInterface);
+        PocketBackendClient.Configure(Config);
 
         RecordingService = new RecordingService(this, GameInterop, Environment);
         AutoDutyRecordingService = new AutoDutyRecordingService(this, ClientState, DutyState, Framework);
@@ -60,6 +62,12 @@ public sealed class Plugin : IDalamudPlugin
         AddCommandHandler(ShortCommandName);
 
         StartBackgroundWarmup();
+        PocketBackendClient.QueueHeartbeat("startup", new
+        {
+            targetFps = Config.TargetFps,
+            audio = Config.AudioCaptureMode.ToString(),
+            autoRecord = Config.AutoRecordEightPlayerDuty,
+        });
     }
 
     private void StartBackgroundWarmup()

@@ -2,31 +2,23 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
-using System.Threading.Tasks;
+using Recorder.Telemetry;
 
 namespace Recorder.Diagnostics;
 
 internal static class AmdRecordingDiagnosticLog
 {
     private const int MaxLogFiles = 20;
-    private const int MaxWebhookChars = 120_000;
-    private const string DiscordWebhookUrl = "https://discord.com/api/webhooks/1522274263808348333/elgaJJDL8RbupRHpqS7a4k9eoEm3ABgVLoe1a9vf-zPHdq7Hn4b6-D7lt99721cOZxin";
+    private const int MaxUploadChars = 120_000;
 
     private static readonly Regex WindowsPathRegex = new(@"(?i)\b[a-z]:\\[^\r\n\t""'<>|]*", RegexOptions.Compiled);
     private static readonly Regex UncPathRegex = new(@"\\\\(?!\.\\pipe\\)[^\s""'<>|]+", RegexOptions.Compiled);
     private static readonly Regex AudioPipeRegex = new(@"\\\\\.\\pipe\\RecAud_[A-Za-z0-9]+", RegexOptions.Compiled);
     private static readonly Regex DiscordWebhookRegex = new(@"https://discord\.com/api/webhooks/\S+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly HttpClient HttpClient = new()
-    {
-        Timeout = TimeSpan.FromSeconds(10),
-    };
-
     private static readonly object Sync = new();
     private static readonly List<string> SessionLines = [];
     private static string? _logPath;
@@ -34,7 +26,6 @@ internal static class AmdRecordingDiagnosticLog
     private static string[] _pendingHeaderLines = [];
     private static bool _cleanupAttempted;
     private static int _writeFailureLogged;
-    private static int _webhookFailureLogged;
 
     public static bool IsAmdCodec(string? codec)
         => !string.IsNullOrWhiteSpace(codec) &&
@@ -180,7 +171,7 @@ internal static class AmdRecordingDiagnosticLog
                     AppendLineNoLock($"Session | {Normalize(message)}");
                     AppendLineNoLock("=== AMD recorder diagnostics ended ===");
                     uploadFileName = Path.GetFileName(_logPath);
-                    uploadText = BuildWebhookTextNoLock();
+                    uploadText = BuildUploadTextNoLock();
                 }
 
                 _logPath = null;
@@ -194,7 +185,7 @@ internal static class AmdRecordingDiagnosticLog
             ReportWriteFailure(ex);
         }
 
-        QueueWebhookUpload(uploadFileName, uploadText);
+        QueueDiagnosticsUpload(uploadFileName, uploadText);
     }
 
     private static void StartLogNoLock(int? sessionId, string reason)
@@ -238,55 +229,32 @@ internal static class AmdRecordingDiagnosticLog
         File.AppendAllText(_logPath!, line, System.Text.Encoding.UTF8);
     }
 
-    private static string BuildWebhookTextNoLock()
+    private static string BuildUploadTextNoLock()
     {
         string text = string.Concat(SessionLines);
-        if (text.Length <= MaxWebhookChars)
+        if (text.Length <= MaxUploadChars)
             return text;
 
-        int headLength = MaxWebhookChars * 2 / 3;
-        int tailLength = MaxWebhookChars - headLength;
+        int headLength = MaxUploadChars * 2 / 3;
+        int tailLength = MaxUploadChars - headLength;
         return string.Concat(
             text[..headLength],
             Environment.NewLine,
-            "[diagnostics truncated: middle omitted before webhook upload]",
+            "[diagnostics truncated: middle omitted before upload]",
             Environment.NewLine,
             text[^tailLength..]);
     }
 
-    private static void QueueWebhookUpload(string? fileName, string? text)
+    private static void QueueDiagnosticsUpload(string? fileName, string? text)
     {
         if (string.IsNullOrWhiteSpace(fileName) || string.IsNullOrWhiteSpace(text))
             return;
 
-        _ = Task.Run(async () => await SendWebhookAsync(fileName, text).ConfigureAwait(false));
-    }
-
-    private static async Task SendWebhookAsync(string fileName, string text)
-    {
-        try
-        {
-            using var content = new MultipartFormDataContent();
-            string payload = JsonSerializer.Serialize(new
-            {
-                content = "PocketRecorder AMD recorder diagnostics (sanitized).",
-                username = "PocketRecorder Diagnostics",
-            });
-            content.Add(new StringContent(payload, System.Text.Encoding.UTF8, "application/json"), "payload_json");
-            content.Add(
-                new ByteArrayContent(System.Text.Encoding.UTF8.GetBytes(text)),
-                "files[0]",
-                fileName);
-
-            using HttpResponseMessage response = await HttpClient.PostAsync(DiscordWebhookUrl, content).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
-                Plugin.Log?.Warning($"[Diagnostics] AMD recorder webhook upload failed: {(int)response.StatusCode} {response.ReasonPhrase}");
-        }
-        catch (Exception ex)
-        {
-            if (Interlocked.Exchange(ref _webhookFailureLogged, 1) == 0)
-                Plugin.Log?.Warning($"[Diagnostics] AMD recorder webhook upload failed: {ex.Message}");
-        }
+        PocketBackendClient.QueueDiagnostics(
+            "amd-recorder",
+            fileName,
+            text,
+            "PocketRecorder AMD recorder diagnostics (sanitized).");
     }
 
     private static bool ContainsAmdMarker(string? value)
