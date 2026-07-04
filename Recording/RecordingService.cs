@@ -19,6 +19,7 @@ internal sealed class RecordingService : IDisposable
     private readonly IRecorderEnvironment _environment;
     private readonly object _sync = new();
     private readonly SoftFpsGovernor _softFps;
+    private readonly NativeRecorderStartupGate _nativeStartupGate = new();
 
     private VideoCaptureService? _videoCapture;
     private AudioCaptureService? _audioCapture;
@@ -167,6 +168,7 @@ internal sealed class RecordingService : IDisposable
             _videoWidth = 0;
             _videoHeight = 0;
             _videoPixelFormat = VideoPixelFormat.Bgra;
+            _nativeStartupGate.Reset();
             _softFps.Reset(log: false);
         }
 
@@ -247,13 +249,18 @@ internal sealed class RecordingService : IDisposable
 
     private void OnVideoFrame(VideoFrame frame)
     {
-        IOutputSink? writer;
-        RecordingRequest? request;
-        RecordingBackendPlan? backendPlan;
-        bool startWriter;
-        int expectedWidth;
-        int expectedHeight;
-        VideoPixelFormat expectedPixelFormat;
+        IOutputSink? writer = null;
+        RecordingRequest? request = null;
+        RecordingBackendPlan? backendPlan = null;
+        bool startWriter = false;
+        bool waitForNativeStartupFrame = false;
+        bool fallbackToFFmpeg = false;
+        int fallbackSessionId = 0;
+        string? nativeStartupGateMessage = null;
+        string? nativeStartupFallbackReason = null;
+        int expectedWidth = 0;
+        int expectedHeight = 0;
+        VideoPixelFormat expectedPixelFormat = VideoPixelFormat.Bgra;
 
         lock (_sync)
         {
@@ -272,16 +279,31 @@ internal sealed class RecordingService : IDisposable
             writer = _writer;
             if (writer == null)
             {
-                _lifecycle = RecordingLifecycle.StartingWriter;
-                _videoWidth = frame.Width;
-                _videoHeight = frame.Height;
-                _videoPixelFormat = frame.PixelFormat;
                 request = _request;
                 backendPlan = _backendPlan;
-                startWriter = true;
-                expectedWidth = frame.Width;
-                expectedHeight = frame.Height;
-                expectedPixelFormat = frame.PixelFormat;
+                NativeRecorderStartupGateResult startupGate = _nativeStartupGate.Evaluate(backendPlan, frame);
+                nativeStartupGateMessage = startupGate.Message;
+                if (startupGate.Action != NativeRecorderStartupGateAction.Ready)
+                {
+                    waitForNativeStartupFrame = true;
+                    if (startupGate.Action == NativeRecorderStartupGateAction.FallbackToFFmpeg)
+                    {
+                        fallbackToFFmpeg = true;
+                        fallbackSessionId = request.SessionId;
+                        nativeStartupFallbackReason = startupGate.Message;
+                    }
+                }
+                else
+                {
+                    _lifecycle = RecordingLifecycle.StartingWriter;
+                    _videoWidth = frame.Width;
+                    _videoHeight = frame.Height;
+                    _videoPixelFormat = frame.PixelFormat;
+                    startWriter = true;
+                    expectedWidth = frame.Width;
+                    expectedHeight = frame.Height;
+                    expectedPixelFormat = frame.PixelFormat;
+                }
             }
             else
             {
@@ -292,6 +314,21 @@ internal sealed class RecordingService : IDisposable
                 expectedHeight = _videoHeight;
                 expectedPixelFormat = _videoPixelFormat;
             }
+        }
+
+        if (!fallbackToFFmpeg && !string.IsNullOrWhiteSpace(nativeStartupGateMessage))
+            LogNativeStartupGate(nativeStartupGateMessage);
+
+        if (fallbackToFFmpeg && fallbackSessionId != 0 && !string.IsNullOrWhiteSpace(nativeStartupFallbackReason))
+        {
+            LogNativeStartupGateFallback(nativeStartupFallbackReason);
+            SwitchToFFmpegFallback(fallbackSessionId, nativeStartupFallbackReason);
+        }
+
+        if (waitForNativeStartupFrame)
+        {
+            frame.ReturnBuffer();
+            return;
         }
 
         if (startWriter)
@@ -316,6 +353,20 @@ internal sealed class RecordingService : IDisposable
 
         writer!.WriteVideoFrame(frame);
         Interlocked.Increment(ref _frameCount);
+    }
+
+    private void LogNativeStartupGate(string message)
+    {
+        _environment.Log.Info($"[Record] {message}");
+        RecordingDiagnosticLog.WriteNativeEvent("Record", message);
+        AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", message);
+    }
+
+    private void LogNativeStartupGateFallback(string message)
+    {
+        _environment.Log.Warning($"[Record] {message}");
+        RecordingDiagnosticLog.WriteNativeFailure("Record", message);
+        AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", message);
     }
 
     private void StartWriterInBackground(RecordingRequest request, RecordingBackendPlan backendPlan, VideoFrame firstFrame)
@@ -547,6 +598,7 @@ internal sealed class RecordingService : IDisposable
             _videoWidth = 0;
             _videoHeight = 0;
             _videoPixelFormat = VideoPixelFormat.Bgra;
+            _nativeStartupGate.Reset();
             _currentBackend = _backendPlan?.PreparingText ?? "FFmpeg fallback 准备中";
             _lifecycle = RecordingLifecycle.Preparing;
             _softFps.Reset(log: false);
@@ -636,6 +688,7 @@ internal sealed class RecordingService : IDisposable
             _videoCapture = null;
             _audioCapture = null;
             _writer = null;
+            _nativeStartupGate.Reset();
             _lifecycle = writer != null || audioCapture != null || videoCapture != null
                 ? RecordingLifecycle.Finalizing
                 : RecordingLifecycle.Idle;
@@ -752,6 +805,7 @@ internal sealed class RecordingService : IDisposable
         _lifecycle = nextLifecycle;
         _currentBackend = string.Empty;
         _finishedCallback = null;
+        _nativeStartupGate.Reset();
     }
 
     private static void DisposeVideoCapture(VideoCaptureService? videoCapture)

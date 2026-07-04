@@ -3,6 +3,7 @@ using Recorder.Diagnostics;
 using Recorder.Recording;
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Threading;
 
 namespace Recorder.Encoding;
@@ -77,6 +78,11 @@ internal sealed class NativeRecorderWriter : IOutputSink
         string startMessage = $"starting native writer, video={videoFormat.Width}x{videoFormat.Height}@{_videoFps}, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}";
         RecordingDiagnosticLog.WriteNativeEvent("NativeRecorder", startMessage);
         AmdRecordingDiagnosticLog.Write("NativeRecorder", startMessage);
+
+        // 确保输出目录存在（原生 avio_open 不会自动创建目录）
+        string? outputDir = Path.GetDirectoryName(_outputPath);
+        if (!string.IsNullOrEmpty(outputDir))
+            Directory.CreateDirectory(outputDir);
 
         _session = NativeRecorderBackend.Create(
             _outputPath,

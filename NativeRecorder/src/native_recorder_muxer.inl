@@ -80,6 +80,17 @@ struct LibavMp4Muxer
 
         if ((format_context->oformat->flags & AVFMT_NOFILE) == 0)
         {
+            // 确保输出目录存在，避免 avio_open 返回 ENOENT (-2)
+            try
+            {
+                auto parent = std::filesystem::path(output_path_utf8).parent_path();
+                if (!parent.empty())
+                    std::filesystem::create_directories(parent);
+            }
+            catch (const std::exception&)
+            {
+            }
+
             ret = avio_open(&format_context->pb, output_path_utf8.c_str(), AVIO_FLAG_WRITE);
             if (ret < 0)
                 return fail_ffmpeg("avio_open", ret, output_path_utf8);
