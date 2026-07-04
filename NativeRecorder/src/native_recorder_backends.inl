@@ -6,6 +6,29 @@ struct NativeEncoderCounters
     uint64_t encoder_input_full_drops = 0;
     uint64_t query_repeat_returns = 0;
     uint64_t audio_packets = 0;
+    uint64_t conversion_pool_waits = 0;
+    uint64_t conversion_pool_timeouts = 0;
+    uint64_t native_queue_waits = 0;
+    uint64_t native_queue_timeouts = 0;
+    uint64_t max_native_queue_depth = 0;
+    uint64_t surface_pool_waits = 0;
+    uint64_t surface_pool_wait_ms = 0;
+    uint64_t surface_pool_timeouts = 0;
+    uint64_t submit_input_full_waits = 0;
+    uint64_t submit_input_full_wait_ms = 0;
+    uint64_t submit_input_full_timeouts = 0;
+    uint64_t output_delay_waits = 0;
+    uint64_t output_delay_wait_ms = 0;
+    uint64_t output_delay_timeouts = 0;
+    uint64_t max_pending_outputs = 0;
+    NativeTimingStats native_submit_stats;
+    NativeTimingStats native_convert_stats;
+    NativeTimingStats native_worker_frame_stats;
+    NativeTimingStats conversion_pool_wait_stats;
+    NativeTimingStats native_queue_wait_stats;
+    NativeTimingStats surface_pool_wait_stats;
+    NativeTimingStats submit_input_full_wait_stats;
+    NativeTimingStats output_delay_wait_stats;
 };
 
 struct NativePendingVideoFrame
@@ -26,6 +49,7 @@ struct NativeD3D11TexturePool
     std::vector<Slot> slots;
     size_t next_slot = 0;
     std::mutex mutex;
+    std::condition_variable cv;
 
     template <typename CreateTexture>
     HRESULT ensure(size_t slot_count, CreateTexture&& create_texture)
@@ -75,6 +99,51 @@ struct NativeD3D11TexturePool
         return DXGI_ERROR_WAS_STILL_DRAWING;
     }
 
+    HRESULT acquire_with_backpressure(
+        size_t& slot_index,
+        ID3D11Texture2D** texture,
+        int timeout_ms,
+        int retry_sleep_ms,
+        const std::string& timeout_message,
+        bool& waited,
+        uint64_t& wait_ms)
+    {
+        if (texture == nullptr)
+            return E_POINTER;
+
+        waited = false;
+        wait_ms = 0;
+        const auto start = std::chrono::steady_clock::now();
+        std::unique_lock lock(mutex);
+        for (;;)
+        {
+            for (size_t offset = 0; offset < slots.size(); ++offset)
+            {
+                size_t index = (next_slot + offset) % slots.size();
+                if (slots[index].in_use || !slots[index].texture)
+                    continue;
+
+                slots[index].in_use = true;
+                next_slot = (index + 1) % slots.size();
+                slot_index = index;
+                *texture = slots[index].texture.Get();
+                if (waited)
+                    wait_ms = NativeTimingStats::elapsed_ms_since(start);
+                return S_OK;
+            }
+
+            wait_ms = NativeTimingStats::elapsed_ms_since(start);
+            if (wait_ms >= static_cast<uint64_t>(timeout_ms))
+            {
+                set_last_error(timeout_message);
+                return DXGI_ERROR_WAS_STILL_DRAWING;
+            }
+
+            waited = true;
+            cv.wait_for(lock, std::chrono::milliseconds(retry_sleep_ms));
+        }
+    }
+
     bool get_texture(size_t slot_index, ComPtr<ID3D11Texture2D>& texture)
     {
         std::lock_guard lock(mutex);
@@ -87,16 +156,22 @@ struct NativeD3D11TexturePool
 
     void release(size_t slot_index)
     {
-        std::lock_guard lock(mutex);
-        if (slot_index < slots.size())
-            slots[slot_index].in_use = false;
+        {
+            std::lock_guard lock(mutex);
+            if (slot_index < slots.size())
+                slots[slot_index].in_use = false;
+        }
+        cv.notify_one();
     }
 
     void clear()
     {
-        std::lock_guard lock(mutex);
-        slots.clear();
-        next_slot = 0;
+        {
+            std::lock_guard lock(mutex);
+            slots.clear();
+            next_slot = 0;
+        }
+        cv.notify_all();
     }
 };
 
@@ -133,6 +208,48 @@ struct NativeVideoFrameQueue
         return S_OK;
     }
 
+    HRESULT enqueue_with_backpressure(
+        NativePendingVideoFrame frame,
+        int timeout_ms,
+        int retry_sleep_ms,
+        const std::string& timeout_message,
+        bool& waited,
+        uint64_t& wait_ms,
+        size_t& depth_after_enqueue)
+    {
+        waited = false;
+        wait_ms = 0;
+        depth_after_enqueue = 0;
+        const auto start = std::chrono::steady_clock::now();
+        std::unique_lock lock(mutex);
+        for (;;)
+        {
+            if (!accepting)
+                return E_ABORT;
+
+            if (queue.size() < kMaxNativeVideoQueueItems)
+            {
+                queue.push_back(frame);
+                depth_after_enqueue = queue.size();
+                if (waited)
+                    wait_ms = NativeTimingStats::elapsed_ms_since(start);
+                lock.unlock();
+                cv.notify_one();
+                return S_OK;
+            }
+
+            wait_ms = NativeTimingStats::elapsed_ms_since(start);
+            if (wait_ms >= static_cast<uint64_t>(timeout_ms))
+            {
+                set_last_error(timeout_message);
+                return DXGI_ERROR_WAS_STILL_DRAWING;
+            }
+
+            waited = true;
+            cv.wait_for(lock, std::chrono::milliseconds(retry_sleep_ms));
+        }
+    }
+
     bool wait_pop(NativePendingVideoFrame& frame)
     {
         for (;;)
@@ -143,6 +260,8 @@ struct NativeVideoFrameQueue
             {
                 frame = queue.front();
                 queue.pop_front();
+                lock.unlock();
+                cv.notify_one();
                 return true;
             }
             if (stopping)
@@ -157,7 +276,7 @@ struct NativeVideoFrameQueue
             accepting = false;
             stopping = true;
         }
-        cv.notify_one();
+        cv.notify_all();
     }
 
     std::vector<size_t> fail_and_take_slots()
@@ -173,16 +292,19 @@ struct NativeVideoFrameQueue
                 queue.pop_front();
             }
         }
-        cv.notify_one();
+        cv.notify_all();
         return slots;
     }
 
     void clear()
     {
-        std::lock_guard lock(mutex);
-        queue.clear();
-        accepting = false;
-        stopping = false;
+        {
+            std::lock_guard lock(mutex);
+            queue.clear();
+            accepting = false;
+            stopping = false;
+        }
+        cv.notify_all();
     }
 };
 
@@ -284,41 +406,60 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
         if (source_device == nullptr || shared_handle == nullptr)
             return E_POINTER;
 
+        const auto submit_start = std::chrono::steady_clock::now();
+        auto record_submit = [this, submit_start]()
+        {
+            counters.native_submit_stats.record_since(submit_start);
+        };
+
         HRESULT hr = initialize(source_device, source_format);
         if (FAILED(hr))
+        {
+            record_submit();
             return hr;
+        }
 
         hr = video_worker_result.load();
         if (FAILED(hr))
+        {
+            record_submit();
             return hr;
+        }
 
         size_t slot_index = 0;
         ID3D11Texture2D* nv12_texture = nullptr;
-        hr = conversion_nv12_pool.acquire(slot_index, &nv12_texture, conversion_pool_full_message());
+        hr = acquire_conversion_slot_with_backpressure(slot_index, &nv12_texture);
         if (FAILED(hr))
+        {
+            record_submit();
             return hr;
+        }
 
+        const auto convert_start = std::chrono::steady_clock::now();
         {
             std::lock_guard context_lock(d3d_context_mutex);
             hr = converter.convert_shared_texture_to(shared_handle, source_format, nv12_texture);
         }
+        counters.native_convert_stats.record_since(convert_start);
         if (FAILED(hr))
         {
             conversion_nv12_pool.release(slot_index);
+            record_submit();
             return hr;
         }
 
         const bool force_idr = counters.submitted_frames == 0;
-        hr = video_queue.enqueue(
-            NativePendingVideoFrame{slot_index, std::max<int64_t>(0, timestamp_hns), force_idr},
-            input_queue_full_message());
+        hr = enqueue_video_frame_with_backpressure(
+            NativePendingVideoFrame{slot_index, std::max<int64_t>(0, timestamp_hns), force_idr});
         if (FAILED(hr))
         {
             conversion_nv12_pool.release(slot_index);
+            record_submit();
             return hr;
         }
 
         ++counters.submitted_frames;
+        record_submit();
         return S_OK;
     }
 
@@ -357,6 +498,57 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
         conversion_nv12_pool.release(slot_index);
     }
 
+    HRESULT acquire_conversion_slot_with_backpressure(size_t& slot_index, ID3D11Texture2D** nv12_texture)
+    {
+        bool waited = false;
+        uint64_t wait_ms = 0;
+        HRESULT hr = conversion_nv12_pool.acquire_with_backpressure(
+            slot_index,
+            nv12_texture,
+            kNativeBackpressureTimeoutMs,
+            kNativeBackpressureRetrySleepMs,
+            conversion_pool_timeout_message(),
+            waited,
+            wait_ms);
+
+        if (waited)
+        {
+            ++counters.conversion_pool_waits;
+            counters.conversion_pool_wait_stats.record_ms(wait_ms);
+        }
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+            ++counters.conversion_pool_timeouts;
+
+        return hr;
+    }
+
+    HRESULT enqueue_video_frame_with_backpressure(NativePendingVideoFrame frame)
+    {
+        bool waited = false;
+        uint64_t wait_ms = 0;
+        size_t depth_after_enqueue = 0;
+        HRESULT hr = video_queue.enqueue_with_backpressure(
+            frame,
+            kNativeBackpressureTimeoutMs,
+            kNativeBackpressureRetrySleepMs,
+            input_queue_timeout_message(),
+            waited,
+            wait_ms,
+            depth_after_enqueue);
+
+        if (depth_after_enqueue > 0)
+            update_max_native_queue_depth(depth_after_enqueue);
+        if (waited)
+        {
+            ++counters.native_queue_waits;
+            counters.native_queue_wait_stats.record_ms(wait_ms);
+        }
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+            ++counters.native_queue_timeouts;
+
+        return hr;
+    }
+
     void start_video_worker()
     {
         video_worker_result.store(S_OK);
@@ -382,9 +574,11 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
             if (!video_queue.wait_pop(frame))
                 return;
 
+            const auto frame_start = std::chrono::steady_clock::now();
             HRESULT hr = process_queued_frame(frame);
             if (SUCCEEDED(hr))
                 hr = drain_after_queued_frame();
+            counters.native_worker_frame_stats.record_since(frame_start);
 
             if (FAILED(hr))
             {
@@ -420,17 +614,47 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
             ", packets=" + std::to_string(counters.written_packets) +
             ", inputFullDrops=" + std::to_string(counters.encoder_input_full_drops) +
             ", queryRepeats=" + std::to_string(counters.query_repeat_returns) +
+            ", nativeSubmitMs=" + counters.native_submit_stats.summary_ms() +
+            ", nativeConvertMs=" + counters.native_convert_stats.summary_ms() +
+            ", nativeWorkerFrameMs=" + counters.native_worker_frame_stats.summary_ms() +
+            ", conversionPoolWaits=" + std::to_string(counters.conversion_pool_waits) +
+            ", conversionPoolWaitMs=" + counters.conversion_pool_wait_stats.summary_ms() +
+            ", conversionPoolTimeouts=" + std::to_string(counters.conversion_pool_timeouts) +
+            ", nativeQueueWaits=" + std::to_string(counters.native_queue_waits) +
+            ", nativeQueueWaitMs=" + counters.native_queue_wait_stats.summary_ms() +
+            ", nativeQueueTimeouts=" + std::to_string(counters.native_queue_timeouts) +
+            ", maxNativeQueue=" + std::to_string(counters.max_native_queue_depth) +
+            ", surfacePoolWaits=" + std::to_string(counters.surface_pool_waits) +
+            ", surfacePoolWaitMs=" + counters.surface_pool_wait_stats.summary_ms() +
+            ", surfacePoolTimeouts=" + std::to_string(counters.surface_pool_timeouts) +
+            ", submitFullWaits=" + std::to_string(counters.submit_input_full_waits) +
+            ", submitFullWaitMs=" + counters.submit_input_full_wait_stats.summary_ms() +
+            ", submitFullTimeouts=" + std::to_string(counters.submit_input_full_timeouts) +
+            ", outputDelayWaits=" + std::to_string(counters.output_delay_waits) +
+            ", outputDelayWaitMs=" + counters.output_delay_wait_stats.summary_ms() +
+            ", outputDelayTimeouts=" + std::to_string(counters.output_delay_timeouts) +
+            ", maxPendingOutputs=" + std::to_string(counters.max_pending_outputs) +
+            ", " + muxer.stats_summary() +
             ", audioPackets=" + std::to_string(counters.audio_packets);
     }
 
-    std::string conversion_pool_full_message() const
+    std::string conversion_pool_timeout_message() const
     {
-        return "NativeRecorder " + backend_tag + " NV12 conversion pool is full; dropping one frame.";
+        return "NativeRecorder " + backend_tag + " NV12 conversion pool stayed full for " +
+            std::to_string(kNativeBackpressureTimeoutMs) + "ms; dropping one frame.";
     }
 
-    std::string input_queue_full_message() const
+    std::string input_queue_timeout_message() const
     {
-        return "NativeRecorder " + backend_tag + " input queue is full; dropping one frame.";
+        return "NativeRecorder " + backend_tag + " input queue stayed full for " +
+            std::to_string(kNativeBackpressureTimeoutMs) + "ms; dropping one frame.";
+    }
+
+    void update_max_native_queue_depth(size_t depth)
+    {
+        counters.max_native_queue_depth = std::max<uint64_t>(
+            counters.max_native_queue_depth,
+            static_cast<uint64_t>(depth));
     }
 
     virtual HRESULT process_queued_frame(const NativePendingVideoFrame& frame) = 0;
@@ -1077,50 +1301,100 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
     HRESULT acquire_encoder_input_slot_with_backpressure(size_t& slot_index, amf::AMFSurfacePtr& surface, ID3D11Texture2D** texture)
     {
         const auto start = std::chrono::steady_clock::now();
+        bool waited = false;
         for (;;)
         {
             HRESULT hr = acquire_encoder_input_slot(slot_index, surface, texture);
             if (hr != DXGI_ERROR_WAS_STILL_DRAWING)
+            {
+                if (waited)
+                {
+                    uint64_t wait_ms = elapsed_ms_since(start);
+                    counters.surface_pool_wait_ms += wait_ms;
+                    counters.surface_pool_wait_stats.record_ms(wait_ms);
+                }
                 return hr;
+            }
 
             const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
             if (elapsed_ms >= kAmfInputFullRetryTimeoutMs)
             {
+                if (waited)
+                {
+                    counters.surface_pool_wait_ms += static_cast<uint64_t>(elapsed_ms);
+                    counters.surface_pool_wait_stats.record_ms(static_cast<uint64_t>(elapsed_ms));
+                }
+                ++counters.surface_pool_timeouts;
                 set_last_error("NativeRecorder AMF encoder input surface pool stayed full for " +
                     std::to_string(kAmfInputFullRetryTimeoutMs) + "ms; dropping one frame.");
                 return hr;
             }
 
+            if (!waited)
+            {
+                waited = true;
+                ++counters.surface_pool_waits;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(kAmfInputFullRetrySleepMs));
             hr = drain_output(false);
             if (FAILED(hr))
+            {
+                uint64_t wait_ms = elapsed_ms_since(start);
+                counters.surface_pool_wait_ms += wait_ms;
+                counters.surface_pool_wait_stats.record_ms(wait_ms);
                 return hr;
+            }
         }
     }
 
     HRESULT submit_input_with_backpressure(const amf::AMFSurfacePtr& surface, AMF_RESULT& result)
     {
         const auto start = std::chrono::steady_clock::now();
+        bool waited = false;
         for (;;)
         {
             result = encoder->SubmitInput(surface);
             if (result != AMF_INPUT_FULL)
+            {
+                if (waited)
+                {
+                    uint64_t wait_ms = elapsed_ms_since(start);
+                    counters.submit_input_full_wait_ms += wait_ms;
+                    counters.submit_input_full_wait_stats.record_ms(wait_ms);
+                }
                 return S_OK;
+            }
 
             const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
             if (elapsed_ms >= kAmfInputFullRetryTimeoutMs)
             {
+                if (waited)
+                {
+                    counters.submit_input_full_wait_ms += static_cast<uint64_t>(elapsed_ms);
+                    counters.submit_input_full_wait_stats.record_ms(static_cast<uint64_t>(elapsed_ms));
+                }
+                ++counters.submit_input_full_timeouts;
                 set_last_error("NativeRecorder AMF encoder input queue stayed full for " +
                     std::to_string(kAmfInputFullRetryTimeoutMs) + "ms; dropping one frame.");
                 return S_OK;
             }
 
+            if (!waited)
+            {
+                waited = true;
+                ++counters.submit_input_full_waits;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(kAmfInputFullRetrySleepMs));
             HRESULT hr = drain_output(false);
             if (FAILED(hr))
+            {
+                uint64_t wait_ms = elapsed_ms_since(start);
+                counters.submit_input_full_wait_ms += wait_ms;
+                counters.submit_input_full_wait_stats.record_ms(wait_ms);
                 return hr;
+            }
         }
     }
 
@@ -1200,13 +1474,61 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         }
 
         pending_output_timestamps.push_with_resource(frame.timestamp_hns, encoder_slot);
+        update_max_pending_outputs();
         ++counters.encoder_input_frames;
         return S_OK;
     }
 
     HRESULT drain_after_queued_frame() override
     {
-        return drain_output(false);
+        return drain_until_output_delay();
+    }
+
+    HRESULT drain_until_output_delay()
+    {
+        HRESULT hr = drain_output(false);
+        if (FAILED(hr))
+            return hr;
+        update_max_pending_outputs();
+
+        if (pending_output_timestamps.size() <= kAmfNvencStyleOutputDelayFrames)
+            return S_OK;
+
+        ++counters.output_delay_waits;
+        const auto start = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            if (pending_output_timestamps.size() <= kAmfNvencStyleOutputDelayFrames)
+            {
+                uint64_t wait_ms = elapsed_ms_since(start);
+                counters.output_delay_wait_ms += wait_ms;
+                counters.output_delay_wait_stats.record_ms(wait_ms);
+                return S_OK;
+            }
+
+            uint64_t elapsed_ms = elapsed_ms_since(start);
+            if (elapsed_ms >= static_cast<uint64_t>(kAmfInputFullRetryTimeoutMs))
+            {
+                counters.output_delay_wait_ms += elapsed_ms;
+                counters.output_delay_wait_stats.record_ms(elapsed_ms);
+                ++counters.output_delay_timeouts;
+                set_last_error("NativeRecorder AMF output delay window stayed above " +
+                    std::to_string(kAmfNvencStyleOutputDelayFrames) + " frames for " +
+                    std::to_string(kAmfInputFullRetryTimeoutMs) + "ms; continuing as last-resort.");
+                return S_OK;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(kAmfInputFullRetrySleepMs));
+            hr = drain_output(false);
+            if (FAILED(hr))
+            {
+                uint64_t wait_ms = elapsed_ms_since(start);
+                counters.output_delay_wait_ms += wait_ms;
+                counters.output_delay_wait_stats.record_ms(wait_ms);
+                return hr;
+            }
+            update_max_pending_outputs();
+        }
     }
 
     HRESULT drain_output(bool flushing)
@@ -1281,6 +1603,19 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             {
                 release_encoder_input_slot(slot_index);
             });
+    }
+
+    void update_max_pending_outputs()
+    {
+        counters.max_pending_outputs = std::max<uint64_t>(
+            counters.max_pending_outputs,
+            static_cast<uint64_t>(pending_output_timestamps.size()));
+    }
+
+    static uint64_t elapsed_ms_since(std::chrono::steady_clock::time_point start)
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count());
     }
 
     HRESULT stop() override

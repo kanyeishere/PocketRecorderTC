@@ -385,7 +385,7 @@ internal static unsafe class NativeRecorderBackend
         if (_getLastError == null)
             return string.Empty;
 
-        byte[] buffer = new byte[512];
+        byte[] buffer = new byte[8192];
         fixed (byte* bufferPtr = buffer)
         {
             if (_getLastError(bufferPtr, buffer.Length) != 0)

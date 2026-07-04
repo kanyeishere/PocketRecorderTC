@@ -80,6 +80,7 @@
     <ClInclude Include="src\native_recorder_backends.inl" />
     <ClInclude Include="src\native_recorder_common.inl" />
     <ClInclude Include="src\native_recorder_converter.inl" />
+    <ClInclude Include="src\native_recorder_diagnostics.inl" />
     <ClInclude Include="src\native_recorder_exports.inl" />
     <ClInclude Include="src\native_recorder_muxer.inl" />
     <ClInclude Include="include\pocket_recorder_native.h" />

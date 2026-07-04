@@ -467,6 +467,11 @@ struct AsyncLibavMp4Muxer
     std::condition_variable queue_cv;
     std::deque<WorkItem> queue;
     std::atomic<HRESULT> worker_result{S_OK};
+    NativeTimingStats video_write_stats;
+    NativeTimingStats audio_write_stats;
+    std::atomic<uint64_t> video_queue_drops{0};
+    std::atomic<uint64_t> audio_queue_drops{0};
+    std::atomic<uint64_t> max_queue_depth{0};
     bool accepting = false;
     bool stopping = false;
 
@@ -486,6 +491,8 @@ struct AsyncLibavMp4Muxer
             return hr;
 
         worker_result.store(S_OK);
+        video_write_stats.reset();
+        audio_write_stats.reset();
         accepting = true;
         stopping = false;
         worker = std::thread([this] { worker_loop(); });
@@ -513,11 +520,13 @@ struct AsyncLibavMp4Muxer
             return E_ABORT;
         if (queue.size() >= kMaxMuxQueueItems)
         {
+            video_queue_drops.fetch_add(1, std::memory_order_relaxed);
             set_last_error("NativeRecorder mux queue is full; dropping one encoded video packet.");
             return S_OK;
         }
 
         queue.push_back(std::move(item));
+        update_max_queue_depth(queue.size());
         lock.unlock();
         queue_cv.notify_one();
         return S_OK;
@@ -543,11 +552,13 @@ struct AsyncLibavMp4Muxer
             return S_OK;
         if (queue.size() >= kMaxMuxQueueItems)
         {
+            audio_queue_drops.fetch_add(1, std::memory_order_relaxed);
             set_last_error("NativeRecorder mux queue is full; dropping one audio packet.");
             return S_OK;
         }
 
         queue.push_back(std::move(item));
+        update_max_queue_depth(queue.size());
         lock.unlock();
         queue_cv.notify_one();
         return S_OK;
@@ -593,13 +604,16 @@ struct AsyncLibavMp4Muxer
             }
 
             HRESULT hr = S_OK;
+            const auto write_start = std::chrono::steady_clock::now();
             if (item.kind == WorkItem::Kind::Video)
             {
                 hr = muxer.write_video_packet(item.data, item.key_frame, item.timestamp_hns, item.duration_hns);
+                video_write_stats.record_since(write_start);
             }
             else
             {
                 hr = muxer.write_audio(item.data.data(), static_cast<int32_t>(item.data.size()), item.timestamp_hns);
+                audio_write_stats.record_since(write_start);
             }
 
             if (FAILED(hr))
@@ -612,6 +626,29 @@ struct AsyncLibavMp4Muxer
                 queue_cv.notify_one();
                 return;
             }
+        }
+    }
+
+    std::string stats_summary() const
+    {
+        return "muxVideoWriteMs=" + video_write_stats.summary_ms() +
+            ", muxAudioWriteMs=" + audio_write_stats.summary_ms() +
+            ", muxMaxQueue=" + std::to_string(max_queue_depth.load(std::memory_order_relaxed)) +
+            ", muxVideoDrops=" + std::to_string(video_queue_drops.load(std::memory_order_relaxed)) +
+            ", muxAudioDrops=" + std::to_string(audio_queue_drops.load(std::memory_order_relaxed));
+    }
+
+    void update_max_queue_depth(size_t depth)
+    {
+        update_atomic_max(max_queue_depth, static_cast<uint64_t>(depth));
+    }
+
+    static void update_atomic_max(std::atomic<uint64_t>& target, uint64_t value)
+    {
+        uint64_t previous = target.load(std::memory_order_relaxed);
+        while (previous < value &&
+            !target.compare_exchange_weak(previous, value, std::memory_order_relaxed, std::memory_order_relaxed))
+        {
         }
     }
 };

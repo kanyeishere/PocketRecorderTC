@@ -21,8 +21,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private readonly string _videoCodec;
     private readonly int _nativeCodec;
     private readonly string _nativeCodecName;
+    private readonly NativeRecorderTimingDiagnostics _timingDiagnostics = new();
     private NativeRecorderSession? _session;
-    private BoundedMediaQueue<VideoFrame>? _videoQueue;
+    private BoundedMediaQueue<NativeQueuedVideoFrame>? _videoQueue;
     private BoundedMediaQueue<AudioPacket>? _audioQueue;
     private Thread? _videoWriterThread;
     private Thread? _audioWriterThread;
@@ -74,6 +75,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
         _lastSubmittedVideoTimestampHns = -1;
         _firstVideoFrameException = null;
         _firstVideoFrameSubmitted.Reset();
+        _timingDiagnostics.Reset(_videoFps);
 
         string startMessage = $"starting native writer, video={videoFormat.Width}x{videoFormat.Height}@{_videoFps}, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}";
         RecordingDiagnosticLog.WriteNativeEvent("NativeRecorder", startMessage);
@@ -92,7 +94,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             _nativeCodec);
         LogNativeStatusToDiagnostics("NativeRecorder create status");
 
-        _videoQueue = new BoundedMediaQueue<VideoFrame>(MaxVideoQueueSize);
+        _videoQueue = new BoundedMediaQueue<NativeQueuedVideoFrame>(MaxVideoQueueSize);
         _videoWriterThread = new Thread(VideoWriterLoop)
         {
             IsBackground = true,
@@ -130,7 +132,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
             return;
         }
 
-        if (_videoQueue.TryEnqueueDropOldest(frame, droppedFrame => droppedFrame.ReturnBuffer(), out int droppedCount))
+        NativeQueuedVideoFrame queuedFrame = new(frame, Stopwatch.GetTimestamp());
+        if (_videoQueue.TryEnqueueDropOldest(queuedFrame, droppedFrame => droppedFrame.Frame.ReturnBuffer(), out int droppedCount))
         {
             if (droppedCount > 0)
             {
@@ -168,14 +171,19 @@ internal sealed class NativeRecorderWriter : IOutputSink
     {
         Plugin.Log!.Info("[NativeRecorder] Video writer thread started.");
 
-        foreach (var frame in _videoQueue!.GetConsumingEnumerable())
+        foreach (var queuedFrame in _videoQueue!.GetConsumingEnumerable())
         {
+            VideoFrame frame = queuedFrame.Frame;
             try
             {
-                long submitStartTicks = Stopwatch.GetTimestamp();
+                long dequeueTicks = Stopwatch.GetTimestamp();
+                long queueWaitTicks = Math.Max(0, dequeueTicks - queuedFrame.EnqueueTicks);
                 bool isFirstSubmittedFrame = Volatile.Read(ref _submittedFrameCount) == 0;
                 long videoTimestampHns = GetMonotonicVideoTimestampHns(frame);
+                long submitStartTicks = Stopwatch.GetTimestamp();
                 bool accepted = SubmitD3D11TextureWithStartupRetry(frame, videoTimestampHns, isFirstSubmittedFrame);
+                long submitTicks = Stopwatch.GetTimestamp() - submitStartTicks;
+                _timingDiagnostics.RecordSubmitAttempt(submitTicks, accepted);
                 if (!accepted)
                 {
                     int dropped = Interlocked.Increment(ref _droppedFrameCount);
@@ -200,10 +208,10 @@ internal sealed class NativeRecorderWriter : IOutputSink
                 }
 
                 frame.MarkD3D11TextureSubmitted();
-                long submitTicks = Stopwatch.GetTimestamp() - submitStartTicks;
 
                 int submitted = Interlocked.Increment(ref _submittedFrameCount);
                 Volatile.Write(ref _lastSubmittedVideoTimestampHns, videoTimestampHns);
+                _timingDiagnostics.RecordSubmittedFrame(frame.TimestampHns, queueWaitTicks);
                 if (submitted > 1)
                     MarkSubmitPressureIfSlow(submitTicks);
                 if (submitted == 1)
@@ -253,13 +261,21 @@ internal sealed class NativeRecorderWriter : IOutputSink
             _firstVideoFrameSubmitted.Set();
 
         DrainQueuedVideoFrames();
+        string timingSummary = _timingDiagnostics.BuildSummary();
         Plugin.Log!.Info($"[NativeRecorder] Video writer thread exiting. input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
+        Plugin.Log!.Info($"[NativeRecorder] Timing diagnostics: {timingSummary}");
         RecordingDiagnosticLog.WriteIfEnabled(
+            "NativeRecorder",
+            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
+        RecordingDiagnosticLog.WriteIfEnabled(
+            "NativeRecorder",
+            $"timing diagnostics: {timingSummary}");
+        AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
             $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
         AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
-            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
+            $"timing diagnostics: {timingSummary}");
     }
 
     private long GetMonotonicVideoTimestampHns(VideoFrame frame)
@@ -397,8 +413,10 @@ internal sealed class NativeRecorderWriter : IOutputSink
         if (_videoQueue == null)
             return 0;
 
-        return _videoQueue.Drain(pendingFrame => pendingFrame.ReturnBuffer());
+        return _videoQueue.Drain(pendingFrame => pendingFrame.Frame.ReturnBuffer());
     }
+
+    private readonly record struct NativeQueuedVideoFrame(VideoFrame Frame, long EnqueueTicks);
 
     private bool IsSubmitPressureActive()
     {
