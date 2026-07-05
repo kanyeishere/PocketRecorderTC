@@ -21,6 +21,9 @@ struct NativeEncoderCounters
     uint64_t output_delay_wait_ms = 0;
     uint64_t output_delay_timeouts = 0;
     uint64_t max_pending_outputs = 0;
+    uint64_t timestamp_pts_matches = 0;
+    uint64_t timestamp_fifo_fallbacks = 0;
+    uint64_t timestamp_missing_entries = 0;
     NativeTimingStats native_submit_stats;
     NativeTimingStats native_convert_stats;
     NativeTimingStats native_worker_frame_stats;
@@ -330,21 +333,60 @@ struct NativeOutputTimestampQueue
     }
 
     template <typename ReleaseResource>
-    int64_t take(int64_t encoder_timestamp_hns, uint64_t written_packets, int64_t duration_hns, ReleaseResource release_resource)
+    int64_t take_fifo(int64_t encoder_timestamp_hns, uint64_t written_packets, int64_t duration_hns, ReleaseResource release_resource)
     {
         if (!entries.empty())
         {
-            Entry entry = entries.front();
-            entries.pop_front();
-            if (entry.has_resource_slot)
-                release_resource(entry.resource_slot);
-            return entry.timestamp_hns;
+            return take_entry(entries.begin(), release_resource).timestamp_hns;
         }
 
         if (encoder_timestamp_hns >= 0)
-            return encoder_timestamp_hns;
+            return std::max<int64_t>(0, encoder_timestamp_hns);
 
         return static_cast<int64_t>(written_packets) * duration_hns;
+    }
+
+    template <typename ReleaseResource>
+    int64_t take_matching_or_fifo(
+        int64_t encoder_timestamp_hns,
+        uint64_t written_packets,
+        int64_t duration_hns,
+        ReleaseResource release_resource,
+        bool& matched_encoder_pts,
+        bool& used_fifo_fallback,
+        bool& used_missing_entry_fallback)
+    {
+        matched_encoder_pts = false;
+        used_fifo_fallback = false;
+        used_missing_entry_fallback = false;
+
+        if (encoder_timestamp_hns >= 0)
+        {
+            const int64_t safe_encoder_timestamp = std::max<int64_t>(0, encoder_timestamp_hns);
+            auto matching_entry = std::find_if(
+                entries.begin(),
+                entries.end(),
+                [safe_encoder_timestamp](const Entry& entry)
+                {
+                    return entry.timestamp_hns == safe_encoder_timestamp;
+                });
+
+            if (matching_entry != entries.end())
+            {
+                matched_encoder_pts = true;
+                return take_entry(matching_entry, release_resource).timestamp_hns;
+            }
+
+            if (entries.empty())
+            {
+                used_missing_entry_fallback = true;
+                return safe_encoder_timestamp;
+            }
+
+            used_fifo_fallback = true;
+        }
+
+        return take_fifo(encoder_timestamp_hns, written_packets, duration_hns, release_resource);
     }
 
     void clear()
@@ -367,6 +409,17 @@ struct NativeOutputTimestampQueue
     size_t size() const
     {
         return entries.size();
+    }
+
+private:
+    template <typename Iterator, typename ReleaseResource>
+    Entry take_entry(Iterator entry_iterator, ReleaseResource release_resource)
+    {
+        Entry entry = *entry_iterator;
+        entries.erase(entry_iterator);
+        if (entry.has_resource_slot)
+            release_resource(entry.resource_slot);
+        return entry;
     }
 };
 
@@ -593,7 +646,7 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
 
     int64_t take_output_timestamp(int64_t encoder_timestamp_hns)
     {
-        return pending_output_timestamps.take(
+        return pending_output_timestamps.take_fifo(
             encoder_timestamp_hns,
             counters.written_packets,
             video_sample_duration_hns,
@@ -634,6 +687,9 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
             ", outputDelayWaitMs=" + counters.output_delay_wait_stats.summary_ms() +
             ", outputDelayTimeouts=" + std::to_string(counters.output_delay_timeouts) +
             ", maxPendingOutputs=" + std::to_string(counters.max_pending_outputs) +
+            ", timestampPtsMatches=" + std::to_string(counters.timestamp_pts_matches) +
+            ", timestampFifoFallbacks=" + std::to_string(counters.timestamp_fifo_fallbacks) +
+            ", timestampMissingEntries=" + std::to_string(counters.timestamp_missing_entries) +
             ", " + muxer.stats_summary() +
             ", audioPackets=" + std::to_string(counters.audio_packets);
     }
@@ -1117,8 +1173,10 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             if (FAILED(hr)) return hr;
 
             set_amf_optional(AMF_VIDEO_ENCODER_MEMORY_TYPE, amf::AMFVariant(static_cast<amf_int64>(amf::AMF_MEMORY_DX11)), "H264 MemoryType");
+            set_amf_optional(AMF_VIDEO_ENCODER_LOWLATENCY_MODE, amf::AMFVariant(true), "H264 LowLatency");
             set_amf_optional(AMF_VIDEO_ENCODER_OUTPUT_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_OUTPUT_MODE_FRAME)), "H264 OutputMode");
             set_amf_optional(AMF_VIDEO_ENCODER_MAX_CONSECUTIVE_BPICTURES, amf::AMFVariant(static_cast<amf_int64>(0)), "H264 BFrames");
+            set_amf_optional(AMF_VIDEO_ENCODER_ADAPTIVE_MINIGOP, amf::AMFVariant(false), "H264 AdaptiveMiniGOP");
             set_amf_optional(AMF_VIDEO_ENCODER_B_PIC_PATTERN, amf::AMFVariant(static_cast<amf_int64>(0)), "H264 BPicturePattern");
             set_amf_optional(AMF_VIDEO_ENCODER_B_REFERENCE_ENABLE, amf::AMFVariant(false), "H264 BReference");
             set_amf_optional(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, amf::AMFVariant(static_cast<amf_int64>(1)), "H264 MaxRefFrames");
@@ -1152,7 +1210,9 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             if (FAILED(hr)) return hr;
 
             set_amf_optional(AMF_VIDEO_ENCODER_HEVC_MEMORY_TYPE, amf::AMFVariant(static_cast<amf_int64>(amf::AMF_MEMORY_DX11)), "HEVC MemoryType");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE, amf::AMFVariant(true), "HEVC LowLatency");
             set_amf_optional(AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE_FRAME)), "HEVC OutputMode");
+            set_amf_optional(AMF_VIDEO_ENCODER_HEVC_MAX_LTR_FRAMES, amf::AMFVariant(static_cast<amf_int64>(0)), "HEVC MaxLTR");
             set_amf_optional(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES, amf::AMFVariant(static_cast<amf_int64>(1)), "HEVC MaxRefFrames");
             set_amf_optional(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)), "HEVC MaxTemporalLayers");
             set_amf_optional(AMF_VIDEO_ENCODER_HEVC_NUM_TEMPORAL_LAYERS, amf::AMFVariant(static_cast<amf_int64>(1)), "HEVC TemporalLayers");
@@ -1437,7 +1497,9 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             return fail_amf("AMF input surface Clear", result);
         }
 
-        surface->SetPts(static_cast<amf_pts>(std::max<int64_t>(0, frame.timestamp_hns)));
+        const int64_t frame_timestamp_hns = std::max<int64_t>(0, frame.timestamp_hns);
+        surface->SetPts(static_cast<amf_pts>(frame_timestamp_hns));
+        surface->SetProperty(L"PTS", amf::AMFVariant(static_cast<amf_int64>(frame_timestamp_hns)));
         surface->SetDuration(static_cast<amf_pts>(video_sample_duration_hns));
 
         if (frame.force_idr)
@@ -1584,7 +1646,12 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
                     output_type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_I;
             }
 
-            int64_t timestamp = take_output_timestamp(static_cast<int64_t>(data->GetPts()));
+            int64_t encoder_timestamp_hns = static_cast<int64_t>(data->GetPts());
+            amf_int64 tagged_timestamp_hns = -1;
+            if (amf_result_success(data->GetProperty(L"PTS", &tagged_timestamp_hns)))
+                encoder_timestamp_hns = static_cast<int64_t>(tagged_timestamp_hns);
+
+            int64_t timestamp = take_output_timestamp(encoder_timestamp_hns);
 
             HRESULT hr = muxer.enqueue_video_packet(packet, key_frame, timestamp, video_sample_duration_hns);
             if (FAILED(hr))
@@ -1595,14 +1662,29 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
 
     int64_t take_output_timestamp(int64_t encoder_timestamp_hns)
     {
-        return pending_output_timestamps.take(
+        bool matched_encoder_pts = false;
+        bool used_fifo_fallback = false;
+        bool used_missing_entry_fallback = false;
+        int64_t timestamp_hns = pending_output_timestamps.take_matching_or_fifo(
             encoder_timestamp_hns,
             counters.written_packets,
             video_sample_duration_hns,
             [this](size_t slot_index)
             {
                 release_encoder_input_slot(slot_index);
-            });
+            },
+            matched_encoder_pts,
+            used_fifo_fallback,
+            used_missing_entry_fallback);
+
+        if (matched_encoder_pts)
+            ++counters.timestamp_pts_matches;
+        if (used_fifo_fallback)
+            ++counters.timestamp_fifo_fallbacks;
+        if (used_missing_entry_fallback)
+            ++counters.timestamp_missing_entries;
+
+        return timestamp_hns;
     }
 
     void update_max_pending_outputs()

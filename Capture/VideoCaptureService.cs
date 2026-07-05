@@ -1,6 +1,7 @@
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
+using Recorder.Diagnostics;
 using Recorder.Encoding;
 using System;
 using System.Diagnostics;
@@ -194,7 +195,10 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         }
         _sw.Stop();
         _nv12PerfStats.FlushIfAny();
-        Plugin.Log!.Info($"[Video] Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, nativeBusySkips={_nativeSharedBusySkipCount}, nv12BusySkips={_nv12BusySkipCount}, errors={_errorCount}, method={_captureMethod}");
+        string stopSummary = $"Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, nativeBusySkips={_nativeSharedBusySkipCount}, nv12BusySkips={_nv12BusySkipCount}, errors={_errorCount}, method={_captureMethod}, {_framePacer.BuildSummary()}";
+        Plugin.Log!.Info($"[Video] {stopSummary}");
+        RecordingDiagnosticLog.WriteIfEnabled("Video", stopSummary);
+        AmdRecordingDiagnosticLog.Write("Video", stopSummary);
     }
 
     public void RequestStop()

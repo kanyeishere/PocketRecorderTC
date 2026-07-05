@@ -103,7 +103,8 @@ internal sealed class NativeRecorderTimingDiagnostics
 
     public string BuildSummary()
     {
-        return "targetFrameMs=" + FormatMs(_expectedFrameHns / 10_000.0) +
+        return "outputTiming=bufferedObsLikeCfr" +
+               ", targetFrameMs=" + FormatMs(_expectedFrameHns / 10_000.0) +
                ", captureDeltaMs=" + FormatHnsSummary(_captureDeltaHns) +
                ", captureJitterMs=" + FormatHnsSummary(_captureJitterHns) +
                ", earlyFrames=" + _earlyFrames.ToString(CultureInfo.InvariantCulture) +

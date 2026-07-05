@@ -16,6 +16,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private const int NativeCodecHevc = 2;
     private const int PressureWindowMs = 1_000;
     private const int FirstFrameRetryMs = 300;
+    private const long MaxOutputLookaheadHns = 160_000;
 
     private readonly int _videoBitrate;
     private readonly string _videoCodec;
@@ -35,12 +36,26 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private int _videoFps;
     private int _inputFrameCount;
     private int _submittedFrameCount;
+    private int _duplicateFrameCount;
     private int _droppedFrameCount;
+    private int _capturedFrameDropCount;
+    private int _realOutputTickDropCount;
+    private int _duplicateOutputTickDropCount;
+    private int _lookaheadFrameHitCount;
+    private int _lookaheadMissCount;
     private int _audioPackets;
+    private long _nextSourceFrameId;
+    private long _lastSubmittedSourceFrameId;
+    private long _maxSubmittedSourceFrameId;
+    private long _sourceFrameRepeatCount;
+    private long _sourceFrameRegressionCount;
+    private long _maxSourceFrameRegressionDistance;
     private long _submitPressureUntilTicks;
     private long _videoFrameDurationHns;
-    private long _firstVideoTimestampHns;
-    private long _lastSubmittedVideoTimestampHns;
+    private long _videoFrameDurationTicks;
+    private long _outputLookaheadHns;
+    private long _outputLookaheadTicks;
+    private long _finalVideoDurationHns;
 
     public NativeRecorderWriter(int videoBitrate, string videoCodec)
     {
@@ -67,12 +82,26 @@ internal sealed class NativeRecorderWriter : IOutputSink
         _stopped = false;
         _inputFrameCount = 0;
         _submittedFrameCount = 0;
+        _duplicateFrameCount = 0;
         _droppedFrameCount = 0;
+        _capturedFrameDropCount = 0;
+        _realOutputTickDropCount = 0;
+        _duplicateOutputTickDropCount = 0;
+        _lookaheadFrameHitCount = 0;
+        _lookaheadMissCount = 0;
         _audioPackets = 0;
+        _nextSourceFrameId = 0;
+        _lastSubmittedSourceFrameId = 0;
+        _maxSubmittedSourceFrameId = 0;
+        _sourceFrameRepeatCount = 0;
+        _sourceFrameRegressionCount = 0;
+        _maxSourceFrameRegressionDistance = 0;
         _submitPressureUntilTicks = 0;
         _videoFrameDurationHns = Math.Max(1, 10_000_000L / _videoFps);
-        _firstVideoTimestampHns = -1;
-        _lastSubmittedVideoTimestampHns = -1;
+        _videoFrameDurationTicks = Math.Max(1, Stopwatch.Frequency / _videoFps);
+        _outputLookaheadHns = Math.Max(1, Math.Min(_videoFrameDurationHns / 2, MaxOutputLookaheadHns));
+        _outputLookaheadTicks = Math.Max(1, _outputLookaheadHns * Stopwatch.Frequency / 10_000_000L);
+        _finalVideoDurationHns = -1;
         _firstVideoFrameException = null;
         _firstVideoFrameSubmitted.Reset();
         _timingDiagnostics.Reset(_videoFps);
@@ -114,7 +143,10 @@ internal sealed class NativeRecorderWriter : IOutputSink
         }
 
         Plugin.Log!.Info($"[NativeRecorder] Started native D3D11 texture writer: {videoFormat.Width}x{videoFormat.Height}@{_videoFps}fps, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}");
-        Plugin.Log!.Info($"[NativeRecorder] Video timing: monotonic capture timestamps, frameDurationHns={_videoFrameDurationHns}");
+        string timingMessage = $"video timing: buffered OBS-like CFR output clock with latest-frame sampling, frameDurationHns={_videoFrameDurationHns}, lookaheadHns={_outputLookaheadHns}; capture timestamps retained for diagnostics.";
+        Plugin.Log!.Info($"[NativeRecorder] {timingMessage}");
+        RecordingDiagnosticLog.WriteIfEnabled("NativeRecorder", timingMessage);
+        AmdRecordingDiagnosticLog.Write("NativeRecorder", timingMessage);
     }
 
     public void WriteVideoFrame(VideoFrame frame)
@@ -132,14 +164,16 @@ internal sealed class NativeRecorderWriter : IOutputSink
             return;
         }
 
-        NativeQueuedVideoFrame queuedFrame = new(frame, Stopwatch.GetTimestamp());
+        long sourceFrameId = Interlocked.Increment(ref _nextSourceFrameId);
+        NativeQueuedVideoFrame queuedFrame = new(frame, Stopwatch.GetTimestamp(), sourceFrameId);
         if (_videoQueue.TryEnqueueDropOldest(queuedFrame, droppedFrame => droppedFrame.Frame.ReturnBuffer(), out int droppedCount))
         {
             if (droppedCount > 0)
             {
                 int dropped = Interlocked.Add(ref _droppedFrameCount, droppedCount);
+                int capturedDrops = Interlocked.Add(ref _capturedFrameDropCount, droppedCount);
                 if (dropped <= 5 || dropped % 60 == 0)
-                    Plugin.Log!.Warning($"[NativeRecorder] Video queue full, dropped a captured texture frame. dropped={dropped}");
+                    Plugin.Log!.Warning($"[NativeRecorder] Video queue full, dropped captured texture frames. dropped={dropped}, capturedDrops={capturedDrops}, count={droppedCount}");
             }
 
             Interlocked.Increment(ref _inputFrameCount);
@@ -171,129 +205,372 @@ internal sealed class NativeRecorderWriter : IOutputSink
     {
         Plugin.Log!.Info("[NativeRecorder] Video writer thread started.");
 
-        foreach (var queuedFrame in _videoQueue!.GetConsumingEnumerable())
+        NativeQueuedVideoFrame retainedFrame = default;
+        bool hasRetainedFrame = false;
+        long nextOutputFrameIndex = 0;
+        long nextOutputDueTicks = 0;
+
+        try
         {
-            VideoFrame frame = queuedFrame.Frame;
-            try
+            if (!TryTakeFirstQueuedFrame(out NativeQueuedVideoFrame firstQueuedFrame))
             {
-                long dequeueTicks = Stopwatch.GetTimestamp();
-                long queueWaitTicks = Math.Max(0, dequeueTicks - queuedFrame.EnqueueTicks);
-                bool isFirstSubmittedFrame = Volatile.Read(ref _submittedFrameCount) == 0;
-                long videoTimestampHns = GetMonotonicVideoTimestampHns(frame);
-                long submitStartTicks = Stopwatch.GetTimestamp();
-                bool accepted = SubmitD3D11TextureWithStartupRetry(frame, videoTimestampHns, isFirstSubmittedFrame);
-                long submitTicks = Stopwatch.GetTimestamp() - submitStartTicks;
-                _timingDiagnostics.RecordSubmitAttempt(submitTicks, accepted);
-                if (!accepted)
-                {
-                    int dropped = Interlocked.Increment(ref _droppedFrameCount);
-                    if (dropped <= 5 || dropped % 60 == 0)
-                    {
-                        string status = _session?.GetLastStatus() ?? string.Empty;
-                        string suffix = string.IsNullOrWhiteSpace(status) ? string.Empty : $" lastStatus={status}";
-                        Plugin.Log!.Info($"[NativeRecorder] Native texture was not ready, dropped one frame. dropped={dropped}.{suffix}");
-                    }
-
-                    if (isFirstSubmittedFrame)
-                    {
-                        string status = _session?.GetLastStatus() ?? string.Empty;
-                        _firstVideoFrameException = new TimeoutException(
-                            string.IsNullOrWhiteSpace(status)
-                                ? "NativeRecorder did not accept the startup texture."
-                                : $"NativeRecorder did not accept the startup texture. {status}");
-                        _firstVideoFrameSubmitted.Set();
-                    }
-
-                    continue;
-                }
-
-                frame.MarkD3D11TextureSubmitted();
-
-                int submitted = Interlocked.Increment(ref _submittedFrameCount);
-                Volatile.Write(ref _lastSubmittedVideoTimestampHns, videoTimestampHns);
-                _timingDiagnostics.RecordSubmittedFrame(frame.TimestampHns, queueWaitTicks);
-                if (submitted > 1)
-                    MarkSubmitPressureIfSlow(submitTicks);
-                if (submitted == 1)
-                {
-                    LogNativeStatus("Native backend status");
-                    LogNativeStatusToDiagnostics("First texture submit status");
-                    _firstVideoFrameSubmitted.Set();
-                }
-
-                if (submitted % 300 == 0)
-                    Plugin.Log!.Info($"[NativeRecorder] Submitted {submitted} texture frames (input={_inputFrameCount}, dropped={_droppedFrameCount}), audioPackets={_audioPackets}");
+                _firstVideoFrameSubmitted.Set();
             }
-            catch (Exception ex)
+            else
             {
-                if (Volatile.Read(ref _submittedFrameCount) == 0)
+                retainedFrame = firstQueuedFrame;
+                hasRetainedFrame = true;
+                long firstQueueWaitTicks = Math.Max(0, Stopwatch.GetTimestamp() - firstQueuedFrame.EnqueueTicks);
+                if (SubmitOutputTick(retainedFrame.Frame, retainedFrame.SourceFrameId, 0, duplicate: false, recordCaptureTiming: true, firstQueueWaitTicks))
                 {
-                    _firstVideoFrameException = ex;
-                    _firstVideoFrameSubmitted.Set();
-                }
+                    nextOutputFrameIndex = 1;
+                    nextOutputDueTicks = Stopwatch.GetTimestamp() + _videoFrameDurationTicks;
 
-                if (_stopped)
-                {
-                    Plugin.Log!.Info($"[NativeRecorder] Video writer stopped while submitting: {ex.Message}");
-                }
-                else
-                {
-                    Plugin.Log!.Warning($"[NativeRecorder] Video submit failed: {ex.Message}");
-                    RecordingDiagnosticLog.WriteNativeFailure(
-                        "NativeRecorder",
-                        $"video submit failed, exception={ex}, lastStatus={_session?.GetLastStatus()}");
-                    AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
-                        "NativeRecorder",
-                        $"video submit failed, exception={ex}, lastStatus={_session?.GetLastStatus()}");
-                    if (Volatile.Read(ref _submittedFrameCount) > 0)
-                        NotifyFatalError($"NativeRecorder video submit failed: {ex.Message}");
-                }
+                    while (ShouldContinueOutput(nextOutputFrameIndex))
+                    {
+                        SleepUntilOutputDue(nextOutputDueTicks);
+                        if (!ShouldContinueOutput(nextOutputFrameIndex))
+                            break;
 
-                break;
-            }
-            finally
-            {
-                frame.ReturnBuffer();
+                        bool hasNewFrame = TrySelectLatestFrameWithLookahead(
+                            nextOutputDueTicks,
+                            out NativeQueuedVideoFrame latestFrame,
+                            out long queueWaitTicks);
+                        VideoFrame frameToSubmit = hasNewFrame ? latestFrame.Frame : retainedFrame.Frame;
+                        long sourceFrameId = hasNewFrame ? latestFrame.SourceFrameId : retainedFrame.SourceFrameId;
+                        long timestampHns = nextOutputFrameIndex * _videoFrameDurationHns;
+
+                        bool accepted = SubmitOutputTick(
+                            frameToSubmit,
+                            sourceFrameId,
+                            timestampHns,
+                            duplicate: !hasNewFrame,
+                            recordCaptureTiming: hasNewFrame,
+                            queueWaitTicks);
+
+                        if (accepted && hasNewFrame)
+                        {
+                            retainedFrame.Frame.ReturnBuffer();
+                            retainedFrame = latestFrame;
+                            hasRetainedFrame = true;
+                            latestFrame = default;
+                        }
+
+                        latestFrame.Frame?.ReturnBuffer();
+                        nextOutputFrameIndex++;
+                        nextOutputDueTicks += _videoFrameDurationTicks;
+                    }
+                }
             }
         }
+        catch (Exception ex)
+        {
+            if (Volatile.Read(ref _submittedFrameCount) == 0)
+            {
+                _firstVideoFrameException = ex;
+                _firstVideoFrameSubmitted.Set();
+            }
+
+            if (_stopped)
+            {
+                Plugin.Log!.Info($"[NativeRecorder] Video writer stopped while submitting: {ex.Message}");
+            }
+            else
+            {
+                Plugin.Log!.Warning($"[NativeRecorder] Video submit failed: {ex.Message}");
+                RecordingDiagnosticLog.WriteNativeFailure(
+                    "NativeRecorder",
+                    $"video submit failed, exception={ex}, lastStatus={_session?.GetLastStatus()}");
+                AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
+                    "NativeRecorder",
+                    $"video submit failed, exception={ex}, lastStatus={_session?.GetLastStatus()}");
+                if (Volatile.Read(ref _submittedFrameCount) > 0)
+                    NotifyFatalError($"NativeRecorder video submit failed: {ex.Message}");
+            }
+        }
+
+        if (hasRetainedFrame)
+            retainedFrame.Frame.ReturnBuffer();
 
         if (Volatile.Read(ref _submittedFrameCount) == 0 && _firstVideoFrameException == null)
             _firstVideoFrameSubmitted.Set();
 
         DrainQueuedVideoFrames();
         string timingSummary = _timingDiagnostics.BuildSummary();
-        Plugin.Log!.Info($"[NativeRecorder] Video writer thread exiting. input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
+        string dropSummary = BuildDropSummary();
+        string sourceFrameSummary = BuildSourceFrameSummary();
+        Plugin.Log!.Info($"[NativeRecorder] Video writer thread exiting. input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, {sourceFrameSummary}");
         Plugin.Log!.Info($"[NativeRecorder] Timing diagnostics: {timingSummary}");
         RecordingDiagnosticLog.WriteIfEnabled(
             "NativeRecorder",
-            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
+            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, {sourceFrameSummary}");
         RecordingDiagnosticLog.WriteIfEnabled(
             "NativeRecorder",
             $"timing diagnostics: {timingSummary}");
         AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
-            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
+            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, {sourceFrameSummary}");
         AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
             $"timing diagnostics: {timingSummary}");
     }
 
-    private long GetMonotonicVideoTimestampHns(VideoFrame frame)
+    private bool TryTakeFirstQueuedFrame(out NativeQueuedVideoFrame queuedFrame)
     {
-        long first = Volatile.Read(ref _firstVideoTimestampHns);
-        if (first < 0)
+        foreach (var frame in _videoQueue!.GetConsumingEnumerable())
         {
-            Interlocked.CompareExchange(ref _firstVideoTimestampHns, frame.TimestampHns, -1);
-            first = Volatile.Read(ref _firstVideoTimestampHns);
+            queuedFrame = frame;
+            return true;
         }
 
-        long timestampHns = Math.Max(0, frame.TimestampHns - first);
+        queuedFrame = default;
+        return false;
+    }
 
-        long last = Volatile.Read(ref _lastSubmittedVideoTimestampHns);
-        if (last >= 0 && timestampHns <= last)
-            timestampHns = last + 1;
+    private bool TrySelectLatestFrameWithLookahead(
+        long outputDueTicks,
+        out NativeQueuedVideoFrame selectedFrame,
+        out long queueWaitTicks)
+    {
+        if (TryDrainToLatestQueuedFrame(out selectedFrame, out queueWaitTicks))
+            return true;
+        if (_stopped)
+            return false;
 
-        return timestampHns;
+        return TryWaitForLookaheadFrame(outputDueTicks + _outputLookaheadTicks, out selectedFrame, out queueWaitTicks);
+    }
+
+    private bool TryDrainToLatestQueuedFrame(out NativeQueuedVideoFrame selectedFrame, out long queueWaitTicks)
+    {
+        queueWaitTicks = 0;
+        if (!_videoQueue!.TryTake(out NativeQueuedVideoFrame queuedFrame))
+        {
+            selectedFrame = default;
+            return false;
+        }
+
+        selectedFrame = DrainToLatestQueuedFrame(queuedFrame, out queueWaitTicks);
+        return true;
+    }
+
+    private NativeQueuedVideoFrame DrainToLatestQueuedFrame(NativeQueuedVideoFrame firstQueuedFrame, out long queueWaitTicks)
+    {
+        queueWaitTicks = 0;
+        NativeQueuedVideoFrame latestQueuedFrame = firstQueuedFrame;
+        int staleDropped = 0;
+
+        while (_videoQueue!.TryTake(out NativeQueuedVideoFrame queuedFrame))
+        {
+            latestQueuedFrame.Frame.ReturnBuffer();
+            staleDropped++;
+            latestQueuedFrame = queuedFrame;
+        }
+
+        if (staleDropped > 0)
+        {
+            int dropped = Interlocked.Add(ref _droppedFrameCount, staleDropped);
+            int capturedDrops = Interlocked.Add(ref _capturedFrameDropCount, staleDropped);
+            if (dropped <= 5 || dropped % 60 == 0)
+                Plugin.Log!.Warning($"[NativeRecorder] Dropped stale captured texture frames while sampling latest. staleDrops={staleDropped}, dropped={dropped}, capturedDrops={capturedDrops}");
+        }
+
+        queueWaitTicks = Math.Max(0, Stopwatch.GetTimestamp() - latestQueuedFrame.EnqueueTicks);
+        return latestQueuedFrame;
+    }
+
+    private bool TryWaitForLookaheadFrame(
+        long deadlineTicks,
+        out NativeQueuedVideoFrame selectedFrame,
+        out long queueWaitTicks)
+    {
+        queueWaitTicks = 0;
+        selectedFrame = default;
+
+        while (!_stopped)
+        {
+            if (_videoQueue!.TryTake(out NativeQueuedVideoFrame queuedFrame))
+            {
+                Interlocked.Increment(ref _lookaheadFrameHitCount);
+                selectedFrame = DrainToLatestQueuedFrame(queuedFrame, out queueWaitTicks);
+                return true;
+            }
+
+            long remainingTicks = deadlineTicks - Stopwatch.GetTimestamp();
+            if (remainingTicks <= 0)
+                break;
+
+            SleepForRemainingTicks(remainingTicks, maxSleepMs: 1);
+        }
+
+        if (!_stopped)
+            Interlocked.Increment(ref _lookaheadMissCount);
+        return false;
+    }
+
+    private bool ShouldContinueOutput(long nextOutputFrameIndex)
+    {
+        if (!_stopped)
+            return true;
+
+        long targetFrameCount = GetFinalTargetFrameCount();
+        return targetFrameCount > nextOutputFrameIndex;
+    }
+
+    private long GetFinalTargetFrameCount()
+    {
+        long finalDurationHns = Volatile.Read(ref _finalVideoDurationHns);
+        if (finalDurationHns <= 0)
+            return 0;
+
+        return (finalDurationHns + _videoFrameDurationHns - 1) / _videoFrameDurationHns;
+    }
+
+    private void SleepUntilOutputDue(long dueTicks)
+    {
+        while (!_stopped)
+        {
+            long remainingTicks = dueTicks - Stopwatch.GetTimestamp();
+            if (remainingTicks <= 0)
+                return;
+
+            SleepForRemainingTicks(remainingTicks, maxSleepMs: 10);
+        }
+    }
+
+    private static void SleepForRemainingTicks(long remainingTicks, int maxSleepMs)
+    {
+        long remainingMs = remainingTicks * 1_000 / Stopwatch.Frequency;
+        if (remainingMs > 0)
+        {
+            Thread.Sleep((int)Math.Min(maxSleepMs, remainingMs));
+        }
+        else
+        {
+            Thread.SpinWait(64);
+        }
+    }
+
+    private bool SubmitOutputTick(
+        VideoFrame frame,
+        long sourceFrameId,
+        long timestampHns,
+        bool duplicate,
+        bool recordCaptureTiming,
+        long queueWaitTicks)
+    {
+        long submitStartTicks = Stopwatch.GetTimestamp();
+        bool accepted = SubmitOneOutputFrame(frame, timestampHns, duplicate);
+        long submitTicks = Stopwatch.GetTimestamp() - submitStartTicks;
+        _timingDiagnostics.RecordSubmitAttempt(submitTicks, accepted);
+
+        if (!accepted)
+        {
+            int dropped = Interlocked.Increment(ref _droppedFrameCount);
+            int realTickDrops = duplicate
+                ? Volatile.Read(ref _realOutputTickDropCount)
+                : Interlocked.Increment(ref _realOutputTickDropCount);
+            int duplicateTickDrops = duplicate
+                ? Interlocked.Increment(ref _duplicateOutputTickDropCount)
+                : Volatile.Read(ref _duplicateOutputTickDropCount);
+            if (dropped <= 5 || dropped % 60 == 0)
+            {
+                string status = _session?.GetLastStatus() ?? string.Empty;
+                string suffix = string.IsNullOrWhiteSpace(status) ? string.Empty : $" lastStatus={status}";
+                string tickKind = duplicate ? "duplicate" : "real";
+                Plugin.Log!.Info($"[NativeRecorder] Native texture was not ready, dropped one {tickKind} output tick. dropped={dropped}, realTickDrops={realTickDrops}, duplicateTickDrops={duplicateTickDrops}.{suffix}");
+            }
+
+            if (Volatile.Read(ref _submittedFrameCount) == 0)
+            {
+                string status = _session?.GetLastStatus() ?? string.Empty;
+                _firstVideoFrameException = new TimeoutException(
+                    string.IsNullOrWhiteSpace(status)
+                        ? "NativeRecorder did not accept the startup texture."
+                        : $"NativeRecorder did not accept the startup texture. {status}");
+                _firstVideoFrameSubmitted.Set();
+            }
+
+            return false;
+        }
+
+        if (recordCaptureTiming)
+            _timingDiagnostics.RecordSubmittedFrame(frame.TimestampHns, queueWaitTicks);
+
+        RecordSubmittedSourceFrame(sourceFrameId, timestampHns, duplicate);
+
+        int submitted = Volatile.Read(ref _submittedFrameCount);
+        if (submitted > 1)
+            MarkSubmitPressureIfSlow(submitTicks);
+
+        if (submitted % 300 == 0)
+            Plugin.Log!.Info($"[NativeRecorder] Submitted {submitted} texture frames (input={_inputFrameCount}, duplicates={_duplicateFrameCount}, {BuildDropSummary()}), audioPackets={_audioPackets}");
+
+        return true;
+    }
+
+    private void RecordSubmittedSourceFrame(long sourceFrameId, long timestampHns, bool duplicate)
+    {
+        long previousSourceFrameId = _lastSubmittedSourceFrameId;
+        long previousMaxSourceFrameId = _maxSubmittedSourceFrameId;
+
+        if (previousSourceFrameId <= 0)
+        {
+            _lastSubmittedSourceFrameId = sourceFrameId;
+            _maxSubmittedSourceFrameId = Math.Max(previousMaxSourceFrameId, sourceFrameId);
+            return;
+        }
+
+        if (sourceFrameId == previousSourceFrameId)
+        {
+            Interlocked.Increment(ref _sourceFrameRepeatCount);
+        }
+        else if (sourceFrameId < previousSourceFrameId)
+        {
+            long regressions = Interlocked.Increment(ref _sourceFrameRegressionCount);
+            long distanceFromPrevious = previousSourceFrameId - sourceFrameId;
+            long distanceFromMax = Math.Max(0, previousMaxSourceFrameId - sourceFrameId);
+            UpdateMaxSourceFrameRegressionDistance(Math.Max(distanceFromPrevious, distanceFromMax));
+            Plugin.Log!.Warning(
+                $"[NativeRecorder] Source frame id regressed. outputTimestampHns={timestampHns}, sourceFrameId={sourceFrameId}, previousSourceFrameId={previousSourceFrameId}, maxSourceFrameId={previousMaxSourceFrameId}, regressionDistance={distanceFromPrevious}, distanceFromMax={distanceFromMax}, duplicate={duplicate}, regressions={regressions}");
+        }
+
+        _lastSubmittedSourceFrameId = sourceFrameId;
+        if (sourceFrameId > previousMaxSourceFrameId)
+            _maxSubmittedSourceFrameId = sourceFrameId;
+    }
+
+    private void UpdateMaxSourceFrameRegressionDistance(long distance)
+    {
+        long current;
+        do
+        {
+            current = Volatile.Read(ref _maxSourceFrameRegressionDistance);
+            if (distance <= current)
+                return;
+        }
+        while (Interlocked.CompareExchange(ref _maxSourceFrameRegressionDistance, distance, current) != current);
+    }
+
+    private bool SubmitOneOutputFrame(VideoFrame frame, long timestampHns, bool duplicate)
+    {
+        bool isFirstSubmittedFrame = Volatile.Read(ref _submittedFrameCount) == 0;
+        bool accepted = SubmitD3D11TextureWithStartupRetry(frame, timestampHns, isFirstSubmittedFrame);
+        if (!accepted)
+            return false;
+
+        frame.MarkD3D11TextureSubmitted();
+        int submitted = Interlocked.Increment(ref _submittedFrameCount);
+        if (duplicate)
+            Interlocked.Increment(ref _duplicateFrameCount);
+
+        if (submitted == 1)
+        {
+            LogNativeStatus("Native backend status");
+            LogNativeStatusToDiagnostics("First texture submit status");
+            _firstVideoFrameSubmitted.Set();
+        }
+
+        return true;
     }
 
     private bool SubmitD3D11TextureWithStartupRetry(VideoFrame frame, long timestampHns, bool isFirstSubmittedFrame)
@@ -367,14 +644,19 @@ internal sealed class NativeRecorderWriter : IOutputSink
         if (_stopped)
             return;
 
+        long finalDurationHns = finalVideoDuration is { } duration
+            ? Math.Max(0, duration.Ticks)
+            : -1;
+        Volatile.Write(ref _finalVideoDurationHns, finalDurationHns);
         _stopped = true;
-        Plugin.Log!.Info($"[NativeRecorder] Stopping... input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
+        string dropSummary = BuildDropSummary();
+        Plugin.Log!.Info($"[NativeRecorder] Stopping... input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, audioPackets={_audioPackets}");
         RecordingDiagnosticLog.WriteIfEnabled(
             "NativeRecorder",
-            $"stopping, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
+            $"stopping, input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, audioPackets={_audioPackets}, finalDuration={finalVideoDuration}");
         AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
-            $"stopping, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
+            $"stopping, input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, audioPackets={_audioPackets}, finalDuration={finalVideoDuration}");
 
         _videoQueue?.CompleteAdding();
         _audioQueue?.CompleteAdding();
@@ -416,7 +698,30 @@ internal sealed class NativeRecorderWriter : IOutputSink
         return _videoQueue.Drain(pendingFrame => pendingFrame.Frame.ReturnBuffer());
     }
 
-    private readonly record struct NativeQueuedVideoFrame(VideoFrame Frame, long EnqueueTicks);
+    private readonly record struct NativeQueuedVideoFrame(VideoFrame Frame, long EnqueueTicks, long SourceFrameId);
+
+    private string BuildDropSummary()
+    {
+        int capturedDrops = Volatile.Read(ref _capturedFrameDropCount);
+        int realTickDrops = Volatile.Read(ref _realOutputTickDropCount);
+        int duplicateTickDrops = Volatile.Read(ref _duplicateOutputTickDropCount);
+        return $"dropped={Volatile.Read(ref _droppedFrameCount)}, " +
+               $"realFrameDrops={capturedDrops + realTickDrops}, " +
+               $"capturedDrops={capturedDrops}, " +
+               $"realTickDrops={realTickDrops}, " +
+               $"duplicateTickDrops={duplicateTickDrops}, " +
+               $"lookaheadHits={Volatile.Read(ref _lookaheadFrameHitCount)}, " +
+               $"lookaheadMisses={Volatile.Read(ref _lookaheadMissCount)}";
+    }
+
+    private string BuildSourceFrameSummary()
+    {
+        return $"sourceFrameRepeats={Volatile.Read(ref _sourceFrameRepeatCount)}, " +
+               $"sourceFrameRegressions={Volatile.Read(ref _sourceFrameRegressionCount)}, " +
+               $"maxSourceFrameRegressionDistance={Volatile.Read(ref _maxSourceFrameRegressionDistance)}, " +
+               $"lastSourceFrameId={Volatile.Read(ref _lastSubmittedSourceFrameId)}, " +
+               $"maxSourceFrameId={Volatile.Read(ref _maxSubmittedSourceFrameId)}";
+    }
 
     private bool IsSubmitPressureActive()
     {
