@@ -1,7 +1,8 @@
 using Dalamud.Game.DutyState;
 using Dalamud.Plugin.Services;
-using OmenTools.Info.Game.Data;
-using OmenTools.OmenService;
+using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.UI;
+using Lumina.Excel.Sheets;
 using Recorder.Recording;
 using System;
 using System.IO;
@@ -104,13 +105,13 @@ internal sealed class AutoDutyRecordingService : IDisposable
         }
     }
 
-    private void OnDutyWiped(IDutyStateEventArgs args)
+    private void OnDutyWiped(object? sender, ushort territoryType)
     {
         Plugin.Log.Info("[AutoDuty] Duty wipe detected.");
         StopAutoRecording("wipe");
     }
 
-    private void OnTerritoryChanged(uint territoryType)
+    private void OnTerritoryChanged(ushort territoryType)
     {
         _wasCountdownVisible = false;
         StopAutoRecording("territory changed");
@@ -182,17 +183,46 @@ internal sealed class AutoDutyRecordingService : IDisposable
 
     private static unsafe bool IsCountdownVisible()
     {
-        var addon = Addons.ScreenInfoCountDown;
+        var addon = RaptureAtkUnitManager.Instance()->GetAddonByName("ScreenInfo_CountDown", 1);
         return addon != null && addon->IsVisible && addon->IsFullyLoaded();
     }
 
-    private static string GetDutyName()
+    private string GetDutyName()
     {
-        string name = GameState.ContentFinderConditionData.Name.ToString();
+        string name = GetContentFinderConditionName();
         if (string.IsNullOrWhiteSpace(name))
-            name = GameState.TerritoryTypeData.PlaceName.ValueNullable?.Name.ToString() ?? "Duty";
+            name = GetTerritoryPlaceName(_clientState.TerritoryType);
 
         return SanitizeFileName(name);
+    }
+
+    private static unsafe string GetContentFinderConditionName()
+    {
+        try
+        {
+            var rowId = GameMain.Instance()->CurrentContentFinderConditionId;
+            var row = Plugin.DataManager.GetExcelSheet<ContentFinderCondition>().GetRowOrDefault(rowId);
+            return row?.Name.ToString() ?? string.Empty;
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Debug(ex, "Failed to read current content finder condition name");
+            return string.Empty;
+        }
+    }
+
+    private static string GetTerritoryPlaceName(uint territoryType)
+    {
+        try
+        {
+            var row = Plugin.DataManager.GetExcelSheet<TerritoryType>().GetRowOrDefault(territoryType);
+            return row?.PlaceName.ValueNullable?.Name.ToString() ?? "Duty";
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Debug(ex, "Failed to read current territory place name");
+            return "Duty";
+        }
     }
 
     private string CreateTemporaryOutputPath(string dutyName, DateTime startTime)

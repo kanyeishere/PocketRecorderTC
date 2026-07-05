@@ -1,5 +1,4 @@
 using Dalamud.Plugin.Services;
-using OmenTools.OmenService;
 using Recorder.Capture;
 using Recorder.Diagnostics;
 using System;
@@ -659,9 +658,7 @@ internal sealed class RecordingService : IDisposable
         {
             try
             {
-                NotifyHelper.ToastError("NVIDIA 驱动版本过旧，无法开启原生录制，请更新。已自动降档至  FFmpeg 录制。");
-                NotifyHelper.Instance().ChatError("NVIDIA 驱动版本过旧，无法开启原生录制，已自动降档至 FFmpeg 录制，请更新驱动。");
-                ChatManager.Instance().SendMessage("/e NVIDIA 驱动版本过旧，无法开启原生录制，已自动降档至 FFmpeg 录制，请更新驱动。<se.1>");
+                Plugin.ChatGui.PrintError("[Pocket Recorder] NVIDIA 驱动版本过旧，无法开启原生录制，已自动降档至 FFmpeg 录制，请更新驱动。");
             }
             catch (Exception notifyEx)
             {

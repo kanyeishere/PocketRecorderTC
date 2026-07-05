@@ -2,7 +2,6 @@ using Dalamud.Game.Command;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
-using OmenTools;
 using Recorder.Encoding;
 using Recorder.Recording;
 using Recorder.Telemetry;
@@ -24,6 +23,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IGameInteropProvider GameInterop { get; private set; } = null!;
     [PluginService] internal static IFramework Framework { get; private set; } = null!;
     [PluginService] internal static IClientState ClientState { get; private set; } = null!;
+    [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
     [PluginService] internal static IDutyState DutyState { get; private set; } = null!;
 
     internal Configuration Config { get; }
@@ -40,7 +40,6 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
-        DService.Init(pluginInterface);
         NativeRecorderBackend.ConfigureFromPluginInterface(pluginInterface);
         Environment = new DalamudRecorderEnvironment(pluginInterface, Log);
         Config = Configuration.Load(pluginInterface);
@@ -462,6 +461,5 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw -= OnUiBuilderDraw;
         WindowSystem.RemoveWindow(FloatingRecordWindow);
         WindowSystem.RemoveWindow(ConfigWindow);
-        DService.Uninit();
     }
 }

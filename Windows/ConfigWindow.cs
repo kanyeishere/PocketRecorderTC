@@ -1,4 +1,4 @@
-using Dalamud.Bindings.ImGui;
+using ImGuiNET;
 using Dalamud.Interface.Windowing;
 using Recorder.Encoding;
 using Recorder.Recording;

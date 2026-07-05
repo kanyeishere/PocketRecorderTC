@@ -2,7 +2,7 @@
   <Import Project="lib\native\NativeRecorderDeps.props" Condition="Exists('lib\native\NativeRecorderDeps.props')" />
 
   <PropertyGroup>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <TargetFramework>net9.0-windows</TargetFramework>
     <PlatformTarget>x64</PlatformTarget>
     <Platforms>x64</Platforms>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
@@ -16,9 +16,6 @@
     <FileVersion>1.0.0.0</FileVersion>
     <AssemblyName>PocketRecorder</AssemblyName>
     <RootNamespace>Recorder</RootNamespace>
-    <DalamudLibPath>$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
-    <DalamudLibPath Condition="Exists('$(APPDATA)\XIVLauncherCN\addon\Hooks\dev\')">$(APPDATA)\XIVLauncherCN\addon\Hooks\dev\</DalamudLibPath>
-    <DalamudLibPath Condition="'$(DALAMUD_HOME)' != ''">$(DALAMUD_HOME)\</DalamudLibPath>
     <NativeRecorderFfmpegRoot Condition="'$(NativeRecorderFfmpegRoot)' == ''">lib\native\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</NativeRecorderFfmpegRoot>
     <NativeRecorderAutoBuild Condition="'$(NativeRecorderAutoBuild)' == '' and '$(OS)' == 'Windows_NT'">true</NativeRecorderAutoBuild>
     <NativeRecorderAutoBuild Condition="'$(NativeRecorderAutoBuild)' == ''">false</NativeRecorderAutoBuild>
@@ -26,9 +23,6 @@
     <NativeRecorderBuildPlatform Condition="'$(NativeRecorderBuildPlatform)' == ''">x64</NativeRecorderBuildPlatform>
     <NativeRecorderProject>$(MSBuildProjectDirectory)\NativeRecorder\NativeRecorder.vcxproj</NativeRecorderProject>
     <NativeRecorderOutputDll>$(MSBuildProjectDirectory)\NativeRecorder\bin\$(NativeRecorderBuildPlatform)\$(NativeRecorderBuildConfiguration)\NativeRecorder.dll</NativeRecorderOutputDll>
-    <RestoreAdditionalProjectSources>
-      https://纯本地引用;
-    </RestoreAdditionalProjectSources>
     <EnableDefaultEmbeddedResourceItems>false</EnableDefaultEmbeddedResourceItems>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
@@ -50,17 +44,12 @@
     <Content Include="$(NativeRecorderFfmpegRoot)\LICENSE*" Condition="Exists('$(NativeRecorderFfmpegRoot)')" Link="licenses\FFmpeg\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\COPYING*" Condition="Exists('$(NativeRecorderFfmpegRoot)')" Link="licenses\FFmpeg\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\BUILDINFO.txt" Condition="Exists('$(NativeRecorderFfmpegRoot)\BUILDINFO.txt')" Link="licenses\FFmpeg\BUILDINFO.txt" CopyToOutputDirectory="PreserveNewest" />
-    <Compile Remove="OmenTools\**\*.cs" />
-    <EmbeddedResource Remove="OmenTools\**\*" />
-    <None Remove="OmenTools\**\*" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="PromeRotation.SDK.API12" Version="0.1.0-preview.2" />
     <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="OmenTools\OmenTools.csproj" />
+    <PackageReference Include="TerraFX.Interop.Windows" Version="10.0.22621.2" ExcludeAssets="runtime" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>
@@ -68,41 +57,6 @@
     <NativeRecorderBuildInput Include="NativeRecorder\include\**\*.*" />
     <NativeRecorderBuildInput Include="NativeRecorder\src\**\*.*" />
     <NativeRecorderBuildInput Include="lib\native\NativeRecorderDeps.props" Condition="Exists('lib\native\NativeRecorderDeps.props')" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Reference Include="Dalamud">
-      <HintPath>$(DalamudLibPath)Dalamud.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Dalamud.Common">
-      <HintPath>$(DalamudLibPath)Dalamud.Common.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Dalamud.Bindings.ImGui">
-      <HintPath>$(DalamudLibPath)Dalamud.Bindings.ImGui.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="TerraFX.Interop.Windows">
-      <HintPath>$(DalamudLibPath)TerraFX.Interop.Windows.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="FFXIVClientStructs">
-      <HintPath>$(DalamudLibPath)FFXIVClientStructs.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="InteropGenerator.Runtime">
-      <HintPath>$(DalamudLibPath)InteropGenerator.Runtime.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Lumina">
-      <HintPath>$(DalamudLibPath)Lumina.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Lumina.Excel">
-      <HintPath>$(DalamudLibPath)Lumina.Excel.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
   </ItemGroup>
 
   <Target Name="BuildNativeRecorder"

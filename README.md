@@ -98,5 +98,5 @@ GPL
 ---
 
 <p align="center">
-  <sub>Made with ❤️ by Wotou · <a href="https://github.com/kanyeishere/PocketStation">GitHub</a></sub>
+  <sub>Made with ❤️ by Wotou · <a href="https://github.com/kanyeishere/PocketRecorderTC">GitHub</a></sub>
 </p>

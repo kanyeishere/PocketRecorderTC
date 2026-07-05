@@ -14,15 +14,12 @@ jobs:
         shell: pwsh
 
     env:
-      DALAMUD_HOME: ${{ github.workspace }}\lib
       USE_MINIMAL_FFMPEG: true
       FFMPEG_REF: n8.1.2
 
     steps:
-      - name: Checkout with submodules
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
@@ -47,9 +44,8 @@ jobs:
 
       - name: Build Plugin
         run: |
-          dotnet build --configuration Release `
+          dotnet build PocketRecorder.csproj --configuration Release `
             /p:Platform=x64 `
-            /p:DALAMUD_HOME="${{ github.workspace }}\lib" `
             /p:NativeRecorderFfmpegRoot="$env:NATIVE_RECORDER_FFMPEG_ROOT" `
             /p:NativeRecorderAutoBuild=false
 

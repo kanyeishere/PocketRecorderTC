@@ -16,15 +16,13 @@ jobs:
         shell: pwsh
 
     env:
-      DALAMUD_HOME: ${{ github.workspace }}\lib
       USE_MINIMAL_FFMPEG: true
       FFMPEG_REF: n8.1.2
 
     steps:
-      - name: Checkout with submodules
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
           token: ${{ github.token }}
 
@@ -79,13 +77,12 @@ jobs:
       - name: Build Plugin
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          dotnet build --configuration Release `
+          dotnet build PocketRecorder.csproj --configuration Release `
             /p:Platform=x64 `
             /p:Version="$version" `
             /p:AssemblyVersion="$version" `
             /p:FileVersion="$version" `
             /p:InformationalVersion="$version" `
-            /p:DALAMUD_HOME="${{ github.workspace }}\lib" `
             /p:NativeRecorderFfmpegRoot="$env:NATIVE_RECORDER_FFMPEG_ROOT" `
             /p:NativeRecorderAutoBuild=false
 
@@ -146,8 +143,8 @@ jobs:
             TestingAssemblyVersion = $version
             ApplicableVersion      = "any"
             Tags                   = @("recording", "capture", "video", "audio", "ffmpeg", "ffxiv")
-            DalamudApiLevel        = 15
-            IconUrl                = "https://raw.githubusercontent.com/kanyeishere/PocketRecorder/master/images/icon.png"
+            DalamudApiLevel        = 12
+            IconUrl                = "https://raw.githubusercontent.com/kanyeishere/PocketRecorderTC/master/images/icon.png"
             RepoUrl                = $repoUrl
             DownloadLinkInstall    = $downloadUrl
             DownloadLinkTesting    = $downloadUrl
@@ -192,10 +189,10 @@ jobs:
             throw "DISPATCH_TOKEN secret is not set. Create a PAT with 'repo' scope and add it as DISPATCH_TOKEN in repo settings."
           }
 
-          Write-Host "Sending repository_dispatch to PocketStation repo..."
+          Write-Host "Sending repository_dispatch to PocketStationTC repo..."
           gh api `
             --method POST `
-            /repos/kanyeishere/PocketStation/dispatches `
+            /repos/kanyeishere/PocketStationTC/dispatches `
             -f event_type="aggregate-manifest" `
             -f 'client_payload[plugin]="PocketRecorder"' `
             -f "client_payload[version]=${{ steps.version.outputs.version }}"
