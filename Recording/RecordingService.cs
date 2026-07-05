@@ -563,8 +563,11 @@ internal sealed class RecordingService : IDisposable
     {
         lock (_sync)
         {
-            if (_request == null || _lifecycle == RecordingLifecycle.StartingWriter)
+            if (_request == null)
                 return false;
+
+            if (_lifecycle == RecordingLifecycle.StartingWriter)
+                return _backendPlan?.PrefersD3D11TextureFrames == true;
 
             if (_writer == null)
             {

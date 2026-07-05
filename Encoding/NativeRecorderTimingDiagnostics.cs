@@ -9,7 +9,7 @@ internal sealed class NativeRecorderTimingDiagnostics
 {
     private readonly List<long> _captureDeltaHns = [];
     private readonly List<long> _captureJitterHns = [];
-    private readonly List<long> _queueWaitTicks = [];
+    private readonly List<long> _sampleAgeTicks = [];
     private readonly List<long> _submitAttemptTicks = [];
     private readonly List<long> _acceptedSubmitTicks = [];
     private readonly List<long> _rejectedSubmitTicks = [];
@@ -21,7 +21,7 @@ internal sealed class NativeRecorderTimingDiagnostics
     private long _lateFrames;
     private long _longGapFrames;
     private long _nonMonotonicCaptureFrames;
-    private long _queueWaitOverBudgetFrames;
+    private long _sampleAgeOverBudgetFrames;
     private long _submitOverBudgetFrames;
     private long _maxConsecutiveLongGaps;
     private long _currentConsecutiveLongGaps;
@@ -36,13 +36,13 @@ internal sealed class NativeRecorderTimingDiagnostics
         _lateFrames = 0;
         _longGapFrames = 0;
         _nonMonotonicCaptureFrames = 0;
-        _queueWaitOverBudgetFrames = 0;
+        _sampleAgeOverBudgetFrames = 0;
         _submitOverBudgetFrames = 0;
         _maxConsecutiveLongGaps = 0;
         _currentConsecutiveLongGaps = 0;
         _captureDeltaHns.Clear();
         _captureJitterHns.Clear();
-        _queueWaitTicks.Clear();
+        _sampleAgeTicks.Clear();
         _submitAttemptTicks.Clear();
         _acceptedSubmitTicks.Clear();
         _rejectedSubmitTicks.Clear();
@@ -61,12 +61,12 @@ internal sealed class NativeRecorderTimingDiagnostics
             _submitOverBudgetFrames++;
     }
 
-    public void RecordSubmittedFrame(long captureTimestampHns, long queueWaitTicks)
+    public void RecordSubmittedFrame(long captureTimestampHns, long sampleAgeTicks)
     {
-        _queueWaitTicks.Add(Math.Max(0, queueWaitTicks));
+        _sampleAgeTicks.Add(Math.Max(0, sampleAgeTicks));
 
-        if (queueWaitTicks > _frameBudgetTicks)
-            _queueWaitOverBudgetFrames++;
+        if (sampleAgeTicks > _frameBudgetTicks)
+            _sampleAgeOverBudgetFrames++;
 
         if (_lastCaptureTimestampHns >= 0)
         {
@@ -103,7 +103,7 @@ internal sealed class NativeRecorderTimingDiagnostics
 
     public string BuildSummary()
     {
-        return "outputTiming=bufferedObsLikeCfr" +
+        return "outputTiming=obsStyleSharedTextureCfr" +
                ", targetFrameMs=" + FormatMs(_expectedFrameHns / 10_000.0) +
                ", captureDeltaMs=" + FormatHnsSummary(_captureDeltaHns) +
                ", captureJitterMs=" + FormatHnsSummary(_captureJitterHns) +
@@ -112,8 +112,8 @@ internal sealed class NativeRecorderTimingDiagnostics
                ", longGapFrames=" + _longGapFrames.ToString(CultureInfo.InvariantCulture) +
                ", maxConsecutiveLongGaps=" + _maxConsecutiveLongGaps.ToString(CultureInfo.InvariantCulture) +
                ", nonMonotonicCaptureFrames=" + _nonMonotonicCaptureFrames.ToString(CultureInfo.InvariantCulture) +
-               ", queueWaitMs=" + FormatTicksSummary(_queueWaitTicks) +
-               ", queueWaitOverBudgetFrames=" + _queueWaitOverBudgetFrames.ToString(CultureInfo.InvariantCulture) +
+               ", sampleAgeMs=" + FormatTicksSummary(_sampleAgeTicks) +
+               ", sampleAgeOverBudgetFrames=" + _sampleAgeOverBudgetFrames.ToString(CultureInfo.InvariantCulture) +
                ", submitMs=" + FormatTicksSummary(_submitAttemptTicks) +
                ", acceptedSubmitMs=" + FormatTicksSummary(_acceptedSubmitTicks) +
                ", rejectedSubmitMs=" + FormatTicksSummary(_rejectedSubmitTicks) +

@@ -13,20 +13,17 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private const int MaxAudioQueueSize = 100;
     private const int NativeCodecH264 = 1;
     private const int NativeCodecHevc = 2;
-    private const int PressureWindowMs = 1_000;
     private const int FirstFrameRetryMs = 300;
-    private const long MaxOutputLookaheadHns = 160_000;
 
     private readonly int _videoBitrate;
     private readonly string _videoCodec;
     private readonly int _nativeCodec;
     private readonly string _nativeCodecName;
     private readonly NativeRecorderTimingDiagnostics _timingDiagnostics = new();
-    private readonly object _latestVideoFrameLock = new();
+    private readonly object _mailboxLock = new();
     private NativeRecorderSession? _session;
-    private ManualResetEventSlim? _latestVideoFrameReady;
-    private NativeQueuedVideoFrame _latestVideoFrame;
-    private bool _hasLatestVideoFrame;
+    private ManualResetEventSlim? _mailboxReady;
+    private D3D11SharedTextureMailbox? _mailbox;
     private BoundedMediaQueue<AudioPacket>? _audioQueue;
     private Thread? _videoWriterThread;
     private Thread? _audioWriterThread;
@@ -40,23 +37,16 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private int _submittedFrameCount;
     private int _duplicateFrameCount;
     private int _droppedFrameCount;
-    private int _capturedFrameDropCount;
     private int _realOutputTickDropCount;
     private int _duplicateOutputTickDropCount;
-    private int _lookaheadFrameHitCount;
-    private int _lookaheadMissCount;
     private int _audioPackets;
-    private long _nextSourceFrameId;
     private long _lastSubmittedSourceFrameId;
     private long _maxSubmittedSourceFrameId;
     private long _sourceFrameRepeatCount;
     private long _sourceFrameRegressionCount;
     private long _maxSourceFrameRegressionDistance;
-    private long _submitPressureUntilTicks;
     private long _videoFrameDurationHns;
     private long _videoFrameDurationTicks;
-    private long _outputLookaheadHns;
-    private long _outputLookaheadTicks;
     private long _finalVideoDurationHns;
 
     public NativeRecorderWriter(int videoBitrate, string videoCodec)
@@ -69,7 +59,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
 
     public bool SupportsAudio => _hasAudio;
     public bool IsVideoBackedUp => false;
-    public bool IsVideoUnderPressure => IsVideoBackedUp || IsSubmitPressureActive();
+    public bool IsVideoUnderPressure => false;
     public event Action<IOutputSink, string>? FatalError;
 
     public void SetOutputPath(string path) => _outputPath = path;
@@ -86,34 +76,26 @@ internal sealed class NativeRecorderWriter : IOutputSink
         _submittedFrameCount = 0;
         _duplicateFrameCount = 0;
         _droppedFrameCount = 0;
-        _capturedFrameDropCount = 0;
         _realOutputTickDropCount = 0;
         _duplicateOutputTickDropCount = 0;
-        _lookaheadFrameHitCount = 0;
-        _lookaheadMissCount = 0;
         _audioPackets = 0;
-        _nextSourceFrameId = 0;
         _lastSubmittedSourceFrameId = 0;
         _maxSubmittedSourceFrameId = 0;
         _sourceFrameRepeatCount = 0;
         _sourceFrameRegressionCount = 0;
         _maxSourceFrameRegressionDistance = 0;
-        _submitPressureUntilTicks = 0;
         _videoFrameDurationHns = Math.Max(1, 10_000_000L / _videoFps);
         _videoFrameDurationTicks = Math.Max(1, Stopwatch.Frequency / _videoFps);
-        _outputLookaheadHns = Math.Max(1, Math.Min(_videoFrameDurationHns / 2, MaxOutputLookaheadHns));
-        _outputLookaheadTicks = Math.Max(1, _outputLookaheadHns * Stopwatch.Frequency / 10_000_000L);
         _finalVideoDurationHns = -1;
         _firstVideoFrameException = null;
         _firstVideoFrameSubmitted.Reset();
         _timingDiagnostics.Reset(_videoFps);
-        ClearLatestVideoFrame();
+        ClearMailbox();
 
         string startMessage = $"starting native writer, video={videoFormat.Describe()}@{_videoFps}, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}";
         RecordingDiagnosticLog.WriteNativeEvent("NativeRecorder", startMessage);
         AmdRecordingDiagnosticLog.Write("NativeRecorder", startMessage);
 
-        // 确保输出目录存在（原生 avio_open 不会自动创建目录）
         string? outputDir = Path.GetDirectoryName(_outputPath);
         if (!string.IsNullOrEmpty(outputDir))
             Directory.CreateDirectory(outputDir);
@@ -126,7 +108,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             _nativeCodec);
         LogNativeStatusToDiagnostics("NativeRecorder create status");
 
-        _latestVideoFrameReady = new ManualResetEventSlim(false);
+        _mailboxReady = new ManualResetEventSlim(false);
         _videoWriterThread = new Thread(VideoWriterLoop)
         {
             IsBackground = true,
@@ -146,7 +128,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
         }
 
         Plugin.Log!.Info($"[NativeRecorder] Started native D3D11 texture writer: {videoFormat.Describe()}@{_videoFps}fps, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}");
-        string timingMessage = $"video timing: OBS-like CFR output clock with single latest-frame handoff, frameDurationHns={_videoFrameDurationHns}, lookaheadHns={_outputLookaheadHns}; capture timestamps retained for diagnostics.";
+        string timingMessage = $"video timing: CFR output clock sampling the current shared texture, frameDurationHns={_videoFrameDurationHns}; capture notifications are not queued as historical frames.";
         Plugin.Log!.Info($"[NativeRecorder] {timingMessage}");
         RecordingDiagnosticLog.WriteIfEnabled("NativeRecorder", timingMessage);
         AmdRecordingDiagnosticLog.Write("NativeRecorder", timingMessage);
@@ -154,40 +136,31 @@ internal sealed class NativeRecorderWriter : IOutputSink
 
     public void WriteVideoFrame(VideoFrame frame)
     {
-        if (_stopped || _latestVideoFrameReady == null)
+        try
         {
-            frame.ReturnBuffer();
-            return;
-        }
+            if (_stopped || _mailboxReady == null)
+                return;
 
-        if (!frame.IsD3D11Texture)
-        {
-            frame.ReturnBuffer();
-            Plugin.Log!.Warning($"[NativeRecorder] Dropped non-D3D11 frame: {frame.PixelFormat}.");
-            return;
-        }
-
-        long sourceFrameId = Interlocked.Increment(ref _nextSourceFrameId);
-        NativeQueuedVideoFrame queuedFrame = new(frame, Stopwatch.GetTimestamp(), sourceFrameId);
-        NativeQueuedVideoFrame droppedFrame = default;
-        bool hasDroppedFrame = false;
-        lock (_latestVideoFrameLock)
-        {
-            if (_hasLatestVideoFrame)
+            if (!frame.IsD3D11Texture || frame.D3D11Mailbox == null)
             {
-                droppedFrame = _latestVideoFrame;
-                hasDroppedFrame = true;
+                Plugin.Log!.Warning($"[NativeRecorder] Dropped non-mailbox D3D11 frame: {frame.PixelFormat}.");
+                return;
             }
 
-            _latestVideoFrame = queuedFrame;
-            _hasLatestVideoFrame = true;
-            _latestVideoFrameReady.Set();
+            lock (_mailboxLock)
+            {
+                if (_mailbox == null || !ReferenceEquals(_mailbox, frame.D3D11Mailbox))
+                    _mailbox = frame.D3D11Mailbox;
+
+                _mailboxReady.Set();
+            }
+
+            Interlocked.Increment(ref _inputFrameCount);
         }
-
-        if (hasDroppedFrame)
-            RecordDroppedLatestCandidate(droppedFrame, staleDropped: 1);
-
-        Interlocked.Increment(ref _inputFrameCount);
+        finally
+        {
+            frame.ReturnBuffer();
+        }
     }
 
     public void WriteAudioPacket(AudioPacket packet)
@@ -212,24 +185,26 @@ internal sealed class NativeRecorderWriter : IOutputSink
     {
         Plugin.Log!.Info("[NativeRecorder] Video writer thread started.");
 
-        NativeQueuedVideoFrame retainedFrame = default;
-        bool hasRetainedFrame = false;
+        D3D11SharedTextureSnapshot retainedSnapshot = default;
+        bool hasRetainedSnapshot = false;
         long nextOutputFrameIndex = 0;
         long nextOutputDueTicks = 0;
+        long lastSampledSourceFrameId = 0;
 
         try
         {
-            if (!TryTakeFirstLatestFrame(out NativeQueuedVideoFrame firstQueuedFrame))
+            if (!TryGetFirstSnapshot(out D3D11SharedTextureSnapshot firstSnapshot))
             {
                 _firstVideoFrameSubmitted.Set();
             }
             else
             {
-                retainedFrame = firstQueuedFrame;
-                hasRetainedFrame = true;
-                long firstQueueWaitTicks = Math.Max(0, Stopwatch.GetTimestamp() - firstQueuedFrame.EnqueueTicks);
-                if (SubmitOutputTick(retainedFrame.Frame, retainedFrame.SourceFrameId, 0, duplicate: false, recordCaptureTiming: true, firstQueueWaitTicks))
+                retainedSnapshot = firstSnapshot;
+                hasRetainedSnapshot = true;
+                long firstSampleAgeTicks = Math.Max(0, Stopwatch.GetTimestamp() - firstSnapshot.PublishTicks);
+                if (SubmitOutputTick(firstSnapshot, 0, duplicate: false, recordCaptureTiming: true, firstSampleAgeTicks))
                 {
+                    lastSampledSourceFrameId = firstSnapshot.SourceFrameId;
                     nextOutputFrameIndex = 1;
                     nextOutputDueTicks = Stopwatch.GetTimestamp() + _videoFrameDurationTicks;
 
@@ -239,31 +214,30 @@ internal sealed class NativeRecorderWriter : IOutputSink
                         if (!ShouldContinueOutput(nextOutputFrameIndex))
                             break;
 
-                        bool hasNewFrame = TrySelectLatestFrameWithLookahead(
-                            nextOutputDueTicks,
-                            out NativeQueuedVideoFrame latestFrame,
-                            out long queueWaitTicks);
-                        VideoFrame frameToSubmit = hasNewFrame ? latestFrame.Frame : retainedFrame.Frame;
-                        long sourceFrameId = hasNewFrame ? latestFrame.SourceFrameId : retainedFrame.SourceFrameId;
+                        D3D11SharedTextureSnapshot currentSnapshot = retainedSnapshot;
+                        bool hasCurrentSnapshot = TryGetCurrentSnapshot(out currentSnapshot);
+                        if (!hasCurrentSnapshot && !hasRetainedSnapshot)
+                            break;
+
+                        bool duplicate = !hasCurrentSnapshot ||
+                                         currentSnapshot.SourceFrameId == lastSampledSourceFrameId;
                         long timestampHns = nextOutputFrameIndex * _videoFrameDurationHns;
+                        long sampleAgeTicks = Math.Max(0, Stopwatch.GetTimestamp() - currentSnapshot.PublishTicks);
 
                         bool accepted = SubmitOutputTick(
-                            frameToSubmit,
-                            sourceFrameId,
+                            currentSnapshot,
                             timestampHns,
-                            duplicate: !hasNewFrame,
-                            recordCaptureTiming: hasNewFrame,
-                            queueWaitTicks);
+                            duplicate,
+                            recordCaptureTiming: !duplicate,
+                            sampleAgeTicks);
 
-                        if (accepted && hasNewFrame)
+                        if (accepted)
                         {
-                            retainedFrame.Frame.ReturnBuffer();
-                            retainedFrame = latestFrame;
-                            hasRetainedFrame = true;
-                            latestFrame = default;
+                            retainedSnapshot = currentSnapshot;
+                            hasRetainedSnapshot = true;
+                            lastSampledSourceFrameId = currentSnapshot.SourceFrameId;
                         }
 
-                        latestFrame.Frame?.ReturnBuffer();
                         nextOutputFrameIndex++;
                         nextOutputDueTicks += _videoFrameDurationTicks;
                     }
@@ -296,13 +270,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
             }
         }
 
-        if (hasRetainedFrame)
-            retainedFrame.Frame.ReturnBuffer();
-
         if (Volatile.Read(ref _submittedFrameCount) == 0 && _firstVideoFrameException == null)
             _firstVideoFrameSubmitted.Set();
 
-        DrainLatestVideoFrame();
         string timingSummary = _timingDiagnostics.BuildSummary();
         string dropSummary = BuildDropSummary();
         string sourceFrameSummary = BuildSourceFrameSummary();
@@ -322,84 +292,32 @@ internal sealed class NativeRecorderWriter : IOutputSink
             $"timing diagnostics: {timingSummary}");
     }
 
-    private bool TryTakeFirstLatestFrame(out NativeQueuedVideoFrame queuedFrame)
+    private bool TryGetFirstSnapshot(out D3D11SharedTextureSnapshot snapshot)
     {
         while (!_stopped)
         {
-            if (TryTakeLatestVideoFrame(out queuedFrame))
+            if (TryGetCurrentSnapshot(out snapshot))
                 return true;
 
-            _latestVideoFrameReady?.Wait(100);
+            _mailboxReady?.Wait(100);
         }
 
-        queuedFrame = default;
+        snapshot = default;
         return false;
     }
 
-    private bool TrySelectLatestFrameWithLookahead(
-        long outputDueTicks,
-        out NativeQueuedVideoFrame selectedFrame,
-        out long queueWaitTicks)
+    private bool TryGetCurrentSnapshot(out D3D11SharedTextureSnapshot snapshot)
     {
-        if (TryTakeLatestVideoFrame(out selectedFrame, out queueWaitTicks))
+        D3D11SharedTextureMailbox? mailbox;
+        lock (_mailboxLock)
+        {
+            mailbox = _mailbox;
+        }
+
+        if (mailbox != null && mailbox.TryGetLatest(out snapshot))
             return true;
-        if (_stopped)
-            return false;
 
-        return TryWaitForLookaheadFrame(outputDueTicks + _outputLookaheadTicks, out selectedFrame, out queueWaitTicks);
-    }
-
-    private bool TryTakeLatestVideoFrame(out NativeQueuedVideoFrame selectedFrame)
-    {
-        return TryTakeLatestVideoFrame(out selectedFrame, out _);
-    }
-
-    private bool TryTakeLatestVideoFrame(out NativeQueuedVideoFrame selectedFrame, out long queueWaitTicks)
-    {
-        lock (_latestVideoFrameLock)
-        {
-            if (!_hasLatestVideoFrame)
-            {
-                selectedFrame = default;
-                queueWaitTicks = 0;
-                return false;
-            }
-
-            selectedFrame = _latestVideoFrame;
-            _latestVideoFrame = default;
-            _hasLatestVideoFrame = false;
-            _latestVideoFrameReady?.Reset();
-        }
-
-        queueWaitTicks = Math.Max(0, Stopwatch.GetTimestamp() - selectedFrame.EnqueueTicks);
-        return true;
-    }
-
-    private bool TryWaitForLookaheadFrame(
-        long deadlineTicks,
-        out NativeQueuedVideoFrame selectedFrame,
-        out long queueWaitTicks)
-    {
-        queueWaitTicks = 0;
-        selectedFrame = default;
-
-        while (!_stopped)
-        {
-            if (TryTakeLatestVideoFrame(out selectedFrame, out queueWaitTicks))
-            {
-                Interlocked.Increment(ref _lookaheadFrameHitCount);
-                return true;
-            }
-
-            long remainingTicks = deadlineTicks - Stopwatch.GetTimestamp();
-            if (remainingTicks <= 0)
-                break;
-
-            SleepForRemainingTicks(remainingTicks, maxSleepMs: 1);
-        }
-
-        if (!_stopped)
-            Interlocked.Increment(ref _lookaheadMissCount);
+        snapshot = default;
         return false;
     }
 
@@ -447,15 +365,14 @@ internal sealed class NativeRecorderWriter : IOutputSink
     }
 
     private bool SubmitOutputTick(
-        VideoFrame frame,
-        long sourceFrameId,
+        D3D11SharedTextureSnapshot snapshot,
         long timestampHns,
         bool duplicate,
         bool recordCaptureTiming,
-        long queueWaitTicks)
+        long sampleAgeTicks)
     {
         long submitStartTicks = Stopwatch.GetTimestamp();
-        bool accepted = SubmitOneOutputFrame(frame, timestampHns, duplicate);
+        bool accepted = SubmitOneOutputFrame(snapshot, timestampHns, duplicate);
         long submitTicks = Stopwatch.GetTimestamp() - submitStartTicks;
         _timingDiagnostics.RecordSubmitAttempt(submitTicks, accepted);
 
@@ -490,14 +407,11 @@ internal sealed class NativeRecorderWriter : IOutputSink
         }
 
         if (recordCaptureTiming)
-            _timingDiagnostics.RecordSubmittedFrame(frame.TimestampHns, queueWaitTicks);
+            _timingDiagnostics.RecordSubmittedFrame(snapshot.SourceTimestampHns, sampleAgeTicks);
 
-        RecordSubmittedSourceFrame(sourceFrameId, timestampHns, duplicate);
+        RecordSubmittedSourceFrame(snapshot.SourceFrameId, timestampHns, duplicate);
 
         int submitted = Volatile.Read(ref _submittedFrameCount);
-        if (submitted > 1)
-            MarkSubmitPressureIfSlow(submitTicks);
-
         if (submitted % 300 == 0)
             Plugin.Log!.Info($"[NativeRecorder] Submitted {submitted} texture frames (input={_inputFrameCount}, duplicates={_duplicateFrameCount}, {BuildDropSummary()}), audioPackets={_audioPackets}");
 
@@ -547,14 +461,13 @@ internal sealed class NativeRecorderWriter : IOutputSink
         while (Interlocked.CompareExchange(ref _maxSourceFrameRegressionDistance, distance, current) != current);
     }
 
-    private bool SubmitOneOutputFrame(VideoFrame frame, long timestampHns, bool duplicate)
+    private bool SubmitOneOutputFrame(D3D11SharedTextureSnapshot snapshot, long timestampHns, bool duplicate)
     {
         bool isFirstSubmittedFrame = Volatile.Read(ref _submittedFrameCount) == 0;
-        bool accepted = SubmitD3D11TextureWithStartupRetry(frame, timestampHns, isFirstSubmittedFrame);
+        bool accepted = SubmitD3D11TextureWithStartupRetry(snapshot, timestampHns, isFirstSubmittedFrame);
         if (!accepted)
             return false;
 
-        frame.MarkD3D11TextureSubmitted();
         int submitted = Interlocked.Increment(ref _submittedFrameCount);
         if (duplicate)
             Interlocked.Increment(ref _duplicateFrameCount);
@@ -569,17 +482,17 @@ internal sealed class NativeRecorderWriter : IOutputSink
         return true;
     }
 
-    private bool SubmitD3D11TextureWithStartupRetry(VideoFrame frame, long timestampHns, bool isFirstSubmittedFrame)
+    private bool SubmitD3D11TextureWithStartupRetry(D3D11SharedTextureSnapshot snapshot, long timestampHns, bool isFirstSubmittedFrame)
     {
         if (!isFirstSubmittedFrame)
-            return _session!.SubmitD3D11Texture(frame, timestampHns);
+            return _session!.SubmitD3D11Texture(snapshot, timestampHns);
 
         Stopwatch retrySw = Stopwatch.StartNew();
         int attempts = 0;
         while (!_stopped)
         {
             attempts++;
-            if (_session!.SubmitD3D11Texture(frame, timestampHns))
+            if (_session!.SubmitD3D11Texture(snapshot, timestampHns))
             {
                 if (attempts > 1)
                     Plugin.Log!.Info($"[NativeRecorder] First texture accepted after retry. attempts={attempts}, retryMs={retrySw.ElapsedMilliseconds}");
@@ -654,7 +567,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             "NativeRecorder",
             $"stopping, input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, audioPackets={_audioPackets}, finalDuration={finalVideoDuration}");
 
-        _latestVideoFrameReady?.Set();
+        _mailboxReady?.Set();
         _audioQueue?.CompleteAdding();
 
         if (_videoWriterThread != null && !_videoWriterThread.Join(5_000))
@@ -679,69 +592,31 @@ internal sealed class NativeRecorderWriter : IOutputSink
     public void Dispose()
     {
         try { Stop(); } catch { }
-        ClearLatestVideoFrame();
+        ClearMailbox();
         _session?.Dispose();
         _session = null;
-        try { _latestVideoFrameReady?.Dispose(); } catch { }
-        _latestVideoFrameReady = null;
+        try { _mailboxReady?.Dispose(); } catch { }
+        _mailboxReady = null;
         try { _audioQueue?.Dispose(); } catch { }
         try { _firstVideoFrameSubmitted.Dispose(); } catch { }
     }
 
-    private int DrainLatestVideoFrame()
+    private void ClearMailbox()
     {
-        if (!TryTakeLatestVideoFrame(out NativeQueuedVideoFrame frame))
-            return 0;
-
-        frame.Frame.ReturnBuffer();
-        return 1;
-    }
-
-    private void ClearLatestVideoFrame()
-    {
-        NativeQueuedVideoFrame frame = default;
-        bool hasFrame = false;
-        lock (_latestVideoFrameLock)
+        lock (_mailboxLock)
         {
-            if (_hasLatestVideoFrame)
-            {
-                frame = _latestVideoFrame;
-                hasFrame = true;
-            }
-
-            _latestVideoFrame = default;
-            _hasLatestVideoFrame = false;
-            _latestVideoFrameReady?.Reset();
+            _mailbox = null;
+            _mailboxReady?.Reset();
         }
-
-        if (hasFrame)
-            frame.Frame.ReturnBuffer();
     }
-
-    private void RecordDroppedLatestCandidate(NativeQueuedVideoFrame frame, int staleDropped)
-    {
-        int dropped = Interlocked.Add(ref _droppedFrameCount, staleDropped);
-        int capturedDrops = Interlocked.Add(ref _capturedFrameDropCount, staleDropped);
-        if (dropped <= 5 || dropped % 60 == 0)
-            Plugin.Log!.Info($"[NativeRecorder] Dropped stale latest texture frame before output tick. staleDrops={staleDropped}, dropped={dropped}, capturedDrops={capturedDrops}");
-
-        frame.Frame.ReturnBuffer();
-    }
-
-    private readonly record struct NativeQueuedVideoFrame(VideoFrame Frame, long EnqueueTicks, long SourceFrameId);
 
     private string BuildDropSummary()
     {
-        int capturedDrops = Volatile.Read(ref _capturedFrameDropCount);
         int realTickDrops = Volatile.Read(ref _realOutputTickDropCount);
         int duplicateTickDrops = Volatile.Read(ref _duplicateOutputTickDropCount);
         return $"dropped={Volatile.Read(ref _droppedFrameCount)}, " +
-               $"realFrameDrops={capturedDrops + realTickDrops}, " +
-               $"capturedDrops={capturedDrops}, " +
                $"realTickDrops={realTickDrops}, " +
-               $"duplicateTickDrops={duplicateTickDrops}, " +
-               $"lookaheadHits={Volatile.Read(ref _lookaheadFrameHitCount)}, " +
-               $"lookaheadMisses={Volatile.Read(ref _lookaheadMissCount)}";
+               $"duplicateTickDrops={duplicateTickDrops}";
     }
 
     private string BuildSourceFrameSummary()
@@ -751,24 +626,6 @@ internal sealed class NativeRecorderWriter : IOutputSink
                $"maxSourceFrameRegressionDistance={Volatile.Read(ref _maxSourceFrameRegressionDistance)}, " +
                $"lastSourceFrameId={Volatile.Read(ref _lastSubmittedSourceFrameId)}, " +
                $"maxSourceFrameId={Volatile.Read(ref _maxSubmittedSourceFrameId)}";
-    }
-
-    private bool IsSubmitPressureActive()
-    {
-        long untilTicks = Volatile.Read(ref _submitPressureUntilTicks);
-        return untilTicks > Stopwatch.GetTimestamp();
-    }
-
-    private void MarkSubmitPressureIfSlow(long submitTicks)
-    {
-        int fps = Math.Max(1, _videoFps);
-        long frameBudgetTicks = Math.Max(1, Stopwatch.Frequency / fps);
-        if (submitTicks <= frameBudgetTicks)
-            return;
-
-        long pressureTicks = Stopwatch.GetTimestamp() +
-            (Stopwatch.Frequency * PressureWindowMs / 1_000);
-        Volatile.Write(ref _submitPressureUntilTicks, pressureTicks);
     }
 
     private void LogNativeStatus(string prefix)

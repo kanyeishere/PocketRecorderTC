@@ -15,9 +15,6 @@ internal sealed class NativeRecorderSession : IDisposable
         _handle = handle;
     }
 
-    public bool SubmitD3D11Texture(VideoFrame frame)
-        => SubmitD3D11Texture(frame, frame.TimestampHns);
-
     public bool SubmitD3D11Texture(VideoFrame frame, long timestampHns)
     {
         if (_handle == IntPtr.Zero)
@@ -33,6 +30,24 @@ internal sealed class NativeRecorderSession : IDisposable
             frame.D3D11DevicePtr,
             frame.D3D11SharedHandle,
             frame.DxgiFormat,
+            timestampHns);
+    }
+
+    public bool SubmitD3D11Texture(D3D11SharedTextureSnapshot snapshot, long timestampHns)
+    {
+        if (_handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(NativeRecorderSession));
+
+        if (snapshot.SharedHandle == IntPtr.Zero)
+            throw new InvalidOperationException("NativeRecorder requires a D3D11 shared texture handle.");
+        if (snapshot.DevicePtr == IntPtr.Zero)
+            throw new InvalidOperationException("NativeRecorder requires the source D3D11 device for adapter matching.");
+
+        return NativeRecorderBackend.SubmitD3D11SharedTexture(
+            _handle,
+            snapshot.DevicePtr,
+            snapshot.SharedHandle,
+            snapshot.DxgiFormat,
             timestampHns);
     }
 

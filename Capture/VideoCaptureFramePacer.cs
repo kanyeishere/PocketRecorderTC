@@ -16,7 +16,7 @@ internal sealed class VideoCaptureFramePacer
     {
         int fps = Math.Max(1, targetFps);
         _minFrameIntervalTicks = Math.Max(1, Stopwatch.Frequency / fps);
-        _lateResyncThresholdTicks = Math.Max(1, _minFrameIntervalTicks / 3);
+        _lateResyncThresholdTicks = Math.Max(1, _minFrameIntervalTicks);
         _nextFrameDueTicks = 0;
         _lateResyncCount = 0;
         _maxLateTicks = 0;
@@ -34,11 +34,13 @@ internal sealed class VideoCaptureFramePacer
             return false;
 
         long lateTicks = nowTicks - _nextFrameDueTicks;
-        long nextDue = lateTicks >= _lateResyncThresholdTicks
+        long previousCaptureTicks = _nextFrameDueTicks - _minFrameIntervalTicks;
+        long elapsedSincePreviousCapture = nowTicks - previousCaptureTicks;
+        long nextDue = elapsedSincePreviousCapture > _minFrameIntervalTicks * 2
             ? nowTicks + _minFrameIntervalTicks
             : _nextFrameDueTicks + _minFrameIntervalTicks;
 
-        if (lateTicks >= _lateResyncThresholdTicks)
+        if (elapsedSincePreviousCapture > _minFrameIntervalTicks * 2)
         {
             _lateResyncCount++;
             _maxLateTicks = Math.Max(_maxLateTicks, lateTicks);

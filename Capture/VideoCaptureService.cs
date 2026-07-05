@@ -34,15 +34,13 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private IntPtr _nv12ShaderDevice;
     private readonly IntPtr[] _nv12ReadbackBuffers = new IntPtr[StagingTextureCount];
     private readonly int[] _nv12ReadbackSlotStates = new int[StagingTextureCount];
-    private readonly IntPtr[] _nativeSharedTextures = new IntPtr[NativeSharedTextureCount];
-    private readonly IntPtr[] _nativeSharedMutexes = new IntPtr[NativeSharedTextureCount];
-    private readonly IntPtr[] _nativeSharedHandles = new IntPtr[NativeSharedTextureCount];
-    private readonly int[] _nativeSharedSlotStates = new int[NativeSharedTextureCount];
+    private IntPtr _nativeSharedTexture;
+    private IntPtr _nativeSharedHandle;
+    private D3D11SharedTextureMailbox? _nativeSharedMailbox;
     private uint _nativeSharedWidth;
     private uint _nativeSharedHeight;
     private DXGI_FORMAT _nativeSharedFormat;
     private IntPtr _nativeSharedDevice;
-    private int _nativeSharedWriteIndex;
     private int _nativeSharedBusySkipCount;
     private int _nativeSharedBusySkipSuppressed;
     private long _lastNativeSharedBusyLogTicks;
@@ -95,17 +93,8 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private const int Nv12SlotReady = 1;
     private const int Nv12SlotMapped = 2;
     private const int Nv12SlotPendingRelease = 3;
-    private const int NativeSharedTextureCount = 6;
-    private const int NativeSlotAvailable = 0;
-    private const int NativeSlotInFlight = 1;
-    private const int NativeSlotPendingDropRelease = 2;
-    private const ulong NativeGameWriteKey = 0;
-    private const ulong NativeEncoderReadKey = 1;
-    private const uint NativeKeyedMutexTimeoutMs = 1;
     private const uint D3D11ResourceMiscShared = 0x2;
-    private const uint D3D11ResourceMiscSharedKeyedMutex = 0x100;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
-    private const int WAIT_TIMEOUT = 0x00000102;
     private static readonly Guid IID_ID3D11Texture2D = new(0x6F15AAF2, 0xD208, 0x4E89, 0x9A, 0xB4, 0x48, 0x95, 0x35, 0xD3, 0x4F, 0x9C);
     private static readonly Guid IID_ID3D11Device = new(0xdb6f6ddb, 0xac77, 0x4e88, 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40);
     public int CurrentWidth { get; private set; }
@@ -153,7 +142,6 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _stopStarted = 0;
         _nv12StopCleanupRequested = 0;
         Array.Clear(_nv12ReadbackSlotStates);
-        Array.Clear(_nativeSharedSlotStates);
         _nv12PerfStats.Reset();
         _sw.Restart();
 

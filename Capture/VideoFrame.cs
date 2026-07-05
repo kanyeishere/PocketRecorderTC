@@ -11,7 +11,6 @@ internal sealed unsafe class VideoFrame
     private int _bufferReturned;
     private bool _isNative;
     private bool _isD3D11Texture;
-    private int _d3d11TextureSubmitted;
     private byte* _dataPtr;
 
     public VideoFrame(
@@ -64,7 +63,7 @@ internal sealed unsafe class VideoFrame
         int width,
         int height,
         long timestampHns,
-        Action<bool> onConsumed)
+        D3D11SharedTextureMailbox? mailbox = null)
     {
         _isD3D11Texture = true;
         Data = Array.Empty<byte>();
@@ -78,7 +77,20 @@ internal sealed unsafe class VideoFrame
         D3D11TexturePtr = d3d11TexturePtr;
         D3D11SharedHandle = d3d11SharedHandle;
         DxgiFormat = dxgiFormat;
-        _onD3D11TextureConsumed = onConsumed;
+        D3D11Mailbox = mailbox;
+    }
+
+    public VideoFrame(D3D11SharedTextureMailbox mailbox, long timestampHns)
+        : this(
+            mailbox.DevicePtr,
+            mailbox.TexturePtr,
+            mailbox.SharedHandle,
+            mailbox.DxgiFormat,
+            mailbox.Width,
+            mailbox.Height,
+            timestampHns,
+            mailbox)
+    {
     }
 
     public byte[] Data { get; }
@@ -95,13 +107,7 @@ internal sealed unsafe class VideoFrame
     public IntPtr D3D11TexturePtr { get; }
     public IntPtr D3D11SharedHandle { get; }
     public int DxgiFormat { get; }
-    private Action<bool>? _onD3D11TextureConsumed;
-
-    public void MarkD3D11TextureSubmitted()
-    {
-        if (_isD3D11Texture)
-            Volatile.Write(ref _d3d11TextureSubmitted, 1);
-    }
+    public D3D11SharedTextureMailbox? D3D11Mailbox { get; }
 
     public VideoFrame DetachToManagedCopyIfNative()
     {
@@ -144,8 +150,7 @@ internal sealed unsafe class VideoFrame
     {
         if (_isD3D11Texture)
         {
-            if (Interlocked.Exchange(ref _bufferReturned, 1) == 0)
-                _onD3D11TextureConsumed?.Invoke(Volatile.Read(ref _d3d11TextureSubmitted) != 0);
+            Interlocked.Exchange(ref _bufferReturned, 1);
             return;
         }
 
