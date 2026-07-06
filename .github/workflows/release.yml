@@ -18,6 +18,7 @@ jobs:
     env:
       USE_MINIMAL_FFMPEG: true
       FFMPEG_REF: n8.1.2
+      VIDEO_CODEC_SDK_12_URL: ${{ secrets.VIDEO_CODEC_SDK_12_URL || vars.VIDEO_CODEC_SDK_12_URL }}
 
     steps:
       - name: Checkout
@@ -115,6 +116,10 @@ jobs:
             if ($matches.Count -eq 0) {
               throw "Required native package file missing: $outputDir\$pattern"
             }
+          }
+          $legacyNativeDlls = @(Get-ChildItem $outputDir -Filter "NativeRecorder.abi13.nvenc*.dll" -File)
+          if ($legacyNativeDlls.Count -ne 0) {
+            throw "Legacy split NativeRecorder DLLs must not be packaged: $($legacyNativeDlls.Name -join ', ')"
           }
 
       - name: Package Plugin

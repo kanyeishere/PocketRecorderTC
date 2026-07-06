@@ -1,3 +1,152 @@
+#if NVENCAPI_MAJOR_VERSION > 13 || (NVENCAPI_MAJOR_VERSION == 13 && NVENCAPI_MINOR_VERSION >= 1)
+#define PR_NVENC_HAS_OUTPUT_FRAME_METADATA 1
+#else
+#define PR_NVENC_HAS_OUTPUT_FRAME_METADATA 0
+#endif
+
+struct PrNvencOutputPacket
+{
+    std::vector<uint8_t> frame;
+    bool key_frame = false;
+    int64_t encoder_timestamp_hns = -1;
+};
+
+bool is_annex_b_start_code(const std::vector<uint8_t>& data, size_t offset, size_t& length)
+{
+    length = 0;
+    if (offset + 3 <= data.size() &&
+        data[offset] == 0 &&
+        data[offset + 1] == 0 &&
+        data[offset + 2] == 1)
+    {
+        length = 3;
+        return true;
+    }
+
+    if (offset + 4 <= data.size() &&
+        data[offset] == 0 &&
+        data[offset + 1] == 0 &&
+        data[offset + 2] == 0 &&
+        data[offset + 3] == 1)
+    {
+        length = 4;
+        return true;
+    }
+
+    return false;
+}
+
+size_t find_next_annex_b_start_code(const std::vector<uint8_t>& data, size_t offset)
+{
+    for (size_t i = offset; i + 3 <= data.size(); ++i)
+    {
+        size_t length = 0;
+        if (is_annex_b_start_code(data, i, length))
+            return i;
+    }
+
+    return data.size();
+}
+
+bool nvenc_packet_contains_key_frame(const std::vector<uint8_t>& data, int32_t codec)
+{
+    for (size_t offset = 0; offset + 3 <= data.size();)
+    {
+        size_t start_code_length = 0;
+        if (!is_annex_b_start_code(data, offset, start_code_length))
+        {
+            ++offset;
+            continue;
+        }
+
+        const size_t nal_start = offset + start_code_length;
+        if (nal_start >= data.size())
+            return false;
+
+        if (codec == PR_CODEC_H264)
+        {
+            const uint8_t nal_type = data[nal_start] & 0x1F;
+            if (nal_type == 5)
+                return true;
+        }
+        else if (nal_start + 1 < data.size())
+        {
+            const uint8_t nal_type = (data[nal_start] >> 1) & 0x3F;
+            if (nal_type >= 16 && nal_type <= 21)
+                return true;
+        }
+
+        offset = find_next_annex_b_start_code(data, nal_start + 1);
+    }
+
+    return false;
+}
+
+void nvenc_encode_frame(
+    NvEncoderD3D11& encoder,
+    int32_t codec,
+    std::vector<PrNvencOutputPacket>& packets,
+    NV_ENC_PIC_PARAMS* picture_params)
+{
+#if PR_NVENC_HAS_OUTPUT_FRAME_METADATA
+    std::vector<NvEncOutputFrame> raw_packets;
+    encoder.EncodeFrame(raw_packets, picture_params);
+    packets.reserve(packets.size() + raw_packets.size());
+    for (NvEncOutputFrame& raw_packet : raw_packets)
+    {
+        PrNvencOutputPacket packet;
+        packet.frame = std::move(raw_packet.frame);
+        packet.key_frame = nvenc_output_is_key_frame(raw_packet.pictureType) ||
+            nvenc_packet_contains_key_frame(packet.frame, codec);
+        packet.encoder_timestamp_hns = static_cast<int64_t>(raw_packet.timeStamp);
+        packets.push_back(std::move(packet));
+    }
+#else
+    std::vector<std::vector<uint8_t>> raw_packets;
+    encoder.EncodeFrame(raw_packets, picture_params);
+    packets.reserve(packets.size() + raw_packets.size());
+    for (std::vector<uint8_t>& raw_packet : raw_packets)
+    {
+        PrNvencOutputPacket packet;
+        packet.frame = std::move(raw_packet);
+        packet.key_frame = nvenc_packet_contains_key_frame(packet.frame, codec);
+        packets.push_back(std::move(packet));
+    }
+#endif
+}
+
+void nvenc_end_encode(
+    NvEncoderD3D11& encoder,
+    int32_t codec,
+    std::vector<PrNvencOutputPacket>& packets)
+{
+#if PR_NVENC_HAS_OUTPUT_FRAME_METADATA
+    std::vector<NvEncOutputFrame> raw_packets;
+    encoder.EndEncode(raw_packets);
+    packets.reserve(packets.size() + raw_packets.size());
+    for (NvEncOutputFrame& raw_packet : raw_packets)
+    {
+        PrNvencOutputPacket packet;
+        packet.frame = std::move(raw_packet.frame);
+        packet.key_frame = nvenc_output_is_key_frame(raw_packet.pictureType) ||
+            nvenc_packet_contains_key_frame(packet.frame, codec);
+        packet.encoder_timestamp_hns = static_cast<int64_t>(raw_packet.timeStamp);
+        packets.push_back(std::move(packet));
+    }
+#else
+    std::vector<std::vector<uint8_t>> raw_packets;
+    encoder.EndEncode(raw_packets);
+    packets.reserve(packets.size() + raw_packets.size());
+    for (std::vector<uint8_t>& raw_packet : raw_packets)
+    {
+        PrNvencOutputPacket packet;
+        packet.frame = std::move(raw_packet);
+        packet.key_frame = nvenc_packet_contains_key_frame(packet.frame, codec);
+        packets.push_back(std::move(packet));
+    }
+#endif
+}
+
 struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
 {
     std::unique_ptr<NvEncoderD3D11> encoder;
@@ -174,19 +323,19 @@ struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             if (frame.force_idr)
                 picture_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
 
-            std::vector<NvEncOutputFrame> packets;
+            std::vector<PrNvencOutputPacket> packets;
             pending_output_timestamps.push(frame.timestamp_hns);
             ++counters.encoder_input_frames;
-            encoder->EncodeFrame(packets, &picture_params);
-            for (const NvEncOutputFrame& packet : packets)
+            nvenc_encode_frame(*encoder, video.codec, packets, &picture_params);
+            for (const PrNvencOutputPacket& packet : packets)
             {
                 if (packet.frame.empty())
                     continue;
 
-                int64_t packet_timestamp = take_output_timestamp(static_cast<int64_t>(packet.timeStamp));
+                int64_t packet_timestamp = take_output_timestamp(packet.encoder_timestamp_hns);
                 HRESULT hr = muxer.enqueue_video_packet(
                     packet.frame,
-                    nvenc_output_is_key_frame(packet.pictureType),
+                    packet.key_frame,
                     packet_timestamp,
                     video_sample_duration_hns);
                 if (FAILED(hr))
@@ -215,17 +364,17 @@ struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         {
             try
             {
-                std::vector<NvEncOutputFrame> packets;
-                encoder->EndEncode(packets);
-                for (const NvEncOutputFrame& packet : packets)
+                std::vector<PrNvencOutputPacket> packets;
+                nvenc_end_encode(*encoder, video.codec, packets);
+                for (const PrNvencOutputPacket& packet : packets)
                 {
                     if (packet.frame.empty())
                         continue;
 
-                    int64_t packet_timestamp = take_output_timestamp(static_cast<int64_t>(packet.timeStamp));
+                    int64_t packet_timestamp = take_output_timestamp(packet.encoder_timestamp_hns);
                     HRESULT hr = muxer.enqueue_video_packet(
                         packet.frame,
-                        nvenc_output_is_key_frame(packet.pictureType),
+                        packet.key_frame,
                         packet_timestamp,
                         video_sample_duration_hns);
                     if (FAILED(hr) && SUCCEEDED(result))

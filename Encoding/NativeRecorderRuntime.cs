@@ -1,49 +1,91 @@
+using Recorder.Capture;
+using Recorder.Recording;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
-using Recorder.Capture;
-using Recorder.Recording;
 
 namespace Recorder.Encoding;
 
-internal static unsafe class NativeRecorderBackend
+internal static unsafe class NativeRecorderRuntimeManager
+{
+    private static readonly NativeRecorderRuntime Runtime = new(
+        "abi13",
+        "NativeRecorder ABI13",
+        [
+            "NativeRecorder.abi13.dll",
+            "NativeRecorder.dll",
+        ],
+        "single ABI13 native DLL; NVENC is built with SDK 12.x for lower driver requirements.");
+
+    public static NativeRecorderRuntime Default => Runtime;
+
+    public static void ConfigureFromPluginInterface(object? pluginInterface)
+        => Runtime.ConfigureFromPluginInterface(pluginInterface);
+
+    public static string GetDiagnosticsReport()
+        => Runtime.GetDiagnosticsReport(loadIfNeeded: true);
+
+    public static string GetNvencSdkSummary(NativeRecorderRuntime? runtime = null)
+        => (runtime ?? Runtime).GetNvencSdkSummary();
+}
+
+internal sealed unsafe class NativeRecorderRuntime
 {
     private const int ExpectedAbiVersion = 13;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
-    private static readonly string[] NativeDllFileNames = ["NativeRecorder.abi13.dll", "NativeRecorder.abi12.dll", "NativeRecorder.abi11.dll", "NativeRecorder.abi10.dll", "NativeRecorder.abi9.dll", "NativeRecorder.abi8.dll", "NativeRecorder.abi7.dll", "NativeRecorder.abi6.dll", "NativeRecorder.abi5.dll", "NativeRecorder.abi4.dll", "NativeRecorder.abi3.dll", "NativeRecorder.abi2.dll", "NativeRecorder.dll"];
-    private static readonly object Sync = new();
-    private static readonly NativeRecorderDllResolver DllResolver = new(NativeDllFileNames);
-    private static bool _loaded;
-    private static bool _loadAttempted;
-    private static IntPtr _library;
-    private static string? _loadError;
 
-    private static PrGetAbiVersion? _getAbiVersion;
-    private static PrProbe? _probe;
-    private static PrGetDiagnosticsReport? _getDiagnosticsReport;
-    private static PrCreate? _create;
-    private static PrSubmitD3D11SharedTexture? _submitD3D11SharedTexture;
-    private static PrSubmitAudio? _submitAudio;
-    private static PrStop? _stop;
-    private static PrDestroy? _destroy;
-    private static PrGetLastError? _getLastError;
+    private readonly object _sync = new();
+    private readonly NativeRecorderDllResolver _dllResolver;
+    private readonly string[] _fileNames;
+    private readonly string _loadOrderReason;
 
-    public static void ConfigureFromPluginInterface(object? pluginInterface)
+    private bool _loaded;
+    private bool _loadAttempted;
+    private IntPtr _library;
+    private string? _loadedPath;
+    private string? _loadError;
+
+    private PrGetAbiVersion? _getAbiVersion;
+    private PrProbe? _probe;
+    private PrGetDiagnosticsReport? _getDiagnosticsReport;
+    private PrCreate? _create;
+    private PrSubmitD3D11SharedTexture? _submitD3D11SharedTexture;
+    private PrSubmitAudio? _submitAudio;
+    private PrStop? _stop;
+    private PrDestroy? _destroy;
+    private PrGetLastError? _getLastError;
+
+    public NativeRecorderRuntime(
+        string id,
+        string displayName,
+        string[] fileNames,
+        string loadOrderReason)
     {
-        lock (Sync)
-        {
-            DllResolver.ConfigureFromPluginInterface(pluginInterface);
-        }
+        Id = id;
+        DisplayName = displayName;
+        _fileNames = fileNames;
+        _loadOrderReason = loadOrderReason;
+        _dllResolver = new NativeRecorderDllResolver(fileNames);
     }
 
-    public static NativeRecorderProbeResult Probe()
+    public string Id { get; }
+    public string DisplayName { get; }
+    public string? LoadedPath => _loadedPath;
+
+    public void ConfigureFromPluginInterface(object? pluginInterface)
     {
-        lock (Sync)
+        lock (_sync)
+            _dllResolver.ConfigureFromPluginInterface(pluginInterface);
+    }
+
+    public NativeRecorderProbeResult Probe()
+    {
+        lock (_sync)
         {
             if (!EnsureLoadedNoLock())
             {
-                string reason = _loadError ?? "NativeRecorder.dll was not found.";
+                string reason = _loadError ?? $"{DisplayName} native DLL was not found.";
                 return NativeRecorderProbeResult.Unavailable(reason, BuildManagedDiagnostics(reason));
             }
 
@@ -78,7 +120,7 @@ internal static unsafe class NativeRecorderBackend
                 }
 
                 string availableReason = string.IsNullOrWhiteSpace(adapterName)
-                    ? "NativeRecorder D3D11 texture recorder available."
+                    ? $"{DisplayName} D3D11 texture recorder available."
                     : adapterName;
                 return NativeRecorderProbeResult.Available(
                     availableReason,
@@ -92,17 +134,49 @@ internal static unsafe class NativeRecorderBackend
         }
     }
 
-    public static NativeRecorderSession Create(
+    public NativeRecorderProbeResult ProbeRuntime()
+    {
+        lock (_sync)
+        {
+            if (!EnsureLoadedNoLock())
+            {
+                string reason = _loadError ?? $"{DisplayName} native DLL was not found.";
+                return NativeRecorderProbeResult.Unavailable(reason, BuildManagedDiagnostics(reason));
+            }
+
+            try
+            {
+                int abi = _getAbiVersion!.Invoke();
+                if (abi != ExpectedAbiVersion)
+                {
+                    string reason = $"NativeRecorder ABI mismatch: expected {ExpectedAbiVersion}, got {abi}.";
+                    return NativeRecorderProbeResult.Unavailable(reason, BuildManagedDiagnostics(reason));
+                }
+
+                string diagnostics = GetNativeDiagnosticsReportNoLock();
+                return NativeRecorderProbeResult.Available(
+                    $"{DisplayName} native DLL loaded.",
+                    string.IsNullOrWhiteSpace(diagnostics) ? BuildManagedDiagnostics("diagnostics unavailable") : diagnostics);
+            }
+            catch (Exception ex)
+            {
+                string reason = $"NativeRecorder runtime probe exception: {ex.Message}";
+                return NativeRecorderProbeResult.Unavailable(reason, BuildManagedDiagnostics(reason));
+            }
+        }
+    }
+
+    public NativeRecorderSession Create(
         string outputPath,
         VideoFormat video,
         AudioFormat? audio,
         int bitrateBps,
         int codec)
     {
-        lock (Sync)
+        lock (_sync)
         {
             if (!EnsureLoadedNoLock())
-                throw new InvalidOperationException(_loadError ?? "NativeRecorder.dll was not found.");
+                throw new InvalidOperationException(_loadError ?? $"{DisplayName} native DLL was not found.");
 
             int abi = _getAbiVersion!.Invoke();
             if (abi != ExpectedAbiVersion)
@@ -142,7 +216,7 @@ internal static unsafe class NativeRecorderBackend
             if (handle == IntPtr.Zero)
                 throw new InvalidOperationException("NativeRecorder create returned a null handle.");
 
-            return new NativeRecorderSession(handle);
+            return new NativeRecorderSession(this, handle);
         }
         finally
         {
@@ -150,12 +224,19 @@ internal static unsafe class NativeRecorderBackend
         }
     }
 
-    public static string GetDiagnosticsReport()
+    public string GetDiagnosticsReport(bool loadIfNeeded = true)
     {
-        lock (Sync)
+        lock (_sync)
         {
-            if (!EnsureLoadedNoLock())
-                return BuildManagedDiagnostics(_loadError ?? "NativeRecorder.dll was not found.");
+            if (loadIfNeeded)
+            {
+                if (!EnsureLoadedNoLock())
+                    return BuildManagedDiagnostics(_loadError ?? $"{DisplayName} native DLL was not found.");
+            }
+            else if (!_loaded)
+            {
+                return string.Empty;
+            }
 
             try
             {
@@ -172,7 +253,28 @@ internal static unsafe class NativeRecorderBackend
         }
     }
 
-    public static bool SubmitD3D11SharedTexture(
+    public string GetNvencSdkSummary()
+    {
+        string report = GetDiagnosticsReport();
+        string buildSdk = ExtractReportField(report, "nvencBuildSdk");
+        string buildApi = ExtractReportField(report, "nvencBuildApi");
+        string driverApi = ExtractReportField(report, "nvencDriverApi");
+        string loadedDll = Path.GetFileName(_loadedPath) ?? string.Empty;
+
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(loadedDll))
+            parts.Add($"dll={loadedDll}");
+        if (!string.IsNullOrWhiteSpace(buildSdk))
+            parts.Add($"sdk={buildSdk}");
+        if (!string.IsNullOrWhiteSpace(buildApi))
+            parts.Add($"api={buildApi}");
+        if (!string.IsNullOrWhiteSpace(driverApi))
+            parts.Add($"driverApi={driverApi}");
+
+        return parts.Count == 0 ? string.Empty : string.Join(", ", parts);
+    }
+
+    public bool SubmitD3D11SharedTexture(
         IntPtr recorder,
         IntPtr d3d11Device,
         IntPtr sharedHandle,
@@ -187,7 +289,7 @@ internal static unsafe class NativeRecorderBackend
         return true;
     }
 
-    public static void SubmitAudio(IntPtr recorder, byte[] data, int byteCount, long timestampHns)
+    public void SubmitAudio(IntPtr recorder, byte[] data, int byteCount, long timestampHns)
     {
         fixed (byte* dataPtr = data)
         {
@@ -196,7 +298,7 @@ internal static unsafe class NativeRecorderBackend
         }
     }
 
-    public static void Stop(IntPtr recorder)
+    public void Stop(IntPtr recorder)
     {
         if (recorder == IntPtr.Zero)
             return;
@@ -205,7 +307,7 @@ internal static unsafe class NativeRecorderBackend
         ThrowIfFailed(hr, "NativeRecorder stop failed");
     }
 
-    public static void Destroy(IntPtr recorder)
+    public void Destroy(IntPtr recorder)
     {
         if (recorder == IntPtr.Zero)
             return;
@@ -213,7 +315,26 @@ internal static unsafe class NativeRecorderBackend
         _destroy!(recorder);
     }
 
-    private static bool EnsureLoadedNoLock()
+    public string GetLastStatus()
+    {
+        if (_getLastError == null)
+            return string.Empty;
+
+        byte[] buffer = new byte[8192];
+        fixed (byte* bufferPtr = buffer)
+        {
+            if (_getLastError(bufferPtr, buffer.Length) != 0)
+                return string.Empty;
+        }
+
+        int length = Array.IndexOf(buffer, (byte)0);
+        if (length < 0)
+            length = buffer.Length;
+
+        return System.Text.Encoding.UTF8.GetString(buffer, 0, length);
+    }
+
+    private bool EnsureLoadedNoLock()
     {
         if (_loaded)
             return true;
@@ -223,7 +344,7 @@ internal static unsafe class NativeRecorderBackend
 
         _loadAttempted = true;
 
-        string[] candidates = DllResolver.BuildCandidates(typeof(NativeRecorderBackend));
+        string[] candidates = _dllResolver.BuildCandidates(typeof(NativeRecorderRuntime), _fileNames);
         List<string> missingCandidates = [];
         List<string> failedCandidates = [];
 
@@ -242,7 +363,7 @@ internal static unsafe class NativeRecorderBackend
             catch (Exception ex)
             {
                 failedCandidates.Add($"{candidate} ({ex.Message})");
-                _loadError = $"Failed to load NativeRecorder.dll: {candidate}. {ex.Message}";
+                _loadError = $"Failed to load {DisplayName}: {candidate}. {ex.Message}";
                 continue;
             }
 
@@ -262,26 +383,27 @@ internal static unsafe class NativeRecorderBackend
             }
 
             _loaded = true;
+            _loadedPath = candidate;
             _loadError = null;
             TryGetExport("pr_get_diagnostics_report", out _getDiagnosticsReport);
-            Plugin.Log?.Info($"[NativeRecorder] Loaded native DLL: {candidate} (ABI {ExpectedAbiVersion}, NvEncoderD3D11/libavformat preferred, AMF/libavformat AMD path available, oneVPL/libavformat Intel path available)");
+            Plugin.Log?.Info($"[NativeRecorder] Loaded {DisplayName}: {candidate} (ABI {ExpectedAbiVersion}, {_loadOrderReason}, NvEncoderD3D11/libavformat preferred, AMF/libavformat AMD path available, oneVPL/libavformat Intel path available)");
             return true;
         }
 
         if (failedCandidates.Count > 0)
         {
-            _loadError ??= "Failed to load NativeRecorder.dll. " +
+            _loadError ??= $"Failed to load {DisplayName}. " +
                 $"Failed candidates: {string.Join("; ", failedCandidates)}";
         }
         else
         {
-            _loadError = "NativeRecorder.dll was not found. " +
+            _loadError = $"{DisplayName} native DLL was not found. " +
                 $"Searched: {string.Join("; ", missingCandidates.Count > 0 ? missingCandidates : candidates)}";
         }
         return false;
     }
 
-    private static bool TryGetExport<TDelegate>(string name, out TDelegate? value)
+    private bool TryGetExport<TDelegate>(string name, out TDelegate? value)
         where TDelegate : Delegate
     {
         value = null;
@@ -292,16 +414,7 @@ internal static unsafe class NativeRecorderBackend
         return true;
     }
 
-    private static string NativeString(byte* bytes, int capacity)
-    {
-        int length = 0;
-        while (length < capacity && bytes[length] != 0)
-            length++;
-
-        return System.Text.Encoding.UTF8.GetString(bytes, length);
-    }
-
-    private static string BuildProbeDiagnostics(
+    private string BuildProbeDiagnostics(
         int abi,
         NativeProbeInfo info,
         string reason,
@@ -314,6 +427,9 @@ internal static unsafe class NativeRecorderBackend
         var parts = new List<string>
         {
             $"abi={abi}/{ExpectedAbiVersion}",
+            $"runtime={Id}",
+            $"loadedDll={ValueOrNone(Path.GetFileName(_loadedPath))}",
+            $"nativeDllOrder={ValueOrNone(_loadOrderReason)}",
             $"adapter={ValueOrNone(adapterName)}",
             $"isSupportedAdapter={info.IsSupportedAdapter}",
             $"supportsD3D11TextureInput={info.SupportsD3D11TextureInput}",
@@ -340,11 +456,13 @@ internal static unsafe class NativeRecorderBackend
         return string.Join("; ", parts);
     }
 
-    private static string BuildManagedDiagnostics(string reason)
+    private string BuildManagedDiagnostics(string reason)
     {
         var parts = new List<string>
         {
             $"abi=not-loaded/{ExpectedAbiVersion}",
+            $"runtime={Id}",
+            $"nativeDllOrder={ValueOrNone(_loadOrderReason)}",
             $"reason={ValueOrNone(reason)}",
         };
 
@@ -359,7 +477,7 @@ internal static unsafe class NativeRecorderBackend
         return string.Join("; ", parts);
     }
 
-    private static string GetNativeDiagnosticsReportNoLock()
+    private string GetNativeDiagnosticsReportNoLock()
     {
         if (_getDiagnosticsReport == null)
             return string.Empty;
@@ -378,6 +496,33 @@ internal static unsafe class NativeRecorderBackend
         return System.Text.Encoding.UTF8.GetString(buffer, 0, length);
     }
 
+    private static string NativeString(byte* bytes, int capacity)
+    {
+        int length = 0;
+        while (length < capacity && bytes[length] != 0)
+            length++;
+
+        return System.Text.Encoding.UTF8.GetString(bytes, length);
+    }
+
+    private static string ExtractReportField(string report, string name)
+    {
+        if (string.IsNullOrWhiteSpace(report) || string.IsNullOrWhiteSpace(name))
+            return string.Empty;
+
+        string needle = name + "=";
+        int start = report.IndexOf(needle, StringComparison.OrdinalIgnoreCase);
+        if (start < 0)
+            return string.Empty;
+
+        start += needle.Length;
+        int end = start;
+        while (end < report.Length && report[end] != ',' && report[end] != ';' && report[end] != '}')
+            end++;
+
+        return report[start..end].Trim();
+    }
+
     private static string ValueOrNone(string? value)
         => string.IsNullOrWhiteSpace(value) ? "<none>" : value;
 
@@ -392,7 +537,7 @@ internal static unsafe class NativeRecorderBackend
         };
     }
 
-    private static void ThrowIfFailed(int hr, string prefix)
+    private void ThrowIfFailed(int hr, string prefix)
     {
         if (hr == 0)
             return;
@@ -403,24 +548,4 @@ internal static unsafe class NativeRecorderBackend
 
         throw new InvalidOperationException($"{prefix}: 0x{hr:X8}.");
     }
-
-    public static string GetLastStatus()
-    {
-        if (_getLastError == null)
-            return string.Empty;
-
-        byte[] buffer = new byte[8192];
-        fixed (byte* bufferPtr = buffer)
-        {
-            if (_getLastError(bufferPtr, buffer.Length) != 0)
-                return string.Empty;
-        }
-
-        int length = Array.IndexOf(buffer, (byte)0);
-        if (length < 0)
-            length = buffer.Length;
-
-        return System.Text.Encoding.UTF8.GetString(buffer, 0, length);
-    }
-
 }

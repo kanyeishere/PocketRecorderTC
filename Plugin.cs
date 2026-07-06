@@ -41,7 +41,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
-        NativeRecorderBackend.ConfigureFromPluginInterface(pluginInterface);
+        NativeRecorderRuntimeManager.ConfigureFromPluginInterface(pluginInterface);
         Environment = new DalamudRecorderEnvironment(pluginInterface, Log);
         Config = Configuration.Load(pluginInterface);
         PocketBackendClient.Configure(Config);

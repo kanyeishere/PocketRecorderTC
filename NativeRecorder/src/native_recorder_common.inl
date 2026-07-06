@@ -51,6 +51,18 @@ extern "C"
 
 using Microsoft::WRL::ComPtr;
 
+#ifndef PR_NVENC_SDK_VERSION_MAJOR
+#define PR_NVENC_SDK_VERSION_MAJOR NVENCAPI_MAJOR_VERSION
+#endif
+
+#ifndef PR_NVENC_SDK_VERSION_MINOR
+#define PR_NVENC_SDK_VERSION_MINOR NVENCAPI_MINOR_VERSION
+#endif
+
+#ifndef PR_NVENC_SDK_VERSION_PATCH
+#define PR_NVENC_SDK_VERSION_PATCH 0
+#endif
+
 namespace
 {
 constexpr UINT kNvidiaVendorId = 0x10DE;
@@ -213,6 +225,9 @@ std::string hex_uint32(uint32_t value)
 bool nvenc_runtime_present();
 bool amf_runtime_present();
 bool onevpl_runtime_present();
+std::string nvenc_build_sdk_version();
+std::string nvenc_build_api_version();
+std::string nvenc_driver_api_report();
 
 std::string memory_mb(size_t bytes)
 {
@@ -294,6 +309,9 @@ std::string native_runtime_report()
     return std::string("nativeRuntime={") +
         "abi=" + std::to_string(PR_ABI_VERSION) +
         ", nvencRuntime=" + (nvenc_runtime_present() ? "present" : "missing") +
+        ", nvencBuildSdk=" + nvenc_build_sdk_version() +
+        ", nvencBuildApi=" + nvenc_build_api_version() +
+        ", nvencDriverApi=" + nvenc_driver_api_report() +
         ", amfRuntime=" + (amf_runtime_present() ? "present" : "missing") +
         ", oneVplRuntime=" + (onevpl_runtime_present() ? "present" : "missing") +
         ", avformat=" + std::to_string(avformat_version()) +
@@ -394,6 +412,108 @@ bool amf_runtime_present()
         return false;
 
     FreeLibrary(module);
+    return true;
+}
+
+uint32_t nvenc_required_driver_api_version()
+{
+    return (static_cast<uint32_t>(NVENCAPI_MAJOR_VERSION) << 4) |
+        static_cast<uint32_t>(NVENCAPI_MINOR_VERSION);
+}
+
+std::string format_nvenc_driver_api_version(uint32_t version)
+{
+    return std::to_string(version >> 4) + "." + std::to_string(version & 0xF);
+}
+
+std::string nvenc_build_sdk_version()
+{
+    return std::to_string(PR_NVENC_SDK_VERSION_MAJOR) + "." +
+        std::to_string(PR_NVENC_SDK_VERSION_MINOR) + "." +
+        std::to_string(PR_NVENC_SDK_VERSION_PATCH);
+}
+
+std::string nvenc_build_api_version()
+{
+    return std::to_string(NVENCAPI_MAJOR_VERSION) + "." +
+        std::to_string(NVENCAPI_MINOR_VERSION);
+}
+
+bool try_get_nvenc_driver_api_version(uint32_t& version, std::string* error = nullptr)
+{
+    version = 0;
+
+    HMODULE module = LoadLibraryW(L"nvEncodeAPI64.dll");
+    if (module == nullptr)
+    {
+        if (error != nullptr)
+            *error = "nvEncodeAPI64.dll missing";
+        return false;
+    }
+
+    using NvEncodeAPIGetMaxSupportedVersionFn = NVENCSTATUS(NVENCAPI*)(uint32_t*);
+    auto* proc = reinterpret_cast<NvEncodeAPIGetMaxSupportedVersionFn>(
+        GetProcAddress(module, "NvEncodeAPIGetMaxSupportedVersion"));
+    if (proc == nullptr)
+    {
+        if (error != nullptr)
+            *error = "NvEncodeAPIGetMaxSupportedVersion missing";
+        FreeLibrary(module);
+        return false;
+    }
+
+    NVENCSTATUS status = proc(&version);
+    FreeLibrary(module);
+    if (status != NV_ENC_SUCCESS)
+    {
+        if (error != nullptr)
+            *error = "NvEncodeAPIGetMaxSupportedVersion status=" + std::to_string(static_cast<int>(status));
+        return false;
+    }
+
+    return true;
+}
+
+std::string nvenc_driver_api_report()
+{
+    uint32_t version = 0;
+    std::string error;
+    if (!try_get_nvenc_driver_api_version(version, &error))
+        return error.empty() ? "unknown" : error;
+
+    return format_nvenc_driver_api_version(version);
+}
+
+bool nvenc_driver_supports_build_api(std::string* message)
+{
+    uint32_t driver_version = 0;
+    std::string error;
+    if (!try_get_nvenc_driver_api_version(driver_version, &error))
+    {
+        if (message != nullptr)
+            *message = error.empty() ? "Unable to query NVIDIA NVENC driver API version." : error;
+        return false;
+    }
+
+    const uint32_t required_version = nvenc_required_driver_api_version();
+    if (driver_version < required_version)
+    {
+        if (message != nullptr)
+        {
+            *message = "NVIDIA driver NVENC API " + format_nvenc_driver_api_version(driver_version) +
+                " is older than NativeRecorder build API " + nvenc_build_api_version() +
+                " (NVIDIA Video Codec SDK " + nvenc_build_sdk_version() + ").";
+        }
+        return false;
+    }
+
+    if (message != nullptr)
+    {
+        *message = "NVIDIA driver NVENC API " + format_nvenc_driver_api_version(driver_version) +
+            " supports NativeRecorder build API " + nvenc_build_api_version() +
+            " (NVIDIA Video Codec SDK " + nvenc_build_sdk_version() + ").";
+    }
+
     return true;
 }
 

@@ -7,11 +7,13 @@ namespace Recorder.Encoding;
 
 internal sealed class NativeRecorderSession : IDisposable
 {
+    private readonly NativeRecorderRuntime _runtime;
     private IntPtr _handle;
     private int _disposed;
 
-    public NativeRecorderSession(IntPtr handle)
+    public NativeRecorderSession(NativeRecorderRuntime runtime, IntPtr handle)
     {
+        _runtime = runtime;
         _handle = handle;
     }
 
@@ -25,7 +27,7 @@ internal sealed class NativeRecorderSession : IDisposable
         if (frame.D3D11DevicePtr == IntPtr.Zero)
             throw new InvalidOperationException("NativeRecorder requires the source D3D11 device for adapter matching.");
 
-        return NativeRecorderBackend.SubmitD3D11SharedTexture(
+        return _runtime.SubmitD3D11SharedTexture(
             _handle,
             frame.D3D11DevicePtr,
             frame.D3D11SharedHandle,
@@ -43,7 +45,7 @@ internal sealed class NativeRecorderSession : IDisposable
         if (snapshot.DevicePtr == IntPtr.Zero)
             throw new InvalidOperationException("NativeRecorder requires the source D3D11 device for adapter matching.");
 
-        return NativeRecorderBackend.SubmitD3D11SharedTexture(
+        return _runtime.SubmitD3D11SharedTexture(
             _handle,
             snapshot.DevicePtr,
             snapshot.SharedHandle,
@@ -56,7 +58,7 @@ internal sealed class NativeRecorderSession : IDisposable
         if (_handle == IntPtr.Zero)
             throw new ObjectDisposedException(nameof(NativeRecorderSession));
 
-        NativeRecorderBackend.SubmitAudio(_handle, packet.Data, packet.Data.Length, packet.TimestampHns);
+        _runtime.SubmitAudio(_handle, packet.Data, packet.Data.Length, packet.TimestampHns);
     }
 
     public void Stop()
@@ -65,11 +67,11 @@ internal sealed class NativeRecorderSession : IDisposable
         if (handle == IntPtr.Zero)
             return;
 
-        NativeRecorderBackend.Stop(handle);
+        _runtime.Stop(handle);
     }
 
     public string GetLastStatus()
-        => NativeRecorderBackend.GetLastStatus();
+        => _runtime.GetLastStatus();
 
     public void Dispose()
     {
@@ -77,7 +79,7 @@ internal sealed class NativeRecorderSession : IDisposable
             return;
 
         IntPtr handle = Interlocked.Exchange(ref _handle, IntPtr.Zero);
-        NativeRecorderBackend.Destroy(handle);
+        _runtime.Destroy(handle);
     }
 }
 

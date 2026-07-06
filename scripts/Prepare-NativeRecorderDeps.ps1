@@ -3,9 +3,11 @@ param(
     [string] $FfmpegRootOverride = $env:NATIVE_RECORDER_FFMPEG_ROOT,
     [string] $UseMinimalFfmpeg = $env:USE_MINIMAL_FFMPEG,
     [string] $VideoCodecSdkUrl = $env:VIDEO_CODEC_SDK_URL,
+    [string] $VideoCodecSdk12Url = $env:VIDEO_CODEC_SDK_12_URL,
     [string] $AmfRepo = $env:AMF_REPO,
     [string] $AmfRef = $env:AMF_REF,
-    [string] $VideoCodecSdkDir = $env:VideoCodecSdkDir,
+    [string] $VideoCodecSdkDir = $(if (-not [string]::IsNullOrWhiteSpace($env:NativeRecorderVideoCodecSdkDir)) { $env:NativeRecorderVideoCodecSdkDir } else { $env:VideoCodecSdkDir }),
+    [string] $VideoCodecSdk12Dir = $env:NativeRecorderNvenc12SdkDir,
     [string] $OneVplVersion = $env:ONEVPL_VERSION,
     [string] $OneVplDevelUrl = $env:ONEVPL_DEVEL_URL,
     [string] $OneVplRuntimeUrl = $env:ONEVPL_RUNTIME_URL,
@@ -56,6 +58,10 @@ if ([string]::IsNullOrWhiteSpace($OneVplRuntimeUrl)) {
 
 New-Item -ItemType Directory -Force -Path $depsRoot | Out-Null
 
+if ([string]::IsNullOrWhiteSpace($VideoCodecSdk12Dir)) {
+    $VideoCodecSdk12Dir = $env:NATIVE_RECORDER_NVENC12_SDK_DIR
+}
+
 function Test-FFmpegRoot([string] $root) {
     if (-not (Test-Path $root)) { return $false }
 
@@ -99,13 +105,46 @@ function Find-FFmpegRoot([string] $root) {
 function Find-VideoCodecSdkRoot([string] $root) {
     if (-not (Test-Path $root)) { return $null }
 
-    return Get-ChildItem $root -Directory -Recurse |
+    $rootItem = Get-Item $root
+    $candidates = @($rootItem) + @(Get-ChildItem $root -Directory -Recurse)
+
+    return $candidates |
         Where-Object {
             (Test-Path (Join-Path $_.FullName "Interface\nvEncodeAPI.h")) -and
             (Test-Path (Join-Path $_.FullName "Samples\NvCodec\NvEncoder\NvEncoderD3D11.h")) -and
-            (Test-Path (Join-Path $_.FullName "Lib\win\x64\nvencodeapi.lib"))
+            (
+                (Test-Path (Join-Path $_.FullName "Lib\win\x64\nvencodeapi.lib")) -or
+                (Test-Path (Join-Path $_.FullName "Lib\x64\nvencodeapi.lib"))
+            )
         } |
         Select-Object -First 1
+}
+
+function Get-NvencApiMajor([string] $sdkRoot) {
+    $header = Join-Path $sdkRoot "Interface\nvEncodeAPI.h"
+    if (-not (Test-Path $header)) { return $null }
+
+    $text = Get-Content -LiteralPath $header -Raw
+    $match = [regex]::Match($text, '(?m)^\s*#define\s+NVENCAPI_MAJOR_VERSION\s+(\d+)')
+    if (-not $match.Success) { return $null }
+
+    return [int]$match.Groups[1].Value
+}
+
+function Find-Nvenc12SdkRoot([string] $root) {
+    if (-not (Test-Path $root)) { return $null }
+
+    $rootItem = Get-Item $root
+    $candidates = @($rootItem) + @(Get-ChildItem $root -Directory -Recurse)
+
+    foreach ($candidateRoot in $candidates) {
+        $candidate = Find-VideoCodecSdkRoot $candidateRoot.FullName
+        if ($null -ne $candidate -and (Get-NvencApiMajor $candidate.FullName) -eq 12) {
+            return $candidate
+        }
+    }
+
+    return $null
 }
 
 function Test-OneVplSdkRoot([string] $root) {
@@ -219,28 +258,54 @@ if (-not (Test-Path (Join-Path $amfDir "public\common\AMFFactory.cpp"))) {
     throw "AMF SDK was prepared, but AMFFactory.cpp was not found."
 }
 
-$sdkDir = $null
-if (-not [string]::IsNullOrWhiteSpace($VideoCodecSdkDir) -and (Test-Path $VideoCodecSdkDir)) {
-    $sdkDir = Find-VideoCodecSdkRoot $VideoCodecSdkDir
-}
-if ($null -eq $sdkDir) {
-    $sdkDir = Find-VideoCodecSdkRoot $videoCodecSdkRoot
-}
-if ($null -eq $sdkDir) {
-    if ([string]::IsNullOrWhiteSpace($VideoCodecSdkUrl)) {
-        throw "VIDEO_CODEC_SDK_URL is required to build NativeRecorder in CI. Point it at a NVIDIA Video Codec SDK zip, for example a private release asset or repository variable."
+$sdk12Dir = $null
+if (-not [string]::IsNullOrWhiteSpace($VideoCodecSdk12Dir) -and (Test-Path $VideoCodecSdk12Dir)) {
+    $sdk12Dir = Find-VideoCodecSdkRoot $VideoCodecSdk12Dir
+    if ($null -ne $sdk12Dir -and (Get-NvencApiMajor $sdk12Dir.FullName) -ne 12) {
+        Write-Warning "Ignoring NativeRecorderNvenc12SdkDir because it is not an NVENC API 12 SDK: $($sdk12Dir.FullName)"
+        $sdk12Dir = $null
     }
-
+}
+if ($null -eq $sdk12Dir -and -not [string]::IsNullOrWhiteSpace($VideoCodecSdkDir) -and (Test-Path $VideoCodecSdkDir)) {
+    $sdk12Dir = Find-Nvenc12SdkRoot $VideoCodecSdkDir
+    if ($null -eq $sdk12Dir) {
+        $candidate = Find-VideoCodecSdkRoot $VideoCodecSdkDir
+        if ($null -ne $candidate) {
+            Write-Warning "Ignoring NativeRecorderVideoCodecSdkDir because it is not an NVENC API 12 SDK: $($candidate.FullName)"
+        }
+    }
+}
+if ($null -eq $sdk12Dir) {
+    $sdk12Dir = Find-Nvenc12SdkRoot $videoCodecSdkRoot
+}
+if ($null -eq $sdk12Dir -and -not [string]::IsNullOrWhiteSpace($VideoCodecSdk12Url)) {
+    $sdk12Zip = Join-Path $depsRoot "Video_Codec_SDK_12.zip"
+    $sdk12Root = Join-Path $videoCodecSdkRoot "nvenc12"
+    Write-Host "Downloading NVIDIA Video Codec SDK 12."
+    Invoke-WebRequest -Uri $VideoCodecSdk12Url -OutFile $sdk12Zip -UseBasicParsing
+    if (Test-Path $sdk12Root) {
+        Remove-Item -Recurse -Force $sdk12Root
+    }
+    New-Item -ItemType Directory -Force -Path $sdk12Root | Out-Null
+    Expand-Archive -Path $sdk12Zip -DestinationPath $sdk12Root -Force
+    $sdk12Dir = Find-Nvenc12SdkRoot $sdk12Root
+}
+if ($null -eq $sdk12Dir -and -not [string]::IsNullOrWhiteSpace($VideoCodecSdkUrl)) {
     $sdkZip = Join-Path $depsRoot "Video_Codec_SDK.zip"
-    Write-Host "Downloading NVIDIA Video Codec SDK."
+    $sdkRoot = Join-Path $videoCodecSdkRoot "generic"
+    Write-Host "Downloading NVIDIA Video Codec SDK from VIDEO_CODEC_SDK_URL. The archive must contain SDK 12.x."
     Invoke-WebRequest -Uri $VideoCodecSdkUrl -OutFile $sdkZip -UseBasicParsing
-    New-Item -ItemType Directory -Force -Path $videoCodecSdkRoot | Out-Null
-    Expand-Archive -Path $sdkZip -DestinationPath $videoCodecSdkRoot -Force
-    $sdkDir = Find-VideoCodecSdkRoot $videoCodecSdkRoot
+    if (Test-Path $sdkRoot) {
+        Remove-Item -Recurse -Force $sdkRoot
+    }
+    New-Item -ItemType Directory -Force -Path $sdkRoot | Out-Null
+    Expand-Archive -Path $sdkZip -DestinationPath $sdkRoot -Force
+    $sdk12Dir = Find-Nvenc12SdkRoot $sdkRoot
 }
-if ($null -eq $sdkDir) {
-    throw "NVIDIA Video Codec SDK was prepared, but nvEncodeAPI.h/NvEncoderD3D11.h/nvencodeapi.lib were not found."
+if ($null -eq $sdk12Dir) {
+    throw "NativeRecorder now builds the single ABI13 DLL with NVIDIA Video Codec SDK 12.x to keep older drivers supported. Set NativeRecorderVideoCodecSdkDir or NativeRecorderNvenc12SdkDir to a Video_Codec_SDK_12.x root, or set VIDEO_CODEC_SDK_12_URL in GitHub Actions."
 }
+$sdkDir = $sdk12Dir
 
 $oneVplSdk = $null
 if (-not [string]::IsNullOrWhiteSpace($OneVplSdkDir) -and (Test-Path $OneVplSdkDir)) {

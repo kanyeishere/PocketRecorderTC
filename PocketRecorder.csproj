@@ -24,6 +24,9 @@
     <NativeRecorderBuildConfiguration Condition="'$(NativeRecorderBuildConfiguration)' == ''">$(Configuration)</NativeRecorderBuildConfiguration>
     <NativeRecorderBuildPlatform Condition="'$(NativeRecorderBuildPlatform)' == ''">x64</NativeRecorderBuildPlatform>
     <NativeRecorderProject>$(MSBuildProjectDirectory)\NativeRecorder\NativeRecorder.vcxproj</NativeRecorderProject>
+    <NativeRecorderVideoCodecSdkDir Condition="'$(NativeRecorderVideoCodecSdkDir)' == '' and '$(NativeRecorderNvenc12SdkDir)' != ''">$(NativeRecorderNvenc12SdkDir)</NativeRecorderVideoCodecSdkDir>
+    <NativeRecorderVideoCodecSdkDir Condition="'$(NativeRecorderVideoCodecSdkDir)' == '' and Exists('$(MSBuildProjectDirectory)\lib\native\VideoCodecSDK\Video_Codec_SDK_12.0.16')">$(MSBuildProjectDirectory)\lib\native\VideoCodecSDK\Video_Codec_SDK_12.0.16</NativeRecorderVideoCodecSdkDir>
+    <NativeRecorderVideoCodecSdkDir Condition="'$(NativeRecorderVideoCodecSdkDir)' == ''">$(VideoCodecSdkDir)</NativeRecorderVideoCodecSdkDir>
     <NativeRecorderOutputDll>$(MSBuildProjectDirectory)\NativeRecorder\bin\$(NativeRecorderBuildPlatform)\$(NativeRecorderBuildConfiguration)\NativeRecorder.dll</NativeRecorderOutputDll>
     <EnableDefaultEmbeddedResourceItems>false</EnableDefaultEmbeddedResourceItems>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
@@ -63,16 +66,18 @@
     <NativeRecorderBuildInput Include="NativeRecorder\NativeRecorder.vcxproj" />
     <NativeRecorderBuildInput Include="NativeRecorder\include\**\*.*" />
     <NativeRecorderBuildInput Include="NativeRecorder\src\**\*.*" />
+    <NativeRecorderBuildInput Include="scripts\Build-NativeRecorder.ps1" />
     <NativeRecorderBuildInput Include="lib\native\NativeRecorderDeps.props" Condition="Exists('lib\native\NativeRecorderDeps.props')" />
+    <NativeRecorderBuildOutput Include="$(NativeRecorderOutputDll)" />
   </ItemGroup>
 
   <Target Name="BuildNativeRecorder"
           BeforeTargets="PrepareForBuild"
           Condition="'$(NativeRecorderAutoBuild)' == 'true' and '$(DesignTimeBuild)' != 'true' and Exists('$(NativeRecorderProject)')"
           Inputs="@(NativeRecorderBuildInput)"
-          Outputs="$(NativeRecorderOutputDll)">
-    <Message Text="Building NativeRecorder: $(NativeRecorderBuildConfiguration)|$(NativeRecorderBuildPlatform)" Importance="high" />
-    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\Build-NativeRecorder.ps1&quot; -ProjectPath &quot;$(NativeRecorderProject)&quot; -Configuration &quot;$(NativeRecorderBuildConfiguration)&quot; -Platform &quot;$(NativeRecorderBuildPlatform)&quot; -FfmpegRoot &quot;$(FfmpegRoot)&quot; -AmfSdkDir &quot;$(AmfSdkDir)&quot; -VideoCodecSdkDir &quot;$(VideoCodecSdkDir)&quot; -OneVplSdkDir &quot;$(OneVplSdkDir)&quot;" />
+          Outputs="@(NativeRecorderBuildOutput)">
+    <Message Text="Building NativeRecorder ABI13 single DLL: $(NativeRecorderBuildConfiguration)|$(NativeRecorderBuildPlatform)" Importance="high" />
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\Build-NativeRecorder.ps1&quot; -ProjectPath &quot;$(NativeRecorderProject)&quot; -Configuration &quot;$(NativeRecorderBuildConfiguration)&quot; -Platform &quot;$(NativeRecorderBuildPlatform)&quot; -FfmpegRoot &quot;$(FfmpegRoot)&quot; -AmfSdkDir &quot;$(AmfSdkDir)&quot; -VideoCodecSdkDir &quot;$(NativeRecorderVideoCodecSdkDir)&quot; -OneVplSdkDir &quot;$(OneVplSdkDir)&quot;" />
   </Target>
 
 </Project>

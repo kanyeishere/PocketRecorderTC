@@ -43,6 +43,7 @@ internal static class RecordingDiagnosticLog
         VideoOutputScaleMode videoOutputScaleMode,
         bool forceFfmpegFallback,
         bool preferNativeRecorder,
+        string? gameGraphicsDevice = null,
         string? initialBackendReason = null,
         string? nativeRecorderProbeReason = null)
     {
@@ -55,6 +56,9 @@ internal static class RecordingDiagnosticLog
             $"hardware={useHardwareEncoder}, audio={audioCaptureMode}, preferNative={preferNativeRecorder}",
             $"captureConfig=includeOverlay={includeOverlay}, outputScale={videoOutputScaleMode}, forceFFmpegFallback={forceFfmpegFallback}",
         };
+
+        if (!string.IsNullOrWhiteSpace(gameGraphicsDevice))
+            headerLines.Add($"gameGraphicsDevice={gameGraphicsDevice}");
 
         if (!string.IsNullOrWhiteSpace(initialBackendReason))
             headerLines.Add($"initialBackendReason={initialBackendReason}");
@@ -172,7 +176,7 @@ internal static class RecordingDiagnosticLog
                 string line =
                     $"Record | gpuVendor={Normalize(context.GpuVendor)}, gpuAdapter={Normalize(context.GpuAdapter)}, " +
                     $"backendMode={Normalize(context.BackendMode)}, backendLabel={Normalize(context.BackendLabel)}, " +
-                    $"dalamudApiLevel={context.DalamudApiLevel}";
+                    $"dalamudApiLevel={context.DalamudApiLevel}, nativeNvencSdk={Normalize(context.NativeNvencSdk)}";
                 if (!string.IsNullOrWhiteSpace(_logPath))
                     AppendLineNoLock(line);
                 else
@@ -326,6 +330,7 @@ internal static class RecordingDiagnosticLog
                     context.RequestedCodec,
                     context.SelectedBackendReason,
                     context.NativeProbeReason,
+                    context.NativeNvencSdk,
                     FinalFrameDiagnostics = finalFrameDiagnostics,
                 });
     }

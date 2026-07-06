@@ -109,17 +109,29 @@ PR_API int32_t PR_CALL pr_probe(pr_probe_info* info)
         hr = find_nvidia_adapter(&adapter_name);
         if (SUCCEEDED(hr))
         {
+            copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
             if (!nvenc_runtime_present())
             {
-                copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
                 copy_text(info->message, sizeof(info->message), "NVIDIA adapter was found, but nvEncodeAPI64.dll was not found.");
                 info->is_supported_adapter = 1;
                 set_last_error(info->message);
                 return PR_OK;
             }
 
-            copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-            copy_text(info->message, sizeof(info->message), "NativeRecorder NVIDIA D3D11 texture path is available (NvEncoderD3D11 + libavformat, FFmpeg fallback on runtime failure).");
+            std::string nvenc_version_message;
+            if (!nvenc_driver_supports_build_api(&nvenc_version_message))
+            {
+                copy_text(info->message, sizeof(info->message), nvenc_version_message.c_str());
+                info->is_supported_adapter = 1;
+                set_last_error(nvenc_version_message);
+                return PR_OK;
+            }
+
+            std::string message = "NativeRecorder NVIDIA D3D11 texture path is available " \
+                "(NvEncoderD3D11 + libavformat, NVIDIA Video Codec SDK " +
+                nvenc_build_sdk_version() + ", NVENC API " + nvenc_build_api_version() +
+                ", FFmpeg fallback on runtime failure). " + nvenc_version_message;
+            copy_text(info->message, sizeof(info->message), message.c_str());
             info->is_supported_adapter = 1;
             info->supports_d3d11_texture_input = 1;
             set_last_error(info->message);

@@ -19,6 +19,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private readonly string _videoCodec;
     private readonly int _nativeCodec;
     private readonly string _nativeCodecName;
+    private readonly NativeRecorderRuntime _runtime;
     private readonly NativeRecorderTimingDiagnostics _timingDiagnostics = new();
     private readonly object _mailboxLock = new();
     private NativeRecorderSession? _session;
@@ -49,8 +50,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private long _videoFrameDurationTicks;
     private long _finalVideoDurationHns;
 
-    public NativeRecorderWriter(int videoBitrate, string videoCodec)
+    public NativeRecorderWriter(NativeRecorderRuntime runtime, int videoBitrate, string videoCodec)
     {
+        _runtime = runtime;
         _videoBitrate = videoBitrate;
         _videoCodec = videoCodec;
         _nativeCodec = ResolveNativeCodec(videoCodec);
@@ -101,7 +103,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
         if (!string.IsNullOrEmpty(outputDir))
             Directory.CreateDirectory(outputDir);
 
-        _session = NativeRecorderBackend.Create(
+        _session = _runtime.Create(
             _outputPath,
             videoFormat,
             audioFormat,
@@ -676,14 +678,16 @@ internal sealed class NativeRecorderWriter : IOutputSink
             codec.Equals("hevc", StringComparison.OrdinalIgnoreCase) ||
             codec.Equals("h265", StringComparison.OrdinalIgnoreCase) ||
             codec.Equals("hevc_amf", StringComparison.OrdinalIgnoreCase) ||
-            codec.Equals("hevc_nvenc", StringComparison.OrdinalIgnoreCase))
+            codec.Equals("hevc_nvenc", StringComparison.OrdinalIgnoreCase) ||
+            codec.Equals("hevc_qsv", StringComparison.OrdinalIgnoreCase))
         {
             return NativeCodecHevc;
         }
 
         if (codec.Equals("h264", StringComparison.OrdinalIgnoreCase) ||
             codec.Equals("h264_amf", StringComparison.OrdinalIgnoreCase) ||
-            codec.Equals("h264_nvenc", StringComparison.OrdinalIgnoreCase))
+            codec.Equals("h264_nvenc", StringComparison.OrdinalIgnoreCase) ||
+            codec.Equals("h264_qsv", StringComparison.OrdinalIgnoreCase))
         {
             return NativeCodecH264;
         }

@@ -16,7 +16,8 @@ internal sealed record RecordingTelemetryContext(
     string BackendLabel,
     string RequestedCodec,
     string SelectedBackendReason,
-    string? NativeProbeReason);
+    string? NativeProbeReason,
+    string NativeNvencSdk = "");
 
 internal readonly record struct RecordingGpuInfo(string Vendor, string AdapterName);
 
@@ -64,18 +65,19 @@ internal static class RecordingTelemetry
         string? nativeProbeReason,
         string? selectedBackendReason,
         string? backendLabel,
-        string? requestedCodec)
+        string? requestedCodec,
+        string? gameGraphicsDevice = null)
     {
-        string nativeDiagnostics = NativeRecorderBackend.GetDiagnosticsReport();
         string? adapterName = ExtractAdapterName(nativeProbeReason);
 
-        foreach (string? candidate in new[] { backendLabel, selectedBackendReason, nativeProbeReason, adapterName, requestedCodec })
+        foreach (string? candidate in new[] { gameGraphicsDevice, backendLabel, selectedBackendReason, nativeProbeReason, adapterName, requestedCodec })
         {
             string vendor = DetectVendorFromText(candidate);
             if (!IsUnknown(vendor))
-                return new RecordingGpuInfo(vendor, adapterName ?? string.Empty);
+                return new RecordingGpuInfo(vendor, ExtractAdapterName(gameGraphicsDevice) ?? adapterName ?? string.Empty);
         }
 
+        string nativeDiagnostics = NativeRecorderRuntimeManager.GetDiagnosticsReport();
         foreach (Match match in DxgiAdapterRegex.Matches(nativeDiagnostics))
         {
             string vendor = VendorFromId(match.Groups[2].Value);
@@ -90,7 +92,7 @@ internal static class RecordingTelemetry
 
     public static string BackendMode(string backendId, string? backendLabel)
     {
-        if (string.Equals(backendId, "native-recorder", StringComparison.OrdinalIgnoreCase) ||
+        if (backendId.StartsWith("native-", StringComparison.OrdinalIgnoreCase) ||
             ContainsAny(backendLabel, "NativeRecorder", "NVENC", "AMF", "QSV", "oneVPL"))
         {
             return "native";

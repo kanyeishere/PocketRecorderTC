@@ -107,6 +107,7 @@ internal static class PocketBackendClient
                     context.RequestedCodec,
                     context.SelectedBackendReason,
                     context.NativeProbeReason,
+                    context.NativeNvencSdk,
                     saved,
                     durationMs = (long)Math.Max(0, duration.TotalMilliseconds),
                     finalFrameDiagnostics,

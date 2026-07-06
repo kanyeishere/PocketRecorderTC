@@ -6,7 +6,6 @@ namespace Recorder.Recording;
 
 internal sealed class NativeRecorderStartupGate
 {
-    private const string NativeRecorderBackendId = "native-recorder";
     private const int MinWidth = 320;
     private const int MinHeight = 180;
     private const int StableFrameCount = 2;
@@ -134,7 +133,7 @@ internal sealed class NativeRecorderStartupGate
     }
 
     private static bool IsNativeRecorderBackend(RecordingBackendPlan? backendPlan)
-        => string.Equals(backendPlan?.Backend.Id, NativeRecorderBackendId, StringComparison.OrdinalIgnoreCase);
+        => backendPlan?.PrefersD3D11TextureFrames == true;
 
     private bool ShouldLog()
         => _skippedFrames <= 5 || _skippedFrames % LogEverySkippedFrames == 0;

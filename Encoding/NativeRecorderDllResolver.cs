@@ -39,6 +39,9 @@ internal sealed class NativeRecorderDllResolver
     }
 
     public string[] BuildCandidates(Type assemblyAnchor)
+        => BuildCandidates(assemblyAnchor, _fileNames);
+
+    public string[] BuildCandidates(Type assemblyAnchor, IReadOnlyList<string> fileNames)
     {
         List<string> directories = [];
 
@@ -61,10 +64,10 @@ internal sealed class NativeRecorderDllResolver
         }
 
         if (directories.Count == 0)
-            return _fileNames;
+            return fileNames.ToArray();
 
         return directories
-            .SelectMany(directory => _fileNames.Select(fileName => Path.Combine(directory, fileName)))
+            .SelectMany(directory => fileNames.Select(fileName => Path.Combine(directory, fileName)))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }

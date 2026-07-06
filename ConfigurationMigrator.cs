@@ -156,6 +156,11 @@ internal static class ConfigurationMigrator
             SaveVersion(config, pi, 19);
         }
 
+        if (config.Version < 20)
+        {
+            SaveVersion(config, pi, 20);
+        }
+
         config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
 
         if (string.IsNullOrWhiteSpace(config.InstallId))

@@ -126,6 +126,7 @@ internal sealed class RecordingService : IDisposable
             int sessionId = ++_sessionId;
             _videoFps = Math.Max(1, config.TargetFps);
             int dalamudApiLevel = RecordingTelemetry.GetDalamudApiLevel();
+            GameGraphicsDeviceProbeResult gameGraphicsDevice = GameGraphicsDeviceProbe.Probe("recording start");
 
             string dir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
             _currentFilePath = string.IsNullOrWhiteSpace(outputPath)
@@ -145,7 +146,8 @@ internal sealed class RecordingService : IDisposable
                 config.UseHardwareEncoder,
                 config.IncludeOverlay,
                 config.VideoOutputScaleMode,
-                config.EffectiveForceFFmpegFallbackForTesting);
+                config.EffectiveForceFFmpegFallbackForTesting,
+                gameGraphicsDevice);
             RecordingDiagnosticLog.StartSession(
                 request.SessionId,
                 request.TargetFps,
@@ -157,14 +159,16 @@ internal sealed class RecordingService : IDisposable
                 request.IncludeOverlay,
                 request.VideoOutputScaleMode,
                 request.ForceFFmpegFallbackForTesting,
-                !request.ForceFFmpegFallbackForTesting && request.UseHardwareEncoder);
+                !request.ForceFFmpegFallbackForTesting && request.UseHardwareEncoder,
+                gameGraphicsDevice.DiagnosticSummary);
             backendPlan = _backendSelector.SelectInitial(request);
             RecordingDiagnosticLog.UpdateBackendSelection(backendPlan.Reason, backendPlan.NativeRecorderProbeReason);
             RecordingGpuInfo gpu = RecordingTelemetry.DetectGpu(
                 backendPlan.NativeRecorderProbeReason,
                 backendPlan.Reason,
                 backendPlan.Backend.DisplayName,
-                request.VideoCodec);
+                request.VideoCodec,
+                request.GameGraphicsDevice.DiagnosticSummary);
             _telemetryContext = new RecordingTelemetryContext(
                 request.SessionId,
                 dalamudApiLevel,
@@ -174,7 +178,8 @@ internal sealed class RecordingService : IDisposable
                 backendPlan.Backend.DisplayName,
                 request.VideoCodec,
                 backendPlan.Reason,
-                backendPlan.NativeRecorderProbeReason);
+                backendPlan.NativeRecorderProbeReason,
+                GetNativeNvencSdkSummary(backendPlan.Backend));
             RecordingDiagnosticLog.UpdateRecordingContext(_telemetryContext);
 
             _request = request;
@@ -427,32 +432,19 @@ internal sealed class RecordingService : IDisposable
                 return;
             }
 
-            try
-            {
-                startResult = backendPlan.Backend.Start(request, firstFrame, audioFormat, OnWriterFatalError);
-            }
-            catch (Exception ex) when (!string.Equals(backendPlan.Backend.Id, "ffmpeg", StringComparison.OrdinalIgnoreCase))
-            {
-                _environment.Log.Warning($"[{backendPlan.Backend.DisplayName}] Backend failed before start; falling back to FFmpeg stdin rawvideo. {ex.Message}");
-                AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
-                    backendPlan.Backend.DisplayName,
-                    $"backend failed before start, fallback=FFmpeg rawvideo, exception={ex}");
-                RecordingDiagnosticLog.WriteIfEnabled(
-                    backendPlan.Backend.DisplayName,
-                    $"backend failed before start, fallback=FFmpeg rawvideo, exception={ex}");
-                NotifyUserForActionableNativeFailure(ex);
-                SwitchToFFmpegFallback(request.SessionId, ex.Message);
+            backendPlan = StartBackendWithVendorFallbacks(request, backendPlan, firstFrame, audioFormat, out startResult);
+            if (startResult == null)
                 return;
-            }
 
-            string? nativeRuntimeReason = string.Equals(backendPlan.Backend.Id, "native-recorder", StringComparison.OrdinalIgnoreCase)
-                ? NativeRecorderBackend.GetLastStatus()
+            string? nativeRuntimeReason = backendPlan.Backend is NativeRecorderRecordingBackend nativeBackend
+                ? nativeBackend.Runtime.GetLastStatus()
                 : null;
             RecordingGpuInfo startedGpu = RecordingTelemetry.DetectGpu(
                 string.IsNullOrWhiteSpace(nativeRuntimeReason) ? backendPlan.NativeRecorderProbeReason : nativeRuntimeReason,
                 backendPlan.Reason,
                 startResult.BackendLabel,
-                request.VideoCodec);
+                request.VideoCodec,
+                request.GameGraphicsDevice.DiagnosticSummary);
 
             lock (_sync)
             {
@@ -476,6 +468,7 @@ internal sealed class RecordingService : IDisposable
                         GpuAdapter = startedGpu.AdapterName,
                         SelectedBackendReason = string.IsNullOrWhiteSpace(nativeRuntimeReason) ? backendPlan.Reason : nativeRuntimeReason,
                         NativeProbeReason = backendPlan.NativeRecorderProbeReason,
+                        NativeNvencSdk = GetNativeNvencSdkSummary(backendPlan.Backend),
                     };
                 writerPublished = true;
                 _lifecycle = RecordingLifecycle.Recording;
@@ -508,6 +501,81 @@ internal sealed class RecordingService : IDisposable
             {
                 try { startResult.Sink.Stop(TimeSpan.Zero); } catch { }
                 try { startResult.Sink.Dispose(); } catch { }
+            }
+        }
+    }
+
+    private RecordingBackendPlan StartBackendWithVendorFallbacks(
+        RecordingRequest request,
+        RecordingBackendPlan initialPlan,
+        VideoFrame firstFrame,
+        AudioFormat? audioFormat,
+        out RecordingBackendStartResult? startResult)
+    {
+        RecordingBackendPlan activePlan = initialPlan;
+        startResult = null;
+
+        while (true)
+        {
+            try
+            {
+                startResult = activePlan.Backend.Start(request, firstFrame, audioFormat, OnWriterFatalError);
+                return activePlan;
+            }
+            catch (Exception ex) when (!string.Equals(activePlan.Backend.Id, "ffmpeg", StringComparison.OrdinalIgnoreCase))
+            {
+                RecordingBackendPlan fallbackPlan = _backendSelector.SelectFallbackAfter(
+                    request,
+                    activePlan.Backend.Id,
+                    ex.Message,
+                    activePlan.NativeRecorderProbeReason);
+
+                bool fallbackIsNative = fallbackPlan.PrefersD3D11TextureFrames;
+                string fallbackTarget = fallbackIsNative ? fallbackPlan.Backend.DisplayName : "FFmpeg stdin rawvideo";
+                _environment.Log.Warning($"[{activePlan.Backend.DisplayName}] Backend failed before start; falling back to {fallbackTarget}. {ex.Message}");
+                AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
+                    activePlan.Backend.DisplayName,
+                    $"backend failed before start, fallback={fallbackTarget}, exception={ex}");
+                RecordingDiagnosticLog.WriteIfEnabled(
+                    activePlan.Backend.DisplayName,
+                    $"backend failed before start, fallback={fallbackTarget}, exception={ex}");
+
+                if (!fallbackIsNative)
+                {
+                    NotifyUserForActionableNativeFailure(ex);
+                    firstFrame.ReturnBuffer();
+                    SwitchToFFmpegFallback(request.SessionId, fallbackPlan.Reason, fallbackPlan.NativeRecorderProbeReason);
+                    return fallbackPlan;
+                }
+
+                lock (_sync)
+                {
+                    if (!IsCurrentSessionNoLock(request.SessionId) ||
+                        _lifecycle != RecordingLifecycle.StartingWriter)
+                    {
+                        firstFrame.ReturnBuffer();
+                        return fallbackPlan;
+                    }
+
+                    _backendPlan = fallbackPlan;
+                    _currentBackend = fallbackPlan.PreparingText;
+                    if (_telemetryContext != null)
+                    {
+                        _telemetryContext = _telemetryContext with
+                        {
+                            BackendMode = RecordingTelemetry.BackendMode(fallbackPlan.Backend.Id, fallbackPlan.Backend.DisplayName),
+                            BackendLabel = fallbackPlan.Backend.DisplayName,
+                            SelectedBackendReason = fallbackPlan.Reason,
+                            NativeProbeReason = fallbackPlan.NativeRecorderProbeReason,
+                            NativeNvencSdk = GetNativeNvencSdkSummary(fallbackPlan.Backend),
+                        };
+                    }
+                }
+
+                RecordingDiagnosticLog.UpdateBackendSelection(fallbackPlan.Reason, fallbackPlan.NativeRecorderProbeReason);
+                if (_telemetryContext != null)
+                    RecordingDiagnosticLog.UpdateRecordingContext(_telemetryContext);
+                activePlan = fallbackPlan;
             }
         }
     }
@@ -633,7 +701,7 @@ internal sealed class RecordingService : IDisposable
         }
     }
 
-    private void SwitchToFFmpegFallback(int sessionId, string reason)
+    private void SwitchToFFmpegFallback(int sessionId, string reason, string? nativeRecorderProbeReason = null)
     {
         int targetFps = _videoFps;
         lock (_sync)
@@ -645,14 +713,18 @@ internal sealed class RecordingService : IDisposable
                 targetFps = _request.TargetFps;
 
             if (_request != null)
-                _backendPlan = _backendSelector.SelectFFmpeg(_request, reason);
+                _backendPlan = _backendSelector.SelectFFmpeg(
+                    _request,
+                    reason,
+                    nativeRecorderProbeReason ?? _backendPlan?.NativeRecorderProbeReason);
             if (_telemetryContext != null && _backendPlan != null)
             {
                 RecordingGpuInfo gpu = RecordingTelemetry.DetectGpu(
                     _backendPlan.NativeRecorderProbeReason,
                     _backendPlan.Reason,
                     _backendPlan.Backend.DisplayName,
-                    _request?.VideoCodec);
+                    _request?.VideoCodec,
+                    _request?.GameGraphicsDevice.DiagnosticSummary);
                 _telemetryContext = _telemetryContext with
                 {
                     GpuVendor = gpu.Vendor,
@@ -691,6 +763,11 @@ internal sealed class RecordingService : IDisposable
         => backendPlan.PrefersD3D11TextureFrames
             ? Math.Max(1, request.TargetFps * 2)
             : request.TargetFps;
+
+    private static string GetNativeNvencSdkSummary(IRecordingBackend backend)
+        => backend is NativeRecorderRecordingBackend nativeBackend
+            ? nativeBackend.Runtime.GetNvencSdkSummary()
+            : string.Empty;
 
     private void NotifyUserForActionableNativeFailure(Exception ex)
     {

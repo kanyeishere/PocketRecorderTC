@@ -8,7 +8,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 19;
+    public int Version { get; set; } = 20;
 
     /// <summary>匿名安装标识，仅用于 Pocket Backend 独立用户统计。</summary>
     public string InstallId { get; set; } = Guid.NewGuid().ToString("N");

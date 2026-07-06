@@ -15,7 +15,8 @@ internal sealed record RecordingRequest(
     bool UseHardwareEncoder,
     bool IncludeOverlay,
     VideoOutputScaleMode VideoOutputScaleMode,
-    bool ForceFFmpegFallbackForTesting)
+    bool ForceFFmpegFallbackForTesting,
+    GameGraphicsDeviceProbeResult GameGraphicsDevice)
 {
     public VideoFormat ToVideoFormat(VideoFrame frame)
     {

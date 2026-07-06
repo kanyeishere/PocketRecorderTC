@@ -40,11 +40,18 @@
   <Import Project="$(ProjectDir)..\lib\native\NativeRecorderDeps.props" Condition="Exists('$(ProjectDir)..\lib\native\NativeRecorderDeps.props')" />
 
   <PropertyGroup>
+    <TargetName>NativeRecorder</TargetName>
     <OutDir>$(ProjectDir)bin\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(ProjectDir)obj\$(Platform)\$(Configuration)\</IntDir>
     <FfmpegRoot Condition="'$(FfmpegRoot)' == ''">$(ProjectDir)..\lib\native\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</FfmpegRoot>
     <AmfSdkDir Condition="'$(AmfSdkDir)' == ''">$(ProjectDir)..\lib\native\AMF\amf</AmfSdkDir>
-    <VideoCodecSdkDir Condition="'$(VideoCodecSdkDir)' == ''">$(ProjectDir)..\lib\native\VideoCodecSDK\Video_Codec_SDK_13.1.15</VideoCodecSdkDir>
+    <VideoCodecSdkDir Condition="'$(VideoCodecSdkDir)' == ''">$(ProjectDir)..\lib\native\VideoCodecSDK\Video_Codec_SDK_12.0.16</VideoCodecSdkDir>
+    <VideoCodecSdkLibDir Condition="'$(VideoCodecSdkLibDir)' == '' and Exists('$(VideoCodecSdkDir)\Lib\win\x64\nvencodeapi.lib')">$(VideoCodecSdkDir)\Lib\win\x64</VideoCodecSdkLibDir>
+    <VideoCodecSdkLibDir Condition="'$(VideoCodecSdkLibDir)' == '' and Exists('$(VideoCodecSdkDir)\Lib\x64\nvencodeapi.lib')">$(VideoCodecSdkDir)\Lib\x64</VideoCodecSdkLibDir>
+    <VideoCodecSdkLibDir Condition="'$(VideoCodecSdkLibDir)' == ''">$(VideoCodecSdkDir)\Lib\win\x64</VideoCodecSdkLibDir>
+    <NvencSdkVersionMajor Condition="'$(NvencSdkVersionMajor)' == ''">12</NvencSdkVersionMajor>
+    <NvencSdkVersionMinor Condition="'$(NvencSdkVersionMinor)' == ''">0</NvencSdkVersionMinor>
+    <NvencSdkVersionPatch Condition="'$(NvencSdkVersionPatch)' == ''">16</NvencSdkVersionPatch>
     <OneVplSdkDir Condition="'$(OneVplSdkDir)' == ''">$(ProjectDir)..\lib\native\oneVPL\devel</OneVplSdkDir>
     <OneVplRuntimeDir Condition="'$(OneVplRuntimeDir)' == ''">$(ProjectDir)..\lib\native\oneVPL\runtime\runtimes\win-x64\native</OneVplRuntimeDir>
   </PropertyGroup>
@@ -56,11 +63,11 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalIncludeDirectories>$(ProjectDir)include;$(VideoCodecSdkDir)\Interface;$(VideoCodecSdkDir)\Samples\NvCodec;$(VideoCodecSdkDir)\Samples\Utils;$(FfmpegRoot)\include;$(AmfSdkDir)\public;$(AmfSdkDir)\public\include;$(OneVplSdkDir)\lib\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WINDOWS;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;PR_NVENC_SDK_VERSION_MAJOR=$(NvencSdkVersionMajor);PR_NVENC_SDK_VERSION_MINOR=$(NvencSdkVersionMinor);PR_NVENC_SDK_VERSION_PATCH=$(NvencSdkVersionPatch);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalLibraryDirectories>$(VideoCodecSdkDir)\Lib\win\x64;$(FfmpegRoot)\lib;$(OneVplSdkDir)\lib\native\win-x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(VideoCodecSdkLibDir);$(FfmpegRoot)\lib;$(OneVplSdkDir)\lib\native\win-x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>d3d11.lib;dxgi.lib;ole32.lib;nvencodeapi.lib;vpl.lib;delayimp.lib;avformat.lib;avcodec.lib;avutil.lib;swresample.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <DelayLoadDLLs>nvEncodeAPI64.dll;libvpl.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
