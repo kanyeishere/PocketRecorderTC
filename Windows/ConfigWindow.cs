@@ -416,6 +416,27 @@ internal sealed class ConfigWindow : Window
                 Plugin.Log!.Error($"Failed to open directory: {ex}");
             }
         }
+
+        int retentionDays = config.RecordingRetentionDays;
+        if (ImGui.InputInt("录像保存期限 (天，0=永久)", ref retentionDays))
+        {
+            config.RecordingRetentionDays = Math.Clamp(retentionDays, 0, RecordingRetentionCleanupService.MaxRetentionDays);
+            SaveConfig(config);
+        }
+
+        if (config.RecordingRetentionDays <= 0)
+        {
+            ImGui.TextDisabled("自动清理关闭，不会删除任何录像。");
+        }
+        else
+        {
+            ImGui.TextDisabled($"仅清理输出目录中早于 {config.RecordingRetentionDays} 天的 Pocket Recorder 录像。");
+            ImGui.TextDisabled("清理会永久删除文件；录制中会自动跳过。");
+        }
+
+        string cleanupStatus = _plugin.RetentionCleanupService.LastStatusText;
+        if (!string.IsNullOrWhiteSpace(cleanupStatus))
+            ImGui.TextDisabled(cleanupStatus);
     }
 
     private static void SaveConfig(Configuration config)

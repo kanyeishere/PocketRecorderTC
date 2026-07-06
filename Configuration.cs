@@ -8,7 +8,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 18;
+    public int Version { get; set; } = 19;
 
     /// <summary>匿名安装标识，仅用于 Pocket Backend 独立用户统计。</summary>
     public string InstallId { get; set; } = Guid.NewGuid().ToString("N");
@@ -18,6 +18,9 @@ public class Configuration : IPluginConfiguration
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
+
+    /// <summary>录像自动清理保留天数，0 表示永久保留。</summary>
+    public int RecordingRetentionDays { get; set; } = 0;
 
     /// <summary>目标视频码率（bps），0 表示由编码器自动选择。</summary>
     public int VideoBitrate { get; set; } = 32_000_000;
