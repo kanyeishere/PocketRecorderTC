@@ -77,6 +77,9 @@ internal readonly record struct GameGraphicsDeviceProbeResult(
     public static GameGraphicsDeviceProbeResult Unavailable(string reason, string probeReason, IntPtr swapChainPtr = default)
         => new(false, default, reason, probeReason, swapChainPtr.ToInt64());
 
+    public GameGraphicsDeviceProbeResult WithProbeReason(string probeReason)
+        => this with { ProbeReason = probeReason };
+
     private static string ValueOrNone(string? value)
         => string.IsNullOrWhiteSpace(value) ? "<none>" : value;
 }

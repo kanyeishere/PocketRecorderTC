@@ -126,7 +126,7 @@ internal sealed class RecordingService : IDisposable
             int sessionId = ++_sessionId;
             _videoFps = Math.Max(1, config.TargetFps);
             int dalamudApiLevel = RecordingTelemetry.GetDalamudApiLevel();
-            GameGraphicsDeviceProbeResult gameGraphicsDevice = GameGraphicsDeviceProbe.Probe("recording start");
+            GameGraphicsDeviceProbeResult gameGraphicsDevice = _plugin.GameGraphicsDeviceProbeCache.Snapshot("recording start");
 
             string dir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
             _currentFilePath = string.IsNullOrWhiteSpace(outputPath)
