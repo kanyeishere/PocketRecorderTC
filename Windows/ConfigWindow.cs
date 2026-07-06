@@ -418,7 +418,8 @@ internal sealed class ConfigWindow : Window
         }
 
         int retentionDays = config.RecordingRetentionDays;
-        if (ImGui.InputInt("录像保存期限 (天，0=永久)", ref retentionDays))
+        ImGui.InputInt("录像保存期限 (天，0=永久)", ref retentionDays);
+        if (ImGui.IsItemDeactivatedAfterEdit())
         {
             config.RecordingRetentionDays = Math.Clamp(retentionDays, 0, RecordingRetentionCleanupService.MaxRetentionDays);
             SaveConfig(config);
