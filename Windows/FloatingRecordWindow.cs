@@ -36,12 +36,17 @@ internal sealed class FloatingRecordWindow : Window
                 ImGuiWindowFlags.NoBackground;
     }
 
+    public void SyncOpenState()
+    {
+        IsOpen = ShouldShow();
+    }
+
     public override bool DrawConditions() =>
-        _plugin.Config.ShowFloatingRecordButton;
+        ShouldShow();
 
     public override void Draw()
     {
-        IsOpen = _plugin.Config.ShowFloatingRecordButton;
+        SyncOpenState();
 
         bool ffmpegBusy = _plugin.IsFFmpegBootstrapRunning && !_plugin.IsFFmpegBootstrapComplete;
         var phase = _plugin.RecordingService.Phase;
@@ -225,4 +230,7 @@ internal sealed class FloatingRecordWindow : Window
 
     private static uint Color(float r, float g, float b, float a) =>
         ImGui.ColorConvertFloat4ToU32(new Vector4(r, g, b, a));
+
+    private bool ShouldShow() =>
+        _plugin.Config.ShowFloatingRecordButton;
 }
