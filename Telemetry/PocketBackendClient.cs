@@ -9,7 +9,7 @@ namespace Recorder.Telemetry;
 
 internal static class PocketBackendClient
 {
-    private const string BackendBaseUrl = "http://203.132.80.202:9898";
+    private const string BackendBaseUrl = "http://129.226.146.196:9898";
 
     private static readonly HttpClient HttpClient = new()
     {
