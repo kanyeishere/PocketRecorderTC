@@ -6,7 +6,8 @@ param(
     [string]$Platform = "x64",
     [string]$FfmpegRoot = "",
     [string]$AmfSdkDir = "",
-    [string]$VideoCodecSdkDir = ""
+    [string]$VideoCodecSdkDir = "",
+    [string]$OneVplSdkDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,6 +77,10 @@ if (-not [string]::IsNullOrWhiteSpace($AmfSdkDir)) {
 
 if (-not [string]::IsNullOrWhiteSpace($VideoCodecSdkDir)) {
     $msbuildArgs += "/p:VideoCodecSdkDir=$VideoCodecSdkDir"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($OneVplSdkDir)) {
+    $msbuildArgs += "/p:OneVplSdkDir=$OneVplSdkDir"
 }
 
 & $msbuild @msbuildArgs

@@ -5,7 +5,12 @@ param(
     [string] $VideoCodecSdkUrl = $env:VIDEO_CODEC_SDK_URL,
     [string] $AmfRepo = $env:AMF_REPO,
     [string] $AmfRef = $env:AMF_REF,
-    [string] $VideoCodecSdkDir = $env:VideoCodecSdkDir
+    [string] $VideoCodecSdkDir = $env:VideoCodecSdkDir,
+    [string] $OneVplVersion = $env:ONEVPL_VERSION,
+    [string] $OneVplDevelUrl = $env:ONEVPL_DEVEL_URL,
+    [string] $OneVplRuntimeUrl = $env:ONEVPL_RUNTIME_URL,
+    [string] $OneVplSdkDir = $env:OneVplSdkDir,
+    [string] $OneVplRuntimeDir = $env:OneVplRuntimeDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +21,7 @@ $ffmpegRoot = Join-Path $depsRoot "ffmpeg-btbn-lgpl-shared"
 $minimalFfmpegRoot = Join-Path $depsRoot "ffmpeg-minimal-lgpl-shared"
 $amfRoot = Join-Path $depsRoot "AMF"
 $videoCodecSdkRoot = Join-Path $depsRoot "VideoCodecSDK"
+$oneVplRoot = Join-Path $depsRoot "oneVPL"
 $propsPath = Join-Path $depsRoot "NativeRecorderDeps.props"
 
 if ([string]::IsNullOrWhiteSpace($FfmpegUrl)) {
@@ -28,6 +34,24 @@ if ([string]::IsNullOrWhiteSpace($AmfRepo)) {
 
 if ([string]::IsNullOrWhiteSpace($AmfRef)) {
     $AmfRef = "6ec029531e356102aafe1e236cfd0ddf739939da"
+}
+
+if ([string]::IsNullOrWhiteSpace($OneVplVersion)) {
+    try {
+        $oneVplIndex = Invoke-RestMethod -Uri "https://api.nuget.org/v3-flatcontainer/onevpl.devel.win-x64/index.json" -UseBasicParsing
+        $OneVplVersion = $oneVplIndex.versions[-1]
+    }
+    catch {
+        $OneVplVersion = "2023.1.0.43419"
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($OneVplDevelUrl)) {
+    $OneVplDevelUrl = "https://api.nuget.org/v3-flatcontainer/onevpl.devel.win-x64/$OneVplVersion/onevpl.devel.win-x64.$OneVplVersion.nupkg"
+}
+
+if ([string]::IsNullOrWhiteSpace($OneVplRuntimeUrl)) {
+    $OneVplRuntimeUrl = "https://api.nuget.org/v3-flatcontainer/onevpl.runtime.win-x64/$OneVplVersion/onevpl.runtime.win-x64.$OneVplVersion.nupkg"
 }
 
 New-Item -ItemType Directory -Force -Path $depsRoot | Out-Null
@@ -81,6 +105,51 @@ function Find-VideoCodecSdkRoot([string] $root) {
             (Test-Path (Join-Path $_.FullName "Samples\NvCodec\NvEncoder\NvEncoderD3D11.h")) -and
             (Test-Path (Join-Path $_.FullName "Lib\win\x64\nvencodeapi.lib"))
         } |
+        Select-Object -First 1
+}
+
+function Test-OneVplSdkRoot([string] $root) {
+    if (-not (Test-Path $root)) { return $false }
+
+    $required = @(
+        "lib\native\include\vpl\mfxvideo.h",
+        "lib\native\include\vpl\mfxdispatcher.h",
+        "lib\native\win-x64\vpl.lib"
+    )
+
+    foreach ($relativePath in $required) {
+        if (-not (Test-Path (Join-Path $root $relativePath))) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Find-OneVplSdkRoot([string] $root) {
+    if (-not (Test-Path $root)) { return $null }
+
+    $rootItem = Get-Item $root
+    $candidates = @($rootItem) + @(Get-ChildItem $root -Directory -Recurse)
+
+    return $candidates |
+        Where-Object { Test-OneVplSdkRoot $_.FullName } |
+        Select-Object -First 1
+}
+
+function Test-OneVplRuntimeRoot([string] $root) {
+    if (-not (Test-Path $root)) { return $false }
+    return Test-Path (Join-Path $root "libvpl.dll")
+}
+
+function Find-OneVplRuntimeRoot([string] $root) {
+    if (-not (Test-Path $root)) { return $null }
+
+    $rootItem = Get-Item $root
+    $candidates = @($rootItem) + @(Get-ChildItem $root -Directory -Recurse)
+
+    return $candidates |
+        Where-Object { Test-OneVplRuntimeRoot $_.FullName } |
         Select-Object -First 1
 }
 
@@ -173,9 +242,88 @@ if ($null -eq $sdkDir) {
     throw "NVIDIA Video Codec SDK was prepared, but nvEncodeAPI.h/NvEncoderD3D11.h/nvencodeapi.lib were not found."
 }
 
+$oneVplSdk = $null
+if (-not [string]::IsNullOrWhiteSpace($OneVplSdkDir) -and (Test-Path $OneVplSdkDir)) {
+    $oneVplSdk = Find-OneVplSdkRoot $OneVplSdkDir
+}
+if ($null -eq $oneVplSdk) {
+    $oneVplSdk = Find-OneVplSdkRoot $oneVplRoot
+}
+if ($null -eq $oneVplSdk) {
+    $oneVplDevelPackage = Join-Path $depsRoot "onevpl.devel.win-x64.$OneVplVersion.zip"
+    $oneVplDevelRoot = Join-Path $oneVplRoot "devel"
+    $oneVplDevelExtract = Join-Path $depsRoot "_onevpl_devel_extract"
+    Write-Host "Downloading oneVPL development package: $OneVplDevelUrl"
+    Invoke-WebRequest -Uri $OneVplDevelUrl -OutFile $oneVplDevelPackage -UseBasicParsing
+    if (Test-Path $oneVplDevelRoot) {
+        Remove-Item -Recurse -Force $oneVplDevelRoot
+    }
+    if (Test-Path $oneVplDevelExtract) {
+        Remove-Item -Recurse -Force $oneVplDevelExtract
+    }
+    New-Item -ItemType Directory -Force -Path $oneVplDevelRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $oneVplDevelExtract | Out-Null
+    Expand-Archive -Path $oneVplDevelPackage -DestinationPath $oneVplDevelExtract -Force
+    New-Item -ItemType Directory -Force -Path (Join-Path $oneVplDevelRoot "lib\native") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $oneVplDevelRoot "lib\native\win-x64") | Out-Null
+    Copy-Item -Path (Join-Path $oneVplDevelExtract "lib\native\include") -Destination (Join-Path $oneVplDevelRoot "lib\native") -Recurse -Force
+    $oneVplPreviewHeaders = Join-Path $oneVplDevelRoot "lib\native\include\vpl\preview"
+    if (Test-Path $oneVplPreviewHeaders) {
+        Remove-Item -Recurse -Force $oneVplPreviewHeaders
+    }
+    Copy-Item -Path (Join-Path $oneVplDevelExtract "lib\native\win-x64\vpl.lib") -Destination (Join-Path $oneVplDevelRoot "lib\native\win-x64\vpl.lib") -Force
+    Copy-Item -Path (Join-Path $oneVplDevelExtract "license.txt") -Destination (Join-Path $oneVplDevelRoot "license.txt") -Force
+    Remove-Item -Recurse -Force $oneVplDevelExtract
+    $oneVplSdk = Find-OneVplSdkRoot $oneVplDevelRoot
+}
+if ($null -eq $oneVplSdk) {
+    throw "oneVPL development package was prepared, but vpl headers/import library were not found."
+}
+
+$oneVplRuntime = $null
+if (-not [string]::IsNullOrWhiteSpace($OneVplRuntimeDir) -and (Test-Path $OneVplRuntimeDir)) {
+    $oneVplRuntime = Find-OneVplRuntimeRoot $OneVplRuntimeDir
+}
+if ($null -eq $oneVplRuntime) {
+    $oneVplRuntime = Find-OneVplRuntimeRoot $oneVplRoot
+}
+if ($null -eq $oneVplRuntime) {
+    $oneVplRuntimePackage = Join-Path $depsRoot "onevpl.runtime.win-x64.$OneVplVersion.zip"
+    $oneVplRuntimeRoot = Join-Path $oneVplRoot "runtime"
+    $oneVplRuntimeExtract = Join-Path $depsRoot "_onevpl_runtime_extract"
+    Write-Host "Downloading oneVPL runtime package: $OneVplRuntimeUrl"
+    Invoke-WebRequest -Uri $OneVplRuntimeUrl -OutFile $oneVplRuntimePackage -UseBasicParsing
+    if (Test-Path $oneVplRuntimeRoot) {
+        Remove-Item -Recurse -Force $oneVplRuntimeRoot
+    }
+    if (Test-Path $oneVplRuntimeExtract) {
+        Remove-Item -Recurse -Force $oneVplRuntimeExtract
+    }
+    New-Item -ItemType Directory -Force -Path $oneVplRuntimeRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $oneVplRuntimeExtract | Out-Null
+    Expand-Archive -Path $oneVplRuntimePackage -DestinationPath $oneVplRuntimeExtract -Force
+    $oneVplRuntimeNativeSource = Join-Path $oneVplRuntimeExtract "runtimes\win-x64\native"
+    $oneVplRuntimeNativeDest = Join-Path $oneVplRuntimeRoot "runtimes\win-x64\native"
+    New-Item -ItemType Directory -Force -Path $oneVplRuntimeNativeDest | Out-Null
+    foreach ($pattern in @("libvpl.dll", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+        Copy-Item -Path (Join-Path $oneVplRuntimeNativeSource $pattern) -Destination $oneVplRuntimeNativeDest -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path (Join-Path $oneVplRuntimeExtract "vpl")) {
+        Copy-Item -Path (Join-Path $oneVplRuntimeExtract "vpl") -Destination $oneVplRuntimeRoot -Recurse -Force
+    }
+    Copy-Item -Path (Join-Path $oneVplRuntimeExtract "license.txt") -Destination (Join-Path $oneVplRuntimeRoot "license.txt") -Force
+    Remove-Item -Recurse -Force $oneVplRuntimeExtract
+    $oneVplRuntime = Find-OneVplRuntimeRoot $oneVplRuntimeRoot
+}
+if ($null -eq $oneVplRuntime) {
+    throw "oneVPL runtime package was prepared, but libvpl.dll was not found."
+}
+
 Set-CiEnv "NATIVE_RECORDER_FFMPEG_ROOT" $ffmpegDir.FullName
 Set-CiEnv "NATIVE_RECORDER_AMF_DIR" $amfDir
 Set-CiEnv "NATIVE_RECORDER_VIDEO_CODEC_SDK_DIR" $sdkDir.FullName
+Set-CiEnv "NATIVE_RECORDER_ONEVPL_SDK_DIR" $oneVplSdk.FullName
+Set-CiEnv "NATIVE_RECORDER_ONEVPL_RUNTIME_DIR" $oneVplRuntime.FullName
 
 $props = @"
 <Project>
@@ -184,6 +332,8 @@ $props = @"
     <NativeRecorderFfmpegRoot>$($ffmpegDir.FullName)</NativeRecorderFfmpegRoot>
     <AmfSdkDir>$amfDir</AmfSdkDir>
     <VideoCodecSdkDir>$($sdkDir.FullName)</VideoCodecSdkDir>
+    <OneVplSdkDir>$($oneVplSdk.FullName)</OneVplSdkDir>
+    <OneVplRuntimeDir>$($oneVplRuntime.FullName)</OneVplRuntimeDir>
   </PropertyGroup>
 </Project>
 "@
@@ -193,4 +343,6 @@ Write-Host "NativeRecorder dependency roots:"
 Write-Host "  FFmpeg:           $($ffmpegDir.FullName)"
 Write-Host "  AMF:              $amfDir"
 Write-Host "  Video Codec SDK:  $($sdkDir.FullName)"
+Write-Host "  oneVPL SDK:       $($oneVplSdk.FullName)"
+Write-Host "  oneVPL runtime:   $($oneVplRuntime.FullName)"
 Write-Host "  Props:            $propsPath"

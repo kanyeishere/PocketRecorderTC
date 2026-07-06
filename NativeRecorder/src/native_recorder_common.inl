@@ -4,10 +4,12 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
 #include <filesystem>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -21,6 +23,9 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+
+#include <vpl/mfxdispatcher.h>
+#include <vpl/mfxvideo.h>
 
 #include "NvEncoder/NvEncoderD3D11.h"
 #include "common/AMFFactory.h"
@@ -50,6 +55,7 @@ namespace
 {
 constexpr UINT kNvidiaVendorId = 0x10DE;
 constexpr UINT kAmdVendorId = 0x1002;
+constexpr UINT kIntelVendorId = 0x8086;
 constexpr DWORD kInvalidStream = 0xFFFFFFFFu;
 constexpr UINT64 kGameWriteKey = 0;
 constexpr UINT64 kEncoderReadKey = 1;
@@ -63,6 +69,9 @@ constexpr int kNativeBackpressureRetrySleepMs = 1;
 constexpr int kAmfInputFullRetryTimeoutMs = kNativeBackpressureTimeoutMs;
 constexpr int kAmfInputFullRetrySleepMs = kNativeBackpressureRetrySleepMs;
 constexpr size_t kAmfNvencStyleOutputDelayFrames = 3;
+constexpr mfxU16 kIntelVplAsyncDepth = 4;
+constexpr mfxU32 kIntelVplSyncWaitMs = 60'000;
+constexpr int kIntelVplDeviceBusySleepMs = 1;
 
 std::mutex g_error_mutex;
 std::string g_last_error;
@@ -203,6 +212,7 @@ std::string hex_uint32(uint32_t value)
 
 bool nvenc_runtime_present();
 bool amf_runtime_present();
+bool onevpl_runtime_present();
 
 std::string memory_mb(size_t bytes)
 {
@@ -285,6 +295,7 @@ std::string native_runtime_report()
         "abi=" + std::to_string(PR_ABI_VERSION) +
         ", nvencRuntime=" + (nvenc_runtime_present() ? "present" : "missing") +
         ", amfRuntime=" + (amf_runtime_present() ? "present" : "missing") +
+        ", oneVplRuntime=" + (onevpl_runtime_present() ? "present" : "missing") +
         ", avformat=" + std::to_string(avformat_version()) +
         ", avcodec=" + std::to_string(avcodec_version()) +
         ", avutil=" + std::to_string(avutil_version()) +
@@ -386,6 +397,16 @@ bool amf_runtime_present()
     return true;
 }
 
+bool onevpl_runtime_present()
+{
+    HMODULE module = LoadLibraryW(L"libvpl.dll");
+    if (module == nullptr)
+        return false;
+
+    FreeLibrary(module);
+    return true;
+}
+
 HRESULT find_adapter_by_vendor(UINT vendor_id, std::string* adapter_name, IDXGIAdapter1** adapter_out = nullptr)
 {
     if (adapter_out != nullptr)
@@ -431,6 +452,11 @@ HRESULT find_nvidia_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_o
 HRESULT find_amd_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_out = nullptr)
 {
     return find_adapter_by_vendor(kAmdVendorId, adapter_name, adapter_out);
+}
+
+HRESULT find_intel_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_out = nullptr)
+{
+    return find_adapter_by_vendor(kIntelVendorId, adapter_name, adapter_out);
 }
 
 HRESULT get_device_adapter_info(
@@ -519,9 +545,19 @@ const wchar_t* amf_codec_id(int32_t codec)
     return codec == PR_CODEC_HEVC ? AMFVideoEncoder_HEVC : AMFVideoEncoderVCE_AVC;
 }
 
+mfxU32 vpl_codec_id(int32_t codec)
+{
+    return codec == PR_CODEC_HEVC ? MFX_CODEC_HEVC : MFX_CODEC_AVC;
+}
+
 std::string amf_result_to_string(AMF_RESULT result)
 {
     return "AMF_RESULT " + std::to_string(static_cast<int>(result));
+}
+
+std::string vpl_status_to_string(mfxStatus status)
+{
+    return "mfxStatus " + std::to_string(static_cast<int>(status));
 }
 
 HRESULT fail_amf(const char* operation, AMF_RESULT result, const std::string& details = {})
@@ -539,9 +575,29 @@ HRESULT fail_amf(const char* operation, AMF_RESULT result, const std::string& de
     return E_FAIL;
 }
 
+HRESULT fail_vpl(const char* operation, mfxStatus status, const std::string& details = {})
+{
+    std::string message = "NativeRecorder ";
+    message += operation != nullptr ? operation : "oneVPL operation";
+    message += " failed: ";
+    message += vpl_status_to_string(status);
+    if (!details.empty())
+    {
+        message += "; ";
+        message += details;
+    }
+    set_last_error(message);
+    return E_FAIL;
+}
+
 bool amf_result_success(AMF_RESULT result)
 {
     return result == AMF_OK;
+}
+
+bool vpl_status_success(mfxStatus status)
+{
+    return status >= MFX_ERR_NONE;
 }
 
 const char* codec_name(int32_t codec)
@@ -585,6 +641,12 @@ int align_to_even(int value)
 {
     int safe_value = std::max(1, value);
     return (safe_value + 1) & ~1;
+}
+
+int align_to_16(int value)
+{
+    int safe_value = std::max(1, value);
+    return (safe_value + 15) & ~15;
 }
 
 int video_output_width(const pr_video_config& video)

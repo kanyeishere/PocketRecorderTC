@@ -36,6 +36,7 @@ internal sealed class FFmpegWriter : IOutputSink
     private int _droppedAudioPacketCount;
     private TimeSpan? _finalVideoDuration;
     private long _managedNativeCopyUntilTicks;
+    private string _processExitCode = "not-started";
 
     // 异步写入队列
     private BoundedMediaQueue<VideoFrame>? _videoQueue;
@@ -59,6 +60,7 @@ internal sealed class FFmpegWriter : IOutputSink
     public bool SupportsAudio => _hasAudio;
     public bool IsVideoBackedUp => _videoQueue != null && _videoQueue.Count >= MaxQueueSize / 2;
     public bool IsVideoUnderPressure => IsVideoBackedUp || IsWritePressureActive();
+    public string FinalVideoDiagnostics => BuildFinalVideoDiagnostics();
     public event Action<IOutputSink, string>? FatalError;
 
     public FFmpegWriter(string ffmpegPath, int videoBitrate, string videoCodec, string preset)
@@ -86,6 +88,7 @@ internal sealed class FFmpegWriter : IOutputSink
         _droppedAudioPacketCount = 0;
         _finalVideoDuration = null;
         _managedNativeCopyUntilTicks = 0;
+        _processExitCode = "not-started";
         _stdinWritePerfStats.Reset();
         _nativeSnapshotPerfStats.Reset();
         _firstVideoFrameWritten.Reset();
@@ -731,8 +734,21 @@ internal sealed class FFmpegWriter : IOutputSink
         }
 
         Plugin.Log.Info("[FFmpeg] Process exited.");
-        string exitCode = _process is { HasExited: true } ? _process.ExitCode.ToString() : "unknown";
-        AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", $"process exited, exitCode={exitCode}");
+        _processExitCode = _process is { HasExited: true } ? _process.ExitCode.ToString() : "unknown";
+        AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", $"process exited, exitCode={_processExitCode}");
+    }
+
+    private string BuildFinalVideoDiagnostics()
+    {
+        return $"input={Volatile.Read(ref _inputFrameCount)}, " +
+               $"output={Volatile.Read(ref _frameCount)}, " +
+               $"tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, " +
+               $"dropped={Volatile.Read(ref _droppedFrameCount)}, " +
+               $"staleDrops={Volatile.Read(ref _staleFrameDropCount)}, " +
+               $"nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, " +
+               $"audioPackets={Volatile.Read(ref _audioPackets)}, " +
+               $"droppedAudio={Volatile.Read(ref _droppedAudioPacketCount)}, " +
+               $"exitCode={_processExitCode}";
     }
 
     private void CloseStandardInput()

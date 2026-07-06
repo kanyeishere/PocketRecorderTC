@@ -60,6 +60,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
     public bool SupportsAudio => _hasAudio;
     public bool IsVideoBackedUp => false;
     public bool IsVideoUnderPressure => false;
+    public string FinalVideoDiagnostics => BuildFinalVideoDiagnostics();
     public event Action<IOutputSink, string>? FatalError;
 
     public void SetOutputPath(string path) => _outputPath = path;
@@ -626,6 +627,17 @@ internal sealed class NativeRecorderWriter : IOutputSink
                $"maxSourceFrameRegressionDistance={Volatile.Read(ref _maxSourceFrameRegressionDistance)}, " +
                $"lastSourceFrameId={Volatile.Read(ref _lastSubmittedSourceFrameId)}, " +
                $"maxSourceFrameId={Volatile.Read(ref _maxSubmittedSourceFrameId)}";
+    }
+
+    private string BuildFinalVideoDiagnostics()
+    {
+        return $"input={Volatile.Read(ref _inputFrameCount)}, " +
+               $"submitted={Volatile.Read(ref _submittedFrameCount)}, " +
+               $"duplicates={Volatile.Read(ref _duplicateFrameCount)}, " +
+               $"{BuildDropSummary()}, " +
+               $"{BuildSourceFrameSummary()}, " +
+               $"audioPackets={Volatile.Read(ref _audioPackets)}, " +
+               $"timing={_timingDiagnostics.BuildSummary()}";
     }
 
     private void LogNativeStatus(string prefix)

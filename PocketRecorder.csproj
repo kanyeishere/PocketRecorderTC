@@ -17,6 +17,8 @@
     <AssemblyName>PocketRecorder</AssemblyName>
     <RootNamespace>Recorder</RootNamespace>
     <NativeRecorderFfmpegRoot Condition="'$(NativeRecorderFfmpegRoot)' == ''">lib\native\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</NativeRecorderFfmpegRoot>
+    <OneVplSdkDir Condition="'$(OneVplSdkDir)' == ''">$(MSBuildProjectDirectory)\lib\native\oneVPL\devel</OneVplSdkDir>
+    <OneVplRuntimeDir Condition="'$(OneVplRuntimeDir)' == ''">$(MSBuildProjectDirectory)\lib\native\oneVPL\runtime\runtimes\win-x64\native</OneVplRuntimeDir>
     <NativeRecorderAutoBuild Condition="'$(NativeRecorderAutoBuild)' == '' and '$(OS)' == 'Windows_NT'">true</NativeRecorderAutoBuild>
     <NativeRecorderAutoBuild Condition="'$(NativeRecorderAutoBuild)' == ''">false</NativeRecorderAutoBuild>
     <NativeRecorderBuildConfiguration Condition="'$(NativeRecorderBuildConfiguration)' == ''">$(Configuration)</NativeRecorderBuildConfiguration>
@@ -41,9 +43,14 @@
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\libgcc*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\libstdc++*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\libwinpthread*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(OneVplRuntimeDir)\libvpl.dll" Condition="Exists('$(OneVplRuntimeDir)\libvpl.dll')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(OneVplRuntimeDir)\msvcp140.dll" Condition="Exists('$(OneVplRuntimeDir)\msvcp140.dll')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(OneVplRuntimeDir)\vcruntime140.dll" Condition="Exists('$(OneVplRuntimeDir)\vcruntime140.dll')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(OneVplRuntimeDir)\vcruntime140_1.dll" Condition="Exists('$(OneVplRuntimeDir)\vcruntime140_1.dll')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\LICENSE*" Condition="Exists('$(NativeRecorderFfmpegRoot)')" Link="licenses\FFmpeg\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\COPYING*" Condition="Exists('$(NativeRecorderFfmpegRoot)')" Link="licenses\FFmpeg\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\BUILDINFO.txt" Condition="Exists('$(NativeRecorderFfmpegRoot)\BUILDINFO.txt')" Link="licenses\FFmpeg\BUILDINFO.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(OneVplRuntimeDir)\..\..\..\vpl\license.txt" Condition="Exists('$(OneVplRuntimeDir)\..\..\..\vpl\license.txt')" Link="licenses\oneVPL\license.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
@@ -65,7 +72,7 @@
           Inputs="@(NativeRecorderBuildInput)"
           Outputs="$(NativeRecorderOutputDll)">
     <Message Text="Building NativeRecorder: $(NativeRecorderBuildConfiguration)|$(NativeRecorderBuildPlatform)" Importance="high" />
-    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\Build-NativeRecorder.ps1&quot; -ProjectPath &quot;$(NativeRecorderProject)&quot; -Configuration &quot;$(NativeRecorderBuildConfiguration)&quot; -Platform &quot;$(NativeRecorderBuildPlatform)&quot; -FfmpegRoot &quot;$(FfmpegRoot)&quot; -AmfSdkDir &quot;$(AmfSdkDir)&quot; -VideoCodecSdkDir &quot;$(VideoCodecSdkDir)&quot;" />
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\Build-NativeRecorder.ps1&quot; -ProjectPath &quot;$(NativeRecorderProject)&quot; -Configuration &quot;$(NativeRecorderBuildConfiguration)&quot; -Platform &quot;$(NativeRecorderBuildPlatform)&quot; -FfmpegRoot &quot;$(FfmpegRoot)&quot; -AmfSdkDir &quot;$(AmfSdkDir)&quot; -VideoCodecSdkDir &quot;$(VideoCodecSdkDir)&quot; -OneVplSdkDir &quot;$(OneVplSdkDir)&quot;" />
   </Target>
 
 </Project>

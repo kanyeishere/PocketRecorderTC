@@ -45,6 +45,8 @@
     <FfmpegRoot Condition="'$(FfmpegRoot)' == ''">$(ProjectDir)..\lib\native\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</FfmpegRoot>
     <AmfSdkDir Condition="'$(AmfSdkDir)' == ''">$(ProjectDir)..\lib\native\AMF\amf</AmfSdkDir>
     <VideoCodecSdkDir Condition="'$(VideoCodecSdkDir)' == ''">$(ProjectDir)..\lib\native\VideoCodecSDK\Video_Codec_SDK_13.1.15</VideoCodecSdkDir>
+    <OneVplSdkDir Condition="'$(OneVplSdkDir)' == ''">$(ProjectDir)..\lib\native\oneVPL\devel</OneVplSdkDir>
+    <OneVplRuntimeDir Condition="'$(OneVplRuntimeDir)' == ''">$(ProjectDir)..\lib\native\oneVPL\runtime\runtimes\win-x64\native</OneVplRuntimeDir>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
@@ -53,14 +55,14 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(VideoCodecSdkDir)\Interface;$(VideoCodecSdkDir)\Samples\NvCodec;$(VideoCodecSdkDir)\Samples\Utils;$(FfmpegRoot)\include;$(AmfSdkDir)\public;$(AmfSdkDir)\public\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(VideoCodecSdkDir)\Interface;$(VideoCodecSdkDir)\Samples\NvCodec;$(VideoCodecSdkDir)\Samples\Utils;$(FfmpegRoot)\include;$(AmfSdkDir)\public;$(AmfSdkDir)\public\include;$(OneVplSdkDir)\lib\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_WINDOWS;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalLibraryDirectories>$(VideoCodecSdkDir)\Lib\win\x64;$(FfmpegRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;ole32.lib;nvencodeapi.lib;delayimp.lib;avformat.lib;avcodec.lib;avutil.lib;swresample.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <DelayLoadDLLs>nvEncodeAPI64.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+      <AdditionalLibraryDirectories>$(VideoCodecSdkDir)\Lib\win\x64;$(FfmpegRoot)\lib;$(OneVplSdkDir)\lib\native\win-x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;ole32.lib;nvencodeapi.lib;vpl.lib;delayimp.lib;avformat.lib;avcodec.lib;avutil.lib;swresample.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>nvEncodeAPI64.dll;libvpl.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
 
@@ -77,6 +79,11 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
+    <ClInclude Include="src\native_recorder_backend_shared.inl" />
+    <ClInclude Include="src\native_recorder_backend_qsv.inl" />
+    <ClInclude Include="src\native_recorder_backend_nvenc.inl" />
+    <ClInclude Include="src\native_recorder_backend_amf.inl" />
+    <ClInclude Include="src\native_recorder_backend_factory.inl" />
     <ClInclude Include="src\native_recorder_backends.inl" />
     <ClInclude Include="src\native_recorder_common.inl" />
     <ClInclude Include="src\native_recorder_converter.inl" />

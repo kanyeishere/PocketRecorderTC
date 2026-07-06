@@ -1,5 +1,6 @@
 using Recorder.Capture;
 using Recorder.Diagnostics;
+using Recorder.Telemetry;
 using System;
 using System.Diagnostics;
 using System.Threading;
@@ -69,9 +70,16 @@ internal sealed class RecordingFinalizer
 
         job.MarkFinalized();
 
+        string finalFrameDiagnostics = job.Writer?.FinalVideoDiagnostics ?? "writer=null";
+        bool saved = job.Writer != null;
+
         _log.Info($"[Record] Saved: {job.OutputPath}, finalize={finalizeSw.ElapsedMilliseconds}ms");
-        AmdRecordingDiagnosticLog.FinishSession($"saved=true, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}");
-        RecordingDiagnosticLog.FinishSession($"saved=true, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}");
+        AmdRecordingDiagnosticLog.FinishSession($"saved={saved}, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}");
+        RecordingDiagnosticLog.FinishSession(
+            $"saved={saved}, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}",
+            finalFrameDiagnostics);
+        if (job.TelemetryContext != null)
+            PocketBackendClient.QueueRecordingFinished(job.TelemetryContext, job.FinalDuration, saved, finalFrameDiagnostics);
         if (job.OutputPath != null)
         {
             try
@@ -104,5 +112,6 @@ internal sealed record RecordingFinalizationJob(
     string? OutputPath,
     Action<RecordingFinishedEventArgs>? FinishedCallback,
     TimeSpan FinalDuration,
+    RecordingTelemetryContext? TelemetryContext,
     Stopwatch Stopwatch,
     Action MarkFinalized);

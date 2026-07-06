@@ -26,6 +26,8 @@ internal static class RecordingDiagnosticLog
     private static string? _logPath;
     private static int? _pendingSessionId;
     private static string[] _pendingHeaderLines = [];
+    private static RecordingTelemetryContext? _context;
+    private static string _finalFrameDiagnostics = string.Empty;
     private static bool _cleanupAttempted;
     private static int _writeFailureLogged;
 
@@ -67,6 +69,8 @@ internal static class RecordingDiagnosticLog
                 _logPath = null;
                 _pendingSessionId = sessionId;
                 _pendingHeaderLines = headerLines.ToArray();
+                _context = null;
+                _finalFrameDiagnostics = string.Empty;
                 PendingLines.Clear();
                 SessionLines.Clear();
             }
@@ -158,26 +162,60 @@ internal static class RecordingDiagnosticLog
         }
     }
 
-    public static void FinishSession(string message)
+    public static void UpdateRecordingContext(RecordingTelemetryContext context)
+    {
+        try
+        {
+            lock (Sync)
+            {
+                _context = context;
+                string line =
+                    $"Record | gpuVendor={Normalize(context.GpuVendor)}, gpuAdapter={Normalize(context.GpuAdapter)}, " +
+                    $"backendMode={Normalize(context.BackendMode)}, backendLabel={Normalize(context.BackendLabel)}, " +
+                    $"dalamudApiLevel={context.DalamudApiLevel}";
+                if (!string.IsNullOrWhiteSpace(_logPath))
+                    AppendLineNoLock(line);
+                else
+                    AddPendingLineNoLock(line);
+            }
+        }
+        catch (Exception ex)
+        {
+            ReportWriteFailure(ex);
+        }
+    }
+
+    public static void FinishSession(string message, string? finalFrameDiagnostics = null)
     {
         string? uploadFileName = null;
         string? uploadText = null;
+        RecordingTelemetryContext? uploadContext = null;
+        string uploadFinalFrameDiagnostics = string.Empty;
 
         try
         {
             lock (Sync)
             {
+                if (!string.IsNullOrWhiteSpace(finalFrameDiagnostics))
+                    _finalFrameDiagnostics = Normalize(finalFrameDiagnostics);
+
                 if (!string.IsNullOrWhiteSpace(_logPath))
                 {
+                    if (!string.IsNullOrWhiteSpace(_finalFrameDiagnostics))
+                        AppendLineNoLock($"FinalFrames | {_finalFrameDiagnostics}");
                     AppendLineNoLock($"Session | {Normalize(message)}");
                     AppendLineNoLock("=== Native recorder diagnostics ended ===");
                     uploadFileName = Path.GetFileName(_logPath);
                     uploadText = BuildUploadTextNoLock();
+                    uploadContext = _context;
+                    uploadFinalFrameDiagnostics = _finalFrameDiagnostics;
                 }
 
                 _logPath = null;
                 _pendingSessionId = null;
                 _pendingHeaderLines = [];
+                _context = null;
+                _finalFrameDiagnostics = string.Empty;
                 PendingLines.Clear();
                 SessionLines.Clear();
             }
@@ -187,7 +225,7 @@ internal static class RecordingDiagnosticLog
             ReportWriteFailure(ex);
         }
 
-        QueueDiagnosticsUpload(uploadFileName, uploadText);
+        QueueDiagnosticsUpload(uploadFileName, uploadText, uploadContext, uploadFinalFrameDiagnostics);
     }
 
     private static void StartLogNoLock(int? sessionId, string reason)
@@ -261,7 +299,11 @@ internal static class RecordingDiagnosticLog
             text[^tailLength..]);
     }
 
-    private static void QueueDiagnosticsUpload(string? fileName, string? text)
+    private static void QueueDiagnosticsUpload(
+        string? fileName,
+        string? text,
+        RecordingTelemetryContext? context,
+        string finalFrameDiagnostics)
     {
         if (string.IsNullOrWhiteSpace(fileName) || string.IsNullOrWhiteSpace(text))
             return;
@@ -270,7 +312,22 @@ internal static class RecordingDiagnosticLog
             "native-recorder",
             fileName,
             text,
-            "PocketRecorder native recorder diagnostics (sanitized).");
+            "PocketRecorder native recorder diagnostics (sanitized).",
+            context == null
+                ? null
+                : new
+                {
+                    context.SessionId,
+                    context.DalamudApiLevel,
+                    context.GpuVendor,
+                    context.GpuAdapter,
+                    context.BackendMode,
+                    context.BackendLabel,
+                    context.RequestedCodec,
+                    context.SelectedBackendReason,
+                    context.NativeProbeReason,
+                    FinalFrameDiagnostics = finalFrameDiagnostics,
+                });
     }
 
     private static string Normalize(string? value)

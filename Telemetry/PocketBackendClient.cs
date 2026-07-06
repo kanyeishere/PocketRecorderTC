@@ -50,7 +50,7 @@ internal static class PocketBackendClient
         });
     }
 
-    public static void QueueDiagnostics(string kind, string fileName, string report, string message)
+    public static void QueueDiagnostics(string kind, string fileName, string report, string message, object? metadata = null)
     {
         Configuration? configuration = _configuration;
         if (!CanSend(configuration))
@@ -69,6 +69,47 @@ internal static class PocketBackendClient
                     fileName,
                     message,
                     report,
+                    metadata,
+                }).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                SuppressTelemetryFailure(ex);
+            }
+        });
+    }
+
+    public static void QueueRecordingFinished(
+        RecordingTelemetryContext context,
+        TimeSpan duration,
+        bool saved,
+        string finalFrameDiagnostics)
+    {
+        Configuration? configuration = _configuration;
+        if (!CanSend(configuration))
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await PostJsonAsync(configuration!, "/api/recordings", new
+                {
+                    app = "recorder",
+                    installId = configuration!.InstallId,
+                    version = GetVersion(),
+                    context.SessionId,
+                    context.DalamudApiLevel,
+                    context.GpuVendor,
+                    context.GpuAdapter,
+                    context.BackendMode,
+                    context.BackendLabel,
+                    context.RequestedCodec,
+                    context.SelectedBackendReason,
+                    context.NativeProbeReason,
+                    saved,
+                    durationMs = (long)Math.Max(0, duration.TotalMilliseconds),
+                    finalFrameDiagnostics,
                 }).ConfigureAwait(false);
             }
             catch (Exception ex)

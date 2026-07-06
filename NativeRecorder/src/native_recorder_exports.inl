@@ -11,52 +11,7 @@ struct pr_recorder_t
 
     HRESULT create_backend(ID3D11Device* source_device, DXGI_FORMAT source_format)
     {
-        if (backend)
-            return S_OK;
-
-        UINT vendor_id = 0;
-        std::string adapter_name;
-        HRESULT info_hr = get_device_adapter_info(source_device, &vendor_id, &adapter_name);
-        if (FAILED(info_hr))
-            return info_hr;
-
-        if (vendor_id == kAmdVendorId)
-        {
-            auto amf_backend = std::make_unique<AmfLibavRecorderBackend>(video, audio, output_path);
-            HRESULT hr = amf_backend->initialize(source_device, source_format);
-            if (SUCCEEDED(hr))
-            {
-                backend = std::move(amf_backend);
-                return S_OK;
-            }
-
-            std::string failure_detail = get_last_error_copy();
-            amf_backend.reset();
-            set_last_error("NativeRecorder AMF + libavformat path unavailable; using FFmpeg fallback. " +
-                failure_detail);
-            return hr;
-        }
-
-        if (vendor_id != kNvidiaVendorId)
-        {
-            set_last_error("NativeRecorder source game device is not on an NVIDIA or AMD adapter; using FFmpeg fallback. adapter=" +
-                adapter_name);
-            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        }
-
-        auto nvenc_backend = std::make_unique<NvencLibavRecorderBackend>(video, audio, output_path);
-        HRESULT hr = nvenc_backend->initialize(source_device, source_format);
-        if (SUCCEEDED(hr))
-        {
-            backend = std::move(nvenc_backend);
-            return S_OK;
-        }
-
-        std::string failure_detail = get_last_error_copy();
-        nvenc_backend.reset();
-        set_last_error("NativeRecorder NvEncoderD3D11 + libavformat path unavailable; using FFmpeg fallback. " +
-            failure_detail);
-        return hr;
+        return create_native_recorder_backend(source_device, source_format, video, audio, output_path, backend);
     }
 
     HRESULT submit_shared_texture(ID3D11Device* source_device, HANDLE shared_handle, DXGI_FORMAT source_format, int64_t timestamp_hns)
@@ -172,24 +127,44 @@ PR_API int32_t PR_CALL pr_probe(pr_probe_info* info)
         }
 
         hr = find_amd_adapter(&adapter_name);
-        if (FAILED(hr))
+        if (SUCCEEDED(hr))
         {
-            copy_text(info->message, sizeof(info->message), "No NVIDIA or AMD DXGI adapter was found.");
+            if (!amf_runtime_present())
+            {
+                copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
+                copy_text(info->message, sizeof(info->message), "AMD adapter was found, but amfrt64.dll was not found.");
+                info->is_supported_adapter = 0;
+                set_last_error(info->message);
+                return PR_OK;
+            }
+
+            copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
+            copy_text(info->message, sizeof(info->message), "NativeRecorder AMD D3D11 texture path is available (AMF + libavformat preferred, FFmpeg fallback on runtime failure).");
+            info->is_supported_adapter = 1;
+            info->supports_d3d11_texture_input = 1;
             set_last_error(info->message);
             return PR_OK;
         }
 
-        if (!amf_runtime_present())
+        hr = find_intel_adapter(&adapter_name);
+        if (FAILED(hr))
+        {
+            copy_text(info->message, sizeof(info->message), "No NVIDIA, AMD, or Intel DXGI adapter was found.");
+            set_last_error(info->message);
+            return PR_OK;
+        }
+
+        if (!onevpl_runtime_present())
         {
             copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-            copy_text(info->message, sizeof(info->message), "AMD adapter was found, but amfrt64.dll was not found.");
+            copy_text(info->message, sizeof(info->message), "Intel adapter was found, but libvpl.dll was not found.");
             info->is_supported_adapter = 0;
             set_last_error(info->message);
             return PR_OK;
         }
 
         copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-        copy_text(info->message, sizeof(info->message), "NativeRecorder AMD D3D11 texture path is available (AMF + libavformat preferred, FFmpeg fallback on runtime failure).");
+        copy_text(info->message, sizeof(info->message), "NativeRecorder Intel D3D11 texture path is available (oneVPL QSV + libavformat preferred, FFmpeg fallback on runtime failure).");
         info->is_supported_adapter = 1;
         info->supports_d3d11_texture_input = 1;
         set_last_error(info->message);

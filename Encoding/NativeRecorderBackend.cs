@@ -150,6 +150,28 @@ internal static unsafe class NativeRecorderBackend
         }
     }
 
+    public static string GetDiagnosticsReport()
+    {
+        lock (Sync)
+        {
+            if (!EnsureLoadedNoLock())
+                return BuildManagedDiagnostics(_loadError ?? "NativeRecorder.dll was not found.");
+
+            try
+            {
+                int abi = _getAbiVersion!.Invoke();
+                if (abi != ExpectedAbiVersion)
+                    return BuildManagedDiagnostics($"NativeRecorder ABI mismatch: expected {ExpectedAbiVersion}, got {abi}.");
+
+                return GetNativeDiagnosticsReportNoLock();
+            }
+            catch (Exception ex)
+            {
+                return BuildManagedDiagnostics($"NativeRecorder diagnostics exception: {ex.Message}");
+            }
+        }
+    }
+
     public static bool SubmitD3D11SharedTexture(
         IntPtr recorder,
         IntPtr d3d11Device,
@@ -242,7 +264,7 @@ internal static unsafe class NativeRecorderBackend
             _loaded = true;
             _loadError = null;
             TryGetExport("pr_get_diagnostics_report", out _getDiagnosticsReport);
-            Plugin.Log?.Info($"[NativeRecorder] Loaded native DLL: {candidate} (ABI {ExpectedAbiVersion}, NvEncoderD3D11/libavformat preferred, AMF/libavformat AMD path available)");
+            Plugin.Log?.Info($"[NativeRecorder] Loaded native DLL: {candidate} (ABI {ExpectedAbiVersion}, NvEncoderD3D11/libavformat preferred, AMF/libavformat AMD path available, oneVPL/libavformat Intel path available)");
             return true;
         }
 
