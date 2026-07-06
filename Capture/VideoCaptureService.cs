@@ -65,6 +65,10 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
 
     // Present Hook
     private Hook<PresentDelegate>? _presentHook;
+    private long _gameSwapChainAddress;
+    private long _lastGameSwapChainRefreshTicks;
+    private int _nonGameSwapChainSkipCount;
+    private long _lastNonGameSwapChainLogTicks;
 
     // 状态
     private volatile bool _capturing;
@@ -95,6 +99,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private const int Nv12SlotPendingRelease = 3;
     private const uint D3D11ResourceMiscShared = 0x2;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
+    private const int GameSwapChainRefreshIntervalMs = 250;
     private static readonly Guid IID_ID3D11Texture2D = new(0x6F15AAF2, 0xD208, 0x4E89, 0x9A, 0xB4, 0x48, 0x95, 0x35, 0xD3, 0x4F, 0x9C);
     private static readonly Guid IID_ID3D11Device = new(0xdb6f6ddb, 0xac77, 0x4e88, 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40);
     public int CurrentWidth { get; private set; }
@@ -139,6 +144,10 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _nativeSharedFallbackLogged = false;
         _lockedOutputPixelFormat = null;
         _presentDetourDepth = 0;
+        Interlocked.Exchange(ref _gameSwapChainAddress, 0);
+        _nonGameSwapChainSkipCount = 0;
+        _lastNonGameSwapChainLogTicks = 0;
+        _lastGameSwapChainRefreshTicks = 0;
         _stopStarted = 0;
         _nv12StopCleanupRequested = 0;
         Array.Clear(_nv12ReadbackSlotStates);
@@ -185,7 +194,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         }
         _sw.Stop();
         _nv12PerfStats.FlushIfAny();
-        string stopSummary = $"Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, nativeBusySkips={_nativeSharedBusySkipCount}, nv12BusySkips={_nv12BusySkipCount}, errors={_errorCount}, method={_captureMethod}, {_framePacer.BuildSummary()}";
+        string stopSummary = $"Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, nonGameSwapChainSkips={_nonGameSwapChainSkipCount}, nativeBusySkips={_nativeSharedBusySkipCount}, nv12BusySkips={_nv12BusySkipCount}, errors={_errorCount}, method={_captureMethod}, {_framePacer.BuildSummary()}";
         Plugin.Log!.Info($"[Video] {stopSummary}");
         RecordingDiagnosticLog.WriteIfEnabled("Video", stopSummary);
         AmdRecordingDiagnosticLog.Write("Video", stopSummary);
@@ -214,31 +223,15 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         {
             if (_presentHook == null)
             {
-                Device* gameDevice = Device.Instance();
-                if (gameDevice == null)
-                {
-                    Plugin.Log!.Warning("[Video] Device.Instance() returned null, cannot hook Present.");
+                if (!TryGetGameSwapChain("install Present hook", out IntPtr gameSwapChainPtr))
                     return false;
-                }
 
-                SwapChain* gameSwapChain = gameDevice->SwapChain;
-                if (gameSwapChain == null)
-                {
-                    Plugin.Log!.Warning("[Video] Device->SwapChain is null, cannot hook Present.");
-                    return false;
-                }
-
-                IDXGISwapChain* dxgiSwapChain = (IDXGISwapChain*)gameSwapChain->DXGISwapChain;
-                if (dxgiSwapChain == null)
-                {
-                    Plugin.Log!.Warning("[Video] SwapChain->DXGISwapChain is null, cannot hook Present.");
-                    return false;
-                }
-
+                var dxgiSwapChain = (IDXGISwapChain*)gameSwapChainPtr;
                 void** vtable = *(void***)dxgiSwapChain;
                 void* presentAddr = vtable[8]; // Present = vtable index 8
 
-                Plugin.Log!.Info($"[Video] Game IDXGISwapChain=0x{(long)dxgiSwapChain:X}, Present addr=0x{(long)presentAddr:X}");
+                Interlocked.Exchange(ref _gameSwapChainAddress, gameSwapChainPtr.ToInt64());
+                Plugin.Log!.Info($"[Video] Game IDXGISwapChain=0x{gameSwapChainPtr.ToInt64():X}, Present addr=0x{(long)presentAddr:X}");
 
                 _presentHook = _gameInterop.HookFromAddress<PresentDelegate>(
                     presentAddr,
@@ -315,6 +308,9 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
 
     private void CaptureBeforePresent(IntPtr swapChainPtr)
     {
+        if (!ShouldCaptureSwapChain(swapChainPtr))
+            return;
+
         long now = _sw.ElapsedTicks;
         if (!ShouldCaptureThisPresent(now)) return;
         if (ShouldSkipCaptureForBackpressure()) return;
@@ -372,6 +368,92 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         {
             ctx->Release();
         }
+    }
+
+    private bool ShouldCaptureSwapChain(IntPtr swapChainPtr)
+    {
+        long currentAddress = swapChainPtr.ToInt64();
+        long gameAddress = Volatile.Read(ref _gameSwapChainAddress);
+        if (currentAddress == gameAddress)
+            return true;
+
+        if (ShouldRefreshGameSwapChain() &&
+            TryGetGameSwapChain("Present swapchain mismatch", out IntPtr refreshedSwapChainPtr))
+        {
+            long refreshedAddress = refreshedSwapChainPtr.ToInt64();
+            long previousAddress = Interlocked.Exchange(ref _gameSwapChainAddress, refreshedAddress);
+            if (previousAddress != refreshedAddress)
+            {
+                Plugin.Log!.Info($"[Video] Game IDXGISwapChain refreshed: 0x{previousAddress:X} -> 0x{refreshedAddress:X}");
+                gameAddress = refreshedAddress;
+            }
+            else
+            {
+                gameAddress = previousAddress;
+            }
+
+            if (currentAddress == gameAddress)
+                return true;
+        }
+
+        LogSkippedNonGameSwapChain(currentAddress, Volatile.Read(ref _gameSwapChainAddress));
+        return false;
+    }
+
+    private bool TryGetGameSwapChain(string reason, out IntPtr swapChainPtr)
+    {
+        swapChainPtr = IntPtr.Zero;
+
+        Device* gameDevice = Device.Instance();
+        if (gameDevice == null)
+        {
+            Plugin.Log!.Warning($"[Video] Device.Instance() returned null, cannot resolve game swapchain. reason={reason}");
+            return false;
+        }
+
+        SwapChain* gameSwapChain = gameDevice->SwapChain;
+        if (gameSwapChain == null)
+        {
+            Plugin.Log!.Warning($"[Video] Device->SwapChain is null, cannot resolve game swapchain. reason={reason}");
+            return false;
+        }
+
+        IDXGISwapChain* dxgiSwapChain = (IDXGISwapChain*)gameSwapChain->DXGISwapChain;
+        if (dxgiSwapChain == null)
+        {
+            Plugin.Log!.Warning($"[Video] SwapChain->DXGISwapChain is null, cannot resolve game swapchain. reason={reason}");
+            return false;
+        }
+
+        swapChainPtr = (IntPtr)dxgiSwapChain;
+        return true;
+    }
+
+    private bool ShouldRefreshGameSwapChain()
+    {
+        long now = Stopwatch.GetTimestamp();
+        long last = Volatile.Read(ref _lastGameSwapChainRefreshTicks);
+        long intervalTicks = Stopwatch.Frequency * GameSwapChainRefreshIntervalMs / 1_000;
+        if (last != 0 && now - last < intervalTicks)
+            return false;
+
+        return Interlocked.CompareExchange(ref _lastGameSwapChainRefreshTicks, now, last) == last;
+    }
+
+    private void LogSkippedNonGameSwapChain(long currentAddress, long gameAddress)
+    {
+        int skipped = Interlocked.Increment(ref _nonGameSwapChainSkipCount);
+        long now = Stopwatch.GetTimestamp();
+        long last = Volatile.Read(ref _lastNonGameSwapChainLogTicks);
+        bool shouldLog = skipped <= 3 ||
+                         now - last >= Stopwatch.Frequency;
+        if (!shouldLog ||
+            Interlocked.CompareExchange(ref _lastNonGameSwapChainLogTicks, now, last) != last)
+        {
+            return;
+        }
+
+        Plugin.Log!.Info($"[Video] Ignored non-game swapchain Present. current=0x{currentAddress:X}, game=0x{gameAddress:X}, ignored={skipped}");
     }
 
     private bool ShouldCaptureThisPresent(long now)
