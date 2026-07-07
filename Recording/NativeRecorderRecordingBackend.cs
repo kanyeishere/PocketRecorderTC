@@ -48,10 +48,10 @@ internal sealed class NativeRecorderRecordingBackend : IRecordingBackend
 
     public RecordingBackendProbeResult Probe(RecordingRequest request)
     {
-        if (request.ForceFFmpegFallbackForTesting)
+        if (request.ForceFFmpegRecording)
         {
-            RecordingDiagnosticLog.WriteNativeEvent(DisplayName, "probe skipped: FFmpeg fallback forced for local testing");
-            return RecordingBackendProbeResult.Unavailable("FFmpeg fallback forced for local testing");
+            RecordingDiagnosticLog.WriteNativeEvent(DisplayName, "probe skipped: FFmpeg recording selected");
+            return RecordingBackendProbeResult.Unavailable("FFmpeg recording selected");
         }
 
         if (!request.UseHardwareEncoder)

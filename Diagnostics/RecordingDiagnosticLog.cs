@@ -41,7 +41,7 @@ internal static class RecordingDiagnosticLog
         AudioCaptureMode audioCaptureMode,
         bool includeOverlay,
         VideoOutputScaleMode videoOutputScaleMode,
-        bool forceFfmpegFallback,
+        bool forceFfmpegRecording,
         bool preferNativeRecorder,
         string? gameGraphicsDevice = null,
         string? initialBackendReason = null,
@@ -54,7 +54,7 @@ internal static class RecordingDiagnosticLog
             $"runtime={RuntimeInformation.FrameworkDescription}, os={RuntimeInformation.OSDescription}, processArch={RuntimeInformation.ProcessArchitecture}",
             $"requestedCodec={requestedCodec}, preset={encoderPreset}, bitrate={videoBitrate}, fps={targetFps}",
             $"hardware={useHardwareEncoder}, audio={audioCaptureMode}, preferNative={preferNativeRecorder}",
-            $"captureConfig=includeOverlay={includeOverlay}, outputScale={videoOutputScaleMode}, forceFFmpegFallback={forceFfmpegFallback}",
+            $"captureConfig=includeOverlay={includeOverlay}, outputScale={videoOutputScaleMode}, forceFFmpegRecording={forceFfmpegRecording}",
         };
 
         if (!string.IsNullOrWhiteSpace(gameGraphicsDevice))

@@ -8,7 +8,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 20;
+    public int Version { get; set; } = 21;
 
     /// <summary>匿名安装标识，仅用于 Pocket Backend 独立用户统计。</summary>
     public string InstallId { get; set; } = Guid.NewGuid().ToString("N");
@@ -40,6 +40,9 @@ public class Configuration : IPluginConfiguration
     /// <summary>是否优先使用硬件编码器。</summary>
     public bool UseHardwareEncoder { get; set; } = true;
 
+    /// <summary>录制后端选择。默认使用显卡原生录制，不可用时回退 FFmpeg。</summary>
+    public RecordingBackendMode RecordingBackendMode { get; set; } = RecordingBackendMode.Native;
+
     /// <summary>历史配置项；NativeRecorder 现在固定优先启用，不再暴露 UI 开关。</summary>
     public bool EnableNativeRecorderExperimental { get; set; } = true;
 
@@ -57,6 +60,9 @@ public class Configuration : IPluginConfiguration
 #endif
         }
     }
+
+    internal bool ForceFFmpegRecording
+        => RecordingBackendMode == RecordingBackendMode.FFmpeg || EffectiveForceFFmpegFallbackForTesting;
 
     /// <summary>FFmpeg 可执行文件路径，空则从 PATH 查找。</summary>
     public string FFmpegPath { get; set; } = string.Empty;

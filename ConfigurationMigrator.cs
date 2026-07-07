@@ -161,7 +161,22 @@ internal static class ConfigurationMigrator
             SaveVersion(config, pi, 20);
         }
 
+        if (config.Version < 21)
+        {
+            config.RecordingBackendMode = config.ForceFFmpegFallbackForTesting
+                ? RecordingBackendMode.FFmpeg
+                : RecordingBackendMode.Native;
+            config.ForceFFmpegFallbackForTesting = false;
+            SaveVersion(config, pi, 21);
+        }
+
         config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
+
+        if (!Enum.IsDefined(typeof(RecordingBackendMode), config.RecordingBackendMode))
+        {
+            config.RecordingBackendMode = RecordingBackendMode.Native;
+            config.Save(pi);
+        }
 
         if (string.IsNullOrWhiteSpace(config.InstallId))
         {

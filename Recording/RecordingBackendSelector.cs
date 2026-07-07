@@ -113,7 +113,7 @@ internal sealed class RecordingBackendSelector
 
     private IEnumerable<IRecordingBackend> EnumeratePreferredBackends(RecordingRequest request)
     {
-        if (request.ForceFFmpegFallbackForTesting)
+        if (request.ForceFFmpegRecording)
         {
             yield return _ffmpeg;
             yield break;

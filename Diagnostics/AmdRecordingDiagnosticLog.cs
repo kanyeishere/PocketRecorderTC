@@ -18,7 +18,7 @@ internal static class AmdRecordingDiagnosticLog
         AudioCaptureMode audioCaptureMode,
         bool includeOverlay,
         VideoOutputScaleMode videoOutputScaleMode,
-        bool forceFfmpegFallback,
+        bool forceFfmpegRecording,
         bool preferNativeRecorder,
         string selectedBackendReason,
         string? nativeRecorderProbeReason)

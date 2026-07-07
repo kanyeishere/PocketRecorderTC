@@ -171,6 +171,27 @@ internal sealed class ConfigWindow : Window
     {
         ImGui.Text("视频设置");
 
+        string[] recordingBackends = { "显卡原生录制", "FFmpeg 录制" };
+        RecordingBackendMode[] recordingBackendValues =
+        [
+            RecordingBackendMode.Native,
+            RecordingBackendMode.FFmpeg,
+        ];
+        int recordingBackendIdx = Array.IndexOf(recordingBackendValues, config.RecordingBackendMode);
+        if (recordingBackendIdx < 0)
+            recordingBackendIdx = 0;
+
+        if (ImGui.Combo("录制方式", ref recordingBackendIdx, recordingBackends, recordingBackends.Length))
+        {
+            config.RecordingBackendMode = recordingBackendValues[recordingBackendIdx];
+            config.ForceFFmpegFallbackForTesting = false;
+            SaveConfig(config);
+        }
+
+        ImGui.TextDisabled(config.RecordingBackendMode == RecordingBackendMode.Native
+            ? "优先使用显卡原生录制；不可用时自动回退 FFmpeg。"
+            : "固定使用 FFmpeg 录制。");
+
         int bitrate = config.VideoBitrate / 1_000_000;
         if (ImGui.SliderInt("码率 (Mbps)", ref bitrate, 1, 100))
         {
@@ -370,8 +391,8 @@ internal sealed class ConfigWindow : Window
 
     private static string GetEncodingModeText(Configuration config)
     {
-        if (config.EffectiveForceFFmpegFallbackForTesting)
-            return "本地测试 FFmpeg fallback";
+        if (config.ForceFFmpegRecording)
+            return config.EffectiveForceFFmpegFallbackForTesting ? "本地测试 FFmpeg 录制" : "FFmpeg 录制";
 
         if (config.VideoCodec != "auto")
             return $"高级 ({config.VideoCodec})";
