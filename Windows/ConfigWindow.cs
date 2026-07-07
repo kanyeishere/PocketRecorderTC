@@ -417,6 +417,10 @@ internal sealed class ConfigWindow : Window
             }
         }
 
+        ImGui.SameLine();
+        if (ImGui.Button("录像列表"))
+            _plugin.RecordingListWindow.IsOpen = true;
+
         int retentionDays = config.RecordingRetentionDays;
         ImGui.InputInt("录像保存期限 (天，0=永久)", ref retentionDays);
         if (ImGui.IsItemDeactivatedAfterEdit())

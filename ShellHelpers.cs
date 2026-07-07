@@ -17,4 +17,35 @@ internal static class ShellHelpers
             Verb = "open",
         });
     }
+
+    public static void OpenFile(string filePath)
+    {
+        if (!File.Exists(filePath))
+            throw new FileNotFoundException("File does not exist.", filePath);
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = filePath,
+            UseShellExecute = true,
+            Verb = "open",
+        });
+    }
+
+    public static void ShowFileInExplorer(string filePath)
+    {
+        if (!File.Exists(filePath))
+        {
+            string? directory = Path.GetDirectoryName(filePath);
+            if (!string.IsNullOrWhiteSpace(directory))
+                OpenDirectory(directory);
+            return;
+        }
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "explorer.exe",
+            Arguments = $"/select,\"{filePath}\"",
+            UseShellExecute = true,
+        });
+    }
 }

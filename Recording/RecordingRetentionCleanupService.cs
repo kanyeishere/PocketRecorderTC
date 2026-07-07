@@ -11,16 +11,17 @@ internal sealed class RecordingRetentionCleanupService : IDisposable
 
     private static readonly TimeSpan InitialDelay = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan Period = TimeSpan.FromHours(12);
+    private static readonly string OptionalStarPrefix = $"{Regex.Escape(RecordingFileNames.StarPrefix)}?";
     private static readonly Regex ManualRecordingNameRegex = new(
-        @"^FFXIV_\d{8}_\d{6}(?:-\d+)?\.mp4$",
+        @$"^{OptionalStarPrefix}FFXIV_\d{{8}}_\d{{6}}(?:-\d+)?\.mp4$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant,
         TimeSpan.FromMilliseconds(250));
     private static readonly Regex DutyRecordingNameRegex = new(
-        @"^.+-\d{8}-\d{6}-\d{6}(?:-\d+)?\.mp4$",
+        @$"^{OptionalStarPrefix}.+-\d{{8}}-\d{{6}}-\d{{6}}(?:-\d+)?\.mp4$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant,
         TimeSpan.FromMilliseconds(250));
     private static readonly Regex TemporaryDutyRecordingNameRegex = new(
-        @"^.+-\d{8}-\d{6}-recording(?:-\d+)?\.mp4$",
+        @$"^{OptionalStarPrefix}.+-\d{{8}}-\d{{6}}-recording(?:-\d+)?\.mp4$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant,
         TimeSpan.FromMilliseconds(250));
 

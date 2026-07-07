@@ -37,6 +37,7 @@ internal sealed class RecordingService : IDisposable
     private int _frameCount;
     private string? _currentFilePath;
     private string _currentBackend = string.Empty;
+    private bool _currentRecordingStarred;
     private RecordingTelemetryContext? _telemetryContext;
     private Action<RecordingFinishedEventArgs>? _finishedCallback;
 
@@ -76,6 +77,14 @@ internal sealed class RecordingService : IDisposable
     public int FrameCount => Volatile.Read(ref _frameCount);
     public string? CurrentFilePath => _currentFilePath;
     public string CurrentBackend => _currentBackend;
+    public bool CurrentRecordingStarred
+    {
+        get
+        {
+            lock (_sync)
+                return _currentRecordingStarred;
+        }
+    }
 
     public event Action<bool>? RecordingStateChanged;
 
@@ -96,6 +105,18 @@ internal sealed class RecordingService : IDisposable
             StopRecording();
         else if (phase == RecordingPhase.Idle)
             StartRecording();
+    }
+
+    public bool ToggleCurrentRecordingStar()
+    {
+        lock (_sync)
+        {
+            if (_lifecycle is not (RecordingLifecycle.Preparing or RecordingLifecycle.StartingWriter or RecordingLifecycle.Recording))
+                return _currentRecordingStarred;
+
+            _currentRecordingStarred = !_currentRecordingStarred;
+            return _currentRecordingStarred;
+        }
     }
 
     public bool StartRecording()
@@ -189,6 +210,7 @@ internal sealed class RecordingService : IDisposable
             _videoCapture = null;
             _lifecycle = RecordingLifecycle.Preparing;
             _finishedCallback = finishedCallback;
+            _currentRecordingStarred = false;
             _frameCount = 0;
             _currentBackend = backendPlan.PreparingText;
             _videoWidth = 0;
@@ -829,6 +851,7 @@ internal sealed class RecordingService : IDisposable
         string? outputPath;
         RecordingTelemetryContext? telemetryContext;
         Action<RecordingFinishedEventArgs>? finishedCallback;
+        bool starred;
         TimeSpan finalDuration;
         Stopwatch stopSw = Stopwatch.StartNew();
 
@@ -844,6 +867,7 @@ internal sealed class RecordingService : IDisposable
             audioCapture = _audioCapture;
             writer = _writer;
             telemetryContext = _telemetryContext;
+            starred = _currentRecordingStarred;
 
             _sessionId++;
             _request = null;
@@ -852,6 +876,7 @@ internal sealed class RecordingService : IDisposable
             _audioCapture = null;
             _writer = null;
             _telemetryContext = null;
+            _currentRecordingStarred = false;
             _nativeStartupGate.Reset();
             _lifecycle = writer != null || audioCapture != null || videoCapture != null
                 ? RecordingLifecycle.Finalizing
@@ -869,6 +894,7 @@ internal sealed class RecordingService : IDisposable
             outputPath,
             finishedCallback,
             finalDuration,
+            starred,
             telemetryContext,
             stopSw,
             MarkFinalized);
@@ -893,6 +919,7 @@ internal sealed class RecordingService : IDisposable
         Action<RecordingFinishedEventArgs>? finishedCallback = null;
         string? outputPath = null;
         RecordingTelemetryContext? telemetryContext = null;
+        bool starred;
 
         lock (_sync)
         {
@@ -904,6 +931,7 @@ internal sealed class RecordingService : IDisposable
             finishedCallback = _finishedCallback;
             outputPath = _currentFilePath;
             telemetryContext = _telemetryContext;
+            starred = _currentRecordingStarred;
 
             _sessionId++;
             ClearSessionNoLock(RecordingLifecycle.Idle);
@@ -923,7 +951,7 @@ internal sealed class RecordingService : IDisposable
         {
             try
             {
-                finishedCallback?.Invoke(new RecordingFinishedEventArgs(outputPath, TimeSpan.Zero, false));
+                finishedCallback?.Invoke(new RecordingFinishedEventArgs(outputPath, TimeSpan.Zero, false, starred));
             }
             catch (Exception ex)
             {
@@ -974,6 +1002,7 @@ internal sealed class RecordingService : IDisposable
         _telemetryContext = null;
         _lifecycle = nextLifecycle;
         _currentBackend = string.Empty;
+        _currentRecordingStarred = false;
         _finishedCallback = null;
         _nativeStartupGate.Reset();
     }

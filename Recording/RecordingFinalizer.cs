@@ -3,6 +3,7 @@ using Recorder.Diagnostics;
 using Recorder.Telemetry;
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Threading;
 
 namespace Recorder.Recording;
@@ -72,19 +73,31 @@ internal sealed class RecordingFinalizer
 
         string finalFrameDiagnostics = job.Writer?.FinalVideoDiagnostics ?? "writer=null";
         bool saved = job.Writer != null;
+        string? finishedOutputPath = job.OutputPath;
+        if (saved && job.Starred && !string.IsNullOrWhiteSpace(job.OutputPath) && File.Exists(job.OutputPath))
+        {
+            try
+            {
+                finishedOutputPath = RecordingFileNames.RenameStarred(job.OutputPath, starred: true);
+            }
+            catch (Exception ex)
+            {
+                _log.Warning($"[Record] Star rename failed: {ex.Message}");
+            }
+        }
 
-        _log.Info($"[Record] Saved: {job.OutputPath}, finalize={finalizeSw.ElapsedMilliseconds}ms");
+        _log.Info($"[Record] Saved: {finishedOutputPath}, starred={job.Starred}, finalize={finalizeSw.ElapsedMilliseconds}ms");
         AmdRecordingDiagnosticLog.FinishSession($"saved={saved}, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}");
         RecordingDiagnosticLog.FinishSession(
             $"saved={saved}, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}",
             finalFrameDiagnostics);
         if (job.TelemetryContext != null)
             PocketBackendClient.QueueRecordingFinished(job.TelemetryContext, job.FinalDuration, saved, finalFrameDiagnostics);
-        if (job.OutputPath != null)
+        if (finishedOutputPath != null)
         {
             try
             {
-                job.FinishedCallback?.Invoke(new RecordingFinishedEventArgs(job.OutputPath, job.FinalDuration, job.Writer != null));
+                job.FinishedCallback?.Invoke(new RecordingFinishedEventArgs(finishedOutputPath, job.FinalDuration, job.Writer != null, job.Starred));
             }
             catch (Exception ex)
             {
@@ -112,6 +125,7 @@ internal sealed record RecordingFinalizationJob(
     string? OutputPath,
     Action<RecordingFinishedEventArgs>? FinishedCallback,
     TimeSpan FinalDuration,
+    bool Starred,
     RecordingTelemetryContext? TelemetryContext,
     Stopwatch Stopwatch,
     Action MarkFinalized);

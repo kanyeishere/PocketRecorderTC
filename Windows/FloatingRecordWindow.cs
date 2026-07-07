@@ -9,7 +9,10 @@ internal sealed class FloatingRecordWindow : Window
 {
     private readonly Plugin _plugin;
     private readonly Vector2 _buttonSize = new(58f, 58f);
+    private readonly Vector2 _starButtonSize = new(32f, 58f);
     private readonly Vector2 _windowPadding = new(7f, 7f);
+    private readonly Vector2 _compactWindowSize = new(72f, 72f);
+    private readonly Vector2 _starWindowSize = new(109f, 72f);
     private bool _wasDragging;
     private bool _rightDragStartedOnButton;
     private Vector2 _rightDragStartMousePos;
@@ -21,7 +24,7 @@ internal sealed class FloatingRecordWindow : Window
     {
         _plugin = plugin;
         IsOpen = _plugin.Config.ShowFloatingRecordButton;
-        Size = new Vector2(72, 72);
+        Size = _compactWindowSize;
         SizeCondition = ImGuiCond.Always;
         Position = _plugin.Config.FloatingRecordButtonPosition;
         PositionCondition = _plugin.Config.HasFloatingRecordButtonPosition
@@ -52,6 +55,8 @@ internal sealed class FloatingRecordWindow : Window
         var phase = _plugin.RecordingService.Phase;
         bool active = phase is RecordingPhase.Preparing or RecordingPhase.Recording;
         bool busy = phase == RecordingPhase.Finalizing || ffmpegBusy;
+        Size = active ? _starWindowSize : _compactWindowSize;
+        SizeCondition = ImGuiCond.Always;
         _suppressContextMenuThisFrame = false;
         bool pressed = DrawCyberRecordButton(active, busy);
 
@@ -74,6 +79,9 @@ internal sealed class FloatingRecordWindow : Window
 
         HandleRightMouseDrag();
 
+        if (active)
+            DrawRecordingStar();
+
         if (_rightClickRequestedMenu)
         {
             ImGui.OpenPopup("PocketRecorderFloatingMenu");
@@ -85,6 +93,12 @@ internal sealed class FloatingRecordWindow : Window
         {
             if (ImGui.MenuItem("打开设置"))
                 _plugin.ConfigWindow.IsOpen = true;
+
+            if (ImGui.MenuItem("录像列表"))
+                _plugin.RecordingListWindow.IsOpen = true;
+
+            if (ImGui.MenuItem("打开输出目录"))
+                OpenOutputDirectory();
 
             if (ImGui.MenuItem("重置位置"))
             {
@@ -104,6 +118,75 @@ internal sealed class FloatingRecordWindow : Window
 
             ImGui.EndPopup();
         }
+    }
+
+    private void DrawRecordingStar()
+    {
+        bool starred = _plugin.RecordingService.CurrentRecordingStarred;
+
+        ImGui.SameLine(0f, 5f);
+        ImGui.SetCursorPosY(_windowPadding.Y);
+        ImGui.InvisibleButton("##PocketRecorderStarButton", _starButtonSize);
+
+        if (ImGui.IsItemClicked(ImGuiMouseButton.Left))
+        {
+            _plugin.RecordingService.ToggleCurrentRecordingStar();
+            starred = _plugin.RecordingService.CurrentRecordingStarred;
+        }
+
+        bool hovered = ImGui.IsItemHovered();
+        var min = ImGui.GetItemRectMin();
+        var max = ImGui.GetItemRectMax();
+        var center = (min + max) * 0.5f;
+        var draw = ImGui.GetWindowDrawList();
+
+        uint starStroke = starred
+            ? Color(1f, 0.96f, 0.58f, 1f)
+            : Color(0.72f, hovered ? 0.95f : 0.86f, hovered ? 1f : 0.92f, 1f);
+        uint starFill = Color(1f, 0.82f, 0.18f, starred ? 1f : 0f);
+        uint starGlow = starred
+            ? Color(1f, 0.72f, 0.15f, 0.38f)
+            : Color(0.10f, 0.86f, 1f, hovered ? 0.42f : 0.22f);
+
+        DrawStarShape(draw, center, 11.2f, 5.2f, starFill, starStroke, starGlow, starred);
+
+        if (hovered)
+        {
+            ImGui.BeginTooltip();
+            ImGui.TextUnformatted(starred ? "本次录像已标星" : "标记本次录像");
+            ImGui.EndTooltip();
+        }
+    }
+
+    private static void DrawStarShape(
+        ImDrawListPtr draw,
+        Vector2 center,
+        float outerRadius,
+        float innerRadius,
+        uint fill,
+        uint stroke,
+        uint glow,
+        bool filled)
+    {
+        Span<Vector2> points = stackalloc Vector2[10];
+        for (int i = 0; i < points.Length; i++)
+        {
+            float radius = i % 2 == 0 ? outerRadius : innerRadius;
+            float angle = (-90f + i * 36f) * MathF.PI / 180f;
+            points[i] = center + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * radius;
+        }
+
+        if (filled)
+        {
+            for (int i = 0; i < points.Length; i++)
+                draw.AddTriangleFilled(center, points[i], points[(i + 1) % points.Length], fill);
+        }
+
+        for (int i = 0; i < points.Length; i++)
+            draw.AddLine(points[i], points[(i + 1) % points.Length], glow, 4.2f);
+
+        for (int i = 0; i < points.Length; i++)
+            draw.AddLine(points[i], points[(i + 1) % points.Length], stroke, 2.2f);
     }
 
     private bool DrawCyberRecordButton(bool active, bool busy)
@@ -230,6 +313,18 @@ internal sealed class FloatingRecordWindow : Window
 
     private static uint Color(float r, float g, float b, float a) =>
         ImGui.ColorConvertFloat4ToU32(new Vector4(r, g, b, a));
+
+    private void OpenOutputDirectory()
+    {
+        try
+        {
+            ShellHelpers.OpenDirectory(_plugin.Config.GetEffectiveOutputDirectory(Plugin.PluginInterface));
+        }
+        catch (System.Exception ex)
+        {
+            Plugin.Log.Error($"Failed to open output directory: {ex}");
+        }
+    }
 
     private bool ShouldShow() =>
         _plugin.Config.ShowFloatingRecordButton;

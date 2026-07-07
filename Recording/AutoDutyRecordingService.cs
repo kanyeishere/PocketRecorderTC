@@ -162,13 +162,13 @@ internal sealed class AutoDutyRecordingService : IDisposable
             return;
         }
 
-        string finalPath = CreateFinalOutputPath(args.OutputPath, dutyName, startTime, endTime);
+        string finalPath = CreateFinalOutputPath(args.OutputPath, dutyName, startTime, endTime, args.Starred);
         try
         {
             if (!string.Equals(args.OutputPath, finalPath, StringComparison.OrdinalIgnoreCase))
             {
                 if (File.Exists(finalPath))
-                    finalPath = AppendCollisionSuffix(finalPath);
+                    finalPath = RecordingFileNames.AppendCollisionSuffix(finalPath);
 
                 File.Move(args.OutputPath, finalPath);
             }
@@ -258,27 +258,12 @@ internal sealed class AutoDutyRecordingService : IDisposable
         return Path.Combine(dir, fileName);
     }
 
-    private static string CreateFinalOutputPath(string temporaryPath, string dutyName, DateTime startTime, DateTime endTime)
+    private static string CreateFinalOutputPath(string temporaryPath, string dutyName, DateTime startTime, DateTime endTime, bool starred)
     {
         string directory = Path.GetDirectoryName(temporaryPath) ?? string.Empty;
-        string fileName = $"{SanitizeFileName(dutyName)}-{startTime:yyyyMMdd}-{startTime:HHmmss}-{endTime:HHmmss}.mp4";
+        string prefix = starred ? RecordingFileNames.StarPrefix : string.Empty;
+        string fileName = $"{prefix}{SanitizeFileName(dutyName)}-{startTime:yyyyMMdd}-{startTime:HHmmss}-{endTime:HHmmss}.mp4";
         return Path.Combine(directory, fileName);
-    }
-
-    private static string AppendCollisionSuffix(string path)
-    {
-        string directory = Path.GetDirectoryName(path) ?? string.Empty;
-        string name = Path.GetFileNameWithoutExtension(path);
-        string ext = Path.GetExtension(path);
-
-        for (int i = 2; i < 1000; i++)
-        {
-            string candidate = Path.Combine(directory, $"{name}-{i}{ext}");
-            if (!File.Exists(candidate))
-                return candidate;
-        }
-
-        return Path.Combine(directory, $"{name}-{Guid.NewGuid():N}{ext}");
     }
 
     private static string SanitizeFileName(string value)
