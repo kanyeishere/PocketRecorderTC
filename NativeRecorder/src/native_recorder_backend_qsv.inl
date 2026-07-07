@@ -3,6 +3,7 @@ struct IntelVplD3D11Allocator
     struct MemId
     {
         ID3D11Texture2D* texture = nullptr;
+        mfxHDL second = reinterpret_cast<mfxHDL>(static_cast<uintptr_t>(MFX_INFINITE));
     };
 
     ComPtr<ID3D11Device> device;
@@ -108,7 +109,7 @@ struct IntelVplD3D11Allocator
 
         auto* pair = reinterpret_cast<mfxHDLPair*>(handle);
         pair->first = mem->texture;
-        pair->second = nullptr;
+        pair->second = mem->second;
         return MFX_ERR_NONE;
     }
 
@@ -168,6 +169,14 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         mfxEncodeCtrl ctrl{};
         mfxSyncPoint syncp = nullptr;
         std::unique_ptr<uint8_t, AvFreeDeleter> buffer;
+        bool has_conversion_slot = false;
+        size_t conversion_slot = 0;
+    };
+
+    struct QsvInputSurface
+    {
+        IntelVplD3D11Allocator::MemId mem{};
+        mfxFrameSurface1 surface{};
     };
 
     mfxLoader loader = nullptr;
@@ -175,16 +184,15 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
     mfxFrameAllocator frame_allocator{};
     IntelVplD3D11Allocator allocator;
     mfxVideoParam encode_params{};
-    mfxFrameAllocResponse surface_response{};
-    std::vector<std::unique_ptr<mfxFrameSurface1>> surfaces;
+    std::vector<QsvInputSurface> qsv_input_surfaces;
     std::vector<Task> tasks;
     size_t first_sync_task = 0;
+    size_t qsv_input_pool_size = kNativeNv12ConversionPoolSize;
     mfxExtCodingOption2 coding_option2{};
     std::vector<mfxExtBuffer*> encode_ext_buffers;
     std::vector<uint8_t> sequence_params;
     mfxVersion vpl_version{};
     bool encoder_initialized = false;
-    bool surfaces_allocated = false;
 
     IntelVplLibavRecorderBackend(const pr_video_config& video_config, const pr_audio_config& audio_config, std::wstring output)
         : NativeD3D11LibavRecorderBackend(video_config, audio_config, std::move(output), "QSV")
@@ -237,7 +245,15 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         if (FAILED(hr))
             return hr;
 
-        hr = allocate_surfaces();
+        hr = query_input_surface_pool_size();
+        if (FAILED(hr))
+            return hr;
+
+        hr = ensure_conversion_pool();
+        if (FAILED(hr))
+            return hr;
+
+        hr = initialize_qsv_input_surfaces();
         if (FAILED(hr))
             return hr;
 
@@ -262,10 +278,6 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         if (FAILED(hr))
             return hr;
 
-        hr = ensure_conversion_pool();
-        if (FAILED(hr))
-            return hr;
-
         initialized = true;
         start_video_worker();
 
@@ -277,13 +289,13 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             ", sourceFormat=" + dxgi_format_to_string(source_format) +
             ", encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height) +
             ", vplSurface=" + std::to_string(encode_params.mfx.FrameInfo.Width) + "x" + std::to_string(encode_params.mfx.FrameInfo.Height) +
-            ", surfaces=" + std::to_string(surfaces.size()) +
+            ", surfaces=" + std::to_string(qsv_input_surfaces.size()) +
             ", tasks=" + std::to_string(tasks.size()) +
             ", asyncDepth=" + std::to_string(encode_params.AsyncDepth) +
             ", vplVersion=" + std::to_string(vpl_version.Major) + "." + std::to_string(vpl_version.Minor) +
             ", vpSourceSupport=" + hex_uint32(converter.source_format_support) +
             ", vpNv12Support=" + hex_uint32(converter.nv12_format_support) +
-            ", qsvInput=shared conversion pool -> oneVPL-owned DX11 NV12 surfaces" +
+            ", qsvInput=shared conversion pool as oneVPL DX11 NV12 surfaces" +
             ", output=" + std::string(codec_name(video.codec)) + "/MP4 via oneVPL QSV + libavformat.";
         set_last_error(message);
         return S_OK;
@@ -422,30 +434,62 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         return S_OK;
     }
 
-    HRESULT allocate_surfaces()
+    HRESULT query_input_surface_pool_size()
     {
         mfxFrameAllocRequest request{};
         mfxStatus sts = MFXVideoENCODE_QueryIOSurf(session, &encode_params, &request);
         if (!vpl_status_success(sts))
             return fail_vpl("oneVPL QueryIOSurf", sts);
 
-        request.Type |= MFX_MEMTYPE_EXTERNAL_FRAME | MFX_MEMTYPE_VIDEO_MEMORY_ENCODER_TARGET | MFX_MEMTYPE_FROM_ENCODE;
-        request.NumFrameSuggested = static_cast<mfxU16>(request.NumFrameSuggested + encode_params.AsyncDepth);
+        qsv_input_pool_size = std::max<size_t>(
+            kNativeNv12ConversionPoolSize,
+            static_cast<size_t>(request.NumFrameSuggested) + static_cast<size_t>(encode_params.AsyncDepth));
+        return S_OK;
+    }
 
-        sts = frame_allocator.Alloc(frame_allocator.pthis, &request, &surface_response);
-        if (!vpl_status_success(sts))
-            return fail_vpl("oneVPL surface Alloc", sts);
+    size_t conversion_pool_slot_count() const override
+    {
+        return std::max<size_t>(kNativeNv12ConversionPoolSize, qsv_input_pool_size);
+    }
 
-        surfaces_allocated = true;
-        surfaces.clear();
-        surfaces.reserve(surface_response.NumFrameActual);
-        for (mfxU16 i = 0; i < surface_response.NumFrameActual; ++i)
+    HRESULT create_conversion_texture(ComPtr<ID3D11Texture2D>& texture) override
+    {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = encode_params.mfx.FrameInfo.Width;
+        desc.Height = encode_params.mfx.FrameInfo.Height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_NV12;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+
+        HRESULT hr = converter.device->CreateTexture2D(&desc, nullptr, &texture);
+        if (FAILED(hr))
+            return fail_step("CreateTexture2D(QSV NV12 input)", hr, "input=" + texture_desc_to_string(desc));
+
+        return S_OK;
+    }
+
+    HRESULT initialize_qsv_input_surfaces()
+    {
+        const size_t slot_count = conversion_pool_slot_count();
+        qsv_input_surfaces.clear();
+        qsv_input_surfaces.resize(slot_count);
+
+        for (size_t i = 0; i < slot_count; ++i)
         {
-            auto surface = std::make_unique<mfxFrameSurface1>();
-            std::memset(surface.get(), 0, sizeof(mfxFrameSurface1));
-            std::memcpy(&surface->Info, &encode_params.mfx.FrameInfo, sizeof(mfxFrameInfo));
-            surface->Data.MemId = surface_response.mids[i];
-            surfaces.push_back(std::move(surface));
+            ComPtr<ID3D11Texture2D> texture;
+            if (!get_conversion_texture(i, texture) || !texture)
+                return E_FAIL;
+
+            QsvInputSurface& entry = qsv_input_surfaces[i];
+            std::memset(&entry.surface, 0, sizeof(entry.surface));
+            std::memcpy(&entry.surface.Info, &encode_params.mfx.FrameInfo, sizeof(mfxFrameInfo));
+            entry.mem.texture = texture.Get();
+            entry.surface.Data.MemId = reinterpret_cast<mfxMemId>(&entry.mem);
         }
 
         return S_OK;
@@ -537,32 +581,30 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
     {
         for (size_t i = 0; i < tasks.size(); ++i)
         {
-            if (tasks[i].syncp == nullptr)
+            if (tasks[i].syncp == nullptr && !tasks[i].has_conversion_slot)
                 return static_cast<int>(i);
         }
         return -1;
     }
 
-    int free_surface_index() const
+    mfxFrameSurface1* surface_for_conversion_slot(size_t slot_index)
     {
-        for (size_t i = 0; i < surfaces.size(); ++i)
-        {
-            if (surfaces[i] && surfaces[i]->Data.Locked == 0)
-                return static_cast<int>(i);
-        }
-        return -1;
+        if (slot_index >= qsv_input_surfaces.size())
+            return nullptr;
+
+        return &qsv_input_surfaces[slot_index].surface;
     }
 
     HRESULT process_queued_frame(const NativePendingVideoFrame& frame) override
     {
-        ComPtr<ID3D11Texture2D> nv12_texture;
-        if (!get_conversion_texture(frame.slot_index, nv12_texture))
+        mfxFrameSurface1* surface = surface_for_conversion_slot(frame.slot_index);
+        if (surface == nullptr)
         {
             release_conversion_slot(frame.slot_index);
             return E_INVALIDARG;
         }
 
-        HRESULT hr = ensure_free_task_and_surface();
+        HRESULT hr = ensure_free_task();
         if (FAILED(hr))
         {
             release_conversion_slot(frame.slot_index);
@@ -570,42 +612,12 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         }
 
         int task_index = free_task_index();
-        int surface_index = free_surface_index();
-        if (task_index < 0 || surface_index < 0)
+        if (task_index < 0)
         {
             release_conversion_slot(frame.slot_index);
-            set_last_error("NativeRecorder oneVPL task/surface pool did not free a slot after sync.");
+            set_last_error("NativeRecorder oneVPL task pool did not free a slot after sync.");
             return E_FAIL;
         }
-
-        mfxFrameSurface1* surface = surfaces[static_cast<size_t>(surface_index)].get();
-        ID3D11Texture2D* surface_texture = IntelVplD3D11Allocator::texture_from_mem_id(surface->Data.MemId);
-        if (surface_texture == nullptr)
-        {
-            release_conversion_slot(frame.slot_index);
-            return E_POINTER;
-        }
-
-        {
-            std::lock_guard context_lock(d3d_context_mutex);
-            D3D11_BOX src_box{};
-            src_box.left = 0;
-            src_box.top = 0;
-            src_box.front = 0;
-            src_box.right = static_cast<UINT>(converter.encoded_width());
-            src_box.bottom = static_cast<UINT>(converter.encoded_height());
-            src_box.back = 1;
-            converter.device_context->CopySubresourceRegion(
-                surface_texture,
-                0,
-                0,
-                0,
-                0,
-                nv12_texture.Get(),
-                0,
-                &src_box);
-        }
-        release_conversion_slot(frame.slot_index);
 
         const int64_t frame_timestamp_hns = std::max<int64_t>(0, frame.timestamp_hns);
         surface->Data.TimeStamp = hns_to_vpl_timestamp(frame_timestamp_hns);
@@ -615,6 +627,8 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         task.bitstream.DataLength = 0;
         task.bitstream.TimeStamp = kTimestampUnknown;
         task.syncp = nullptr;
+        task.has_conversion_slot = true;
+        task.conversion_slot = frame.slot_index;
         std::memset(&task.ctrl, 0, sizeof(task.ctrl));
         if (frame.force_idr)
             task.ctrl.FrameType = MFX_FRAMETYPE_I | MFX_FRAMETYPE_IDR | MFX_FRAMETYPE_REF;
@@ -624,10 +638,19 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         {
             pending_output_timestamps.push(frame_timestamp_hns);
             ++counters.encoder_input_frames;
+            reset_task(task);
             return S_OK;
         }
         if (!vpl_status_success(sts))
+        {
+            reset_task(task);
             return fail_vpl("oneVPL EncodeFrameAsync", sts);
+        }
+        if (task.syncp == nullptr)
+        {
+            reset_task(task);
+            return S_OK;
+        }
 
         pending_output_timestamps.push(frame_timestamp_hns);
         update_max_pending_outputs();
@@ -640,9 +663,9 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         return drain_ready_tasks();
     }
 
-    HRESULT ensure_free_task_and_surface()
+    HRESULT ensure_free_task()
     {
-        while (free_task_index() < 0 || free_surface_index() < 0)
+        while (free_task_index() < 0)
         {
             HRESULT hr = sync_oldest_task(kIntelVplSyncWaitMs, false);
             if (FAILED(hr))
@@ -765,8 +788,19 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         return S_OK;
     }
 
-    static void reset_task(Task& task)
+    void release_task_conversion_slot(Task& task)
     {
+        if (!task.has_conversion_slot)
+            return;
+
+        release_conversion_slot(task.conversion_slot);
+        task.has_conversion_slot = false;
+        task.conversion_slot = 0;
+    }
+
+    void reset_task(Task& task)
+    {
+        release_task_conversion_slot(task);
         task.syncp = nullptr;
         task.bitstream.DataOffset = 0;
         task.bitstream.DataLength = 0;
@@ -795,7 +829,7 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
 
         for (;;)
         {
-            HRESULT hr = ensure_free_task_and_surface();
+            HRESULT hr = ensure_free_task();
             if (FAILED(hr))
                 return hr;
 
@@ -858,13 +892,7 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             encoder_initialized = false;
         }
 
-        if (surfaces_allocated)
-        {
-            frame_allocator.Free(frame_allocator.pthis, &surface_response);
-            surfaces_allocated = false;
-        }
-
-        surfaces.clear();
+        qsv_input_surfaces.clear();
         tasks.clear();
 
         if (session != nullptr)

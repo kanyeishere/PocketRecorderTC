@@ -534,11 +534,21 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
     HRESULT ensure_conversion_pool()
     {
         return conversion_nv12_pool.ensure(
-            kNativeNv12ConversionPoolSize,
+            conversion_pool_slot_count(),
             [this](ComPtr<ID3D11Texture2D>& texture)
             {
-                return converter.create_nv12_texture(texture);
+                return create_conversion_texture(texture);
             });
+    }
+
+    virtual size_t conversion_pool_slot_count() const
+    {
+        return kNativeNv12ConversionPoolSize;
+    }
+
+    virtual HRESULT create_conversion_texture(ComPtr<ID3D11Texture2D>& texture)
+    {
+        return converter.create_nv12_texture(texture);
     }
 
     bool get_conversion_texture(size_t slot_index, ComPtr<ID3D11Texture2D>& texture)
