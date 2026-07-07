@@ -21,6 +21,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private readonly IGameInteropProvider _gameInterop;
     private readonly Action<VideoFrame> _onFrame;
     private readonly Func<bool>? _shouldCaptureFrame;
+    private readonly object _hookSync = new();
 
     // D3D11 对象
     private ID3D11Device* _device;
@@ -117,8 +118,19 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _shouldCaptureFrame = shouldCaptureFrame;
     }
 
+    public bool PreinstallPresentHook()
+    {
+        if (_disposed)
+            return false;
+
+        return TryInstallPresentHook(enable: false);
+    }
+
     public bool Start(int targetFps, int? captureFps = null)
     {
+        if (_disposed)
+            return false;
+
         _targetFps = Math.Max(1, targetFps);
         _captureFps = Math.Max(1, captureFps ?? _targetFps);
         _framePacer.Reset(_captureFps);
@@ -128,7 +140,6 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _backpressureSkipCount = 0;
         _errorCount = 0;
         _consecutiveBlackFrames = 0;
-        _presentHookEnabled = false;
         _diagnosedFirstFrame = false;
         _diagnosedReadbackFrame = false;
         _loggedBackBufferSuccess = false;
@@ -144,7 +155,6 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _nativeSharedFallbackLogged = false;
         _lockedOutputPixelFormat = null;
         _presentDetourDepth = 0;
-        Interlocked.Exchange(ref _gameSwapChainAddress, 0);
         _nonGameSwapChainSkipCount = 0;
         _lastNonGameSwapChainLogTicks = 0;
         _lastGameSwapChainRefreshTicks = 0;
@@ -176,28 +186,15 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         RequestStop();
         WaitForNv12StopCleanup();
 
-        // 卸载 hook
-        if (_presentHook != null)
-        {
-            if (_presentHookEnabled)
-            {
-                try { _presentHook.Disable(); } catch { }
-                _presentHookEnabled = false;
-            }
-        }
-
+        DisablePresentHook();
         WaitForPresentDetoursToDrain();
-        if (_presentHook != null)
-        {
-            _presentHook.Dispose();
-            _presentHook = null;
-        }
         _sw.Stop();
         _nv12PerfStats.FlushIfAny();
         string stopSummary = $"Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, nonGameSwapChainSkips={_nonGameSwapChainSkipCount}, nativeBusySkips={_nativeSharedBusySkipCount}, nv12BusySkips={_nv12BusySkipCount}, errors={_errorCount}, method={_captureMethod}, {_framePacer.BuildSummary()}";
         Plugin.Log!.Info($"[Video] {stopSummary}");
         RecordingDiagnosticLog.WriteIfEnabled("Video", stopSummary);
         AmdRecordingDiagnosticLog.Write("Video", stopSummary);
+        ReleaseCaptureResources();
     }
 
     public void RequestStop()
@@ -219,50 +216,85 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
 
     private bool TryInstallPresentHook(bool enable)
     {
-        try
+        lock (_hookSync)
         {
-            if (_presentHook == null)
+            try
             {
-                if (!TryGetGameSwapChain("install Present hook", out IntPtr gameSwapChainPtr))
+                if (_disposed)
                     return false;
 
-                var dxgiSwapChain = (IDXGISwapChain*)gameSwapChainPtr;
-                void** vtable = *(void***)dxgiSwapChain;
-                void* presentAddr = vtable[8]; // Present = vtable index 8
+                if (_presentHook == null)
+                {
+                    if (!TryGetGameSwapChain("install Present hook", out IntPtr gameSwapChainPtr))
+                        return false;
 
-                Interlocked.Exchange(ref _gameSwapChainAddress, gameSwapChainPtr.ToInt64());
-                Plugin.Log!.Info($"[Video] Game IDXGISwapChain=0x{gameSwapChainPtr.ToInt64():X}, Present addr=0x{(long)presentAddr:X}");
+                    var dxgiSwapChain = (IDXGISwapChain*)gameSwapChainPtr;
+                    void** vtable = *(void***)dxgiSwapChain;
+                    void* presentAddr = vtable[8]; // Present = vtable index 8
 
-                _presentHook = _gameInterop.HookFromAddress<PresentDelegate>(
-                    presentAddr,
-                    OnPresentDetour,
-                    IGameInteropProvider.HookBackend.Automatic);
+                    Interlocked.Exchange(ref _gameSwapChainAddress, gameSwapChainPtr.ToInt64());
+                    Plugin.Log!.Info($"[Video] Game IDXGISwapChain=0x{gameSwapChainPtr.ToInt64():X}, Present addr=0x{(long)presentAddr:X}");
+
+                    _presentHook = _gameInterop.HookFromAddress<PresentDelegate>(
+                        presentAddr,
+                        OnPresentDetour,
+                        IGameInteropProvider.HookBackend.Automatic);
+                }
+
+                if (enable && !_presentHookEnabled)
+                {
+                    _presentHook.Enable();
+                    _presentHookEnabled = true;
+                    _captureMethod = "PresentHook";
+                    Plugin.Log!.Info("[Video] ✓ Present hook enabled.");
+                }
+                else if (!enable && _presentHookEnabled)
+                {
+                    _presentHook.Disable();
+                    _presentHookEnabled = false;
+                    Plugin.Log!.Info("[Video] ✓ Present hook disabled.");
+                }
+                else if (!enable)
+                {
+                    Plugin.Log!.Info("[Video] ✓ Present hook installed (disabled).");
+                }
+
+                return true;
             }
-
-            if (enable && !_presentHookEnabled)
+            catch (Exception ex)
             {
-                _presentHook.Enable();
-                _presentHookEnabled = true;
-                _captureMethod = "PresentHook";
-                Plugin.Log!.Info("[Video] ✓ Present hook enabled.");
+                Plugin.Log!.Error($"[Video] Failed to install Present hook: {ex}");
+                return false;
             }
-            else if (!enable && _presentHookEnabled)
-            {
-                _presentHook.Disable();
-                _presentHookEnabled = false;
-                Plugin.Log!.Info("[Video] ✓ Present hook disabled.");
-            }
-            else if (!enable)
-            {
-                Plugin.Log!.Info("[Video] ✓ Present hook installed (disabled).");
-            }
-
-            return true;
         }
-        catch (Exception ex)
+    }
+
+    private void DisablePresentHook()
+    {
+        lock (_hookSync)
         {
-            Plugin.Log!.Error($"[Video] Failed to install Present hook: {ex}");
-            return false;
+            if (_presentHook == null || !_presentHookEnabled)
+                return;
+
+            try { _presentHook.Disable(); } catch { }
+            _presentHookEnabled = false;
+            Plugin.Log!.Info("[Video] ✓ Present hook disabled.");
+        }
+    }
+
+    private void DisposePresentHook()
+    {
+        DisablePresentHook();
+        WaitForPresentDetoursToDrain();
+
+        lock (_hookSync)
+        {
+            if (_presentHook == null)
+                return;
+
+            _presentHook.Dispose();
+            _presentHook = null;
+            _presentHookEnabled = false;
         }
     }
 
@@ -789,16 +821,21 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
             Plugin.Log!.Warning($"[Video] Present detours did not drain within {waitSw.ElapsedMilliseconds}ms.");
     }
 
+    private void ReleaseCaptureResources()
+    {
+        ReleaseNativeSharedTextures();
+        _stagingReadback.Release();
+        ReleaseNv12Resources();
+        ReleaseNv12Shader();
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
 
         Stop();
-
-        ReleaseNativeSharedTextures();
-        _stagingReadback.Release();
-        ReleaseNv12Resources();
-        ReleaseNv12Shader();
+        DisposePresentHook();
+        ReleaseCaptureResources();
     }
 }

@@ -62,7 +62,8 @@ internal sealed class RecordingFinalizer
         }
         finally
         {
-            DisposeVideoCapture(job.VideoCapture);
+            if (job.DisposeVideoCapture)
+                DisposeVideoCapture(job.VideoCapture);
         }
 
         _log.Info($"[Record] Capture stopped after {job.Stopwatch.ElapsedMilliseconds}ms.");
@@ -120,6 +121,7 @@ internal sealed class RecordingFinalizer
 
 internal sealed record RecordingFinalizationJob(
     VideoCaptureService? VideoCapture,
+    bool DisposeVideoCapture,
     AudioCaptureService? AudioCapture,
     IOutputSink? Writer,
     string? OutputPath,
