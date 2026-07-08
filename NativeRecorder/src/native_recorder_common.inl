@@ -324,6 +324,8 @@ std::string texture_desc_to_string(const D3D11_TEXTURE2D_DESC& desc)
 {
     return std::to_string(desc.Width) + "x" + std::to_string(desc.Height) +
         ", format=" + dxgi_format_to_string(desc.Format) +
+        ", mip=" + std::to_string(desc.MipLevels) +
+        ", array=" + std::to_string(desc.ArraySize) +
         ", usage=" + std::to_string(static_cast<uint32_t>(desc.Usage)) +
         ", bind=" + hex_uint32(desc.BindFlags) +
         ", cpu=" + hex_uint32(desc.CPUAccessFlags) +

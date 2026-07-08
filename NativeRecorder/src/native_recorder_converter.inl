@@ -171,6 +171,8 @@ struct SharedTextureNv12Converter
         }
 
         D3D11_TEXTURE2D_DESC copy_desc = source_desc;
+        copy_desc.MipLevels = 1;
+        copy_desc.ArraySize = 1;
         copy_desc.Usage = D3D11_USAGE_DEFAULT;
         copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         copy_desc.CPUAccessFlags = 0;
