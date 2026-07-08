@@ -27,7 +27,7 @@ internal static class PocketBackendClient
     public static void QueueHeartbeat(string eventName, object? metadata = null)
     {
         Configuration? configuration = _configuration;
-        if (!CanSend(configuration))
+        if (!CanSendHeartbeat(configuration))
             return;
 
         _ = Task.Run(async () =>
@@ -53,7 +53,7 @@ internal static class PocketBackendClient
     public static void QueueDiagnostics(string kind, string fileName, string report, string message, object? metadata = null)
     {
         Configuration? configuration = _configuration;
-        if (!CanSend(configuration))
+        if (!CanSendDiagnostics(configuration))
             return;
 
         _ = Task.Run(async () =>
@@ -86,7 +86,7 @@ internal static class PocketBackendClient
         string finalFrameDiagnostics)
     {
         Configuration? configuration = _configuration;
-        if (!CanSend(configuration))
+        if (!CanSendDiagnostics(configuration))
             return;
 
         _ = Task.Run(async () =>
@@ -105,9 +105,9 @@ internal static class PocketBackendClient
                     context.BackendMode,
                     context.BackendLabel,
                     context.RequestedCodec,
-                    context.SelectedBackendReason,
-                    context.NativeProbeReason,
                     context.NativeNvencSdk,
+                    cpuName = context.CpuName,
+                    totalMemoryMB = context.TotalMemoryMB,
                     saved,
                     durationMs = (long)Math.Max(0, duration.TotalMilliseconds),
                     finalFrameDiagnostics,
@@ -120,7 +120,11 @@ internal static class PocketBackendClient
         });
     }
 
-    private static bool CanSend(Configuration? configuration)
+    private static bool CanSendHeartbeat(Configuration? configuration)
+        => configuration is not null &&
+           !string.IsNullOrWhiteSpace(configuration.InstallId);
+
+    private static bool CanSendDiagnostics(Configuration? configuration)
         => configuration is { EnablePocketBackendTelemetry: true } &&
            !string.IsNullOrWhiteSpace(configuration.InstallId);
 

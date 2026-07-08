@@ -1,6 +1,7 @@
 using Recorder.Capture;
 using Recorder.Diagnostics;
 using Recorder.Encoding;
+using Recorder.Localization;
 using System;
 
 namespace Recorder.Recording;
@@ -25,18 +26,19 @@ internal sealed class NativeRecorderRecordingBackend : IRecordingBackend
         _kind = kind;
         _runtime = NativeRecorderRuntimeManager.Default;
 
-        (Id, DisplayName, PreparingText, _requiredVendor, _runtimeRequirementField, _runtimeRequirementName) = kind switch
+        (Id, DisplayName, _preparingTextKey, _requiredVendor, _runtimeRequirementField, _runtimeRequirementName) = kind switch
         {
-            NativeRecordingBackendKind.Nvenc => ("native-nvenc", "Native NVENC", "Native NVENC 准备中", "nvidia", "nvencRuntime", "NVENC"),
-            NativeRecordingBackendKind.Amf => ("native-amf", "Native AMF", "Native AMF 准备中", "amd", "amfRuntime", "AMF"),
-            NativeRecordingBackendKind.Qsv => ("native-qsv", "Native QSV", "Native QSV 准备中", "intel", "oneVplRuntime", "oneVPL"),
+            NativeRecordingBackendKind.Nvenc => ("native-nvenc", "Native NVENC", "Backend.NativeNvencPreparing", "nvidia", "nvencRuntime", "NVENC"),
+            NativeRecordingBackendKind.Amf => ("native-amf", "Native AMF", "Backend.NativeAmfPreparing", "amd", "amfRuntime", "AMF"),
+            NativeRecordingBackendKind.Qsv => ("native-qsv", "Native QSV", "Backend.NativeQsvPreparing", "intel", "oneVplRuntime", "oneVPL"),
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null),
         };
     }
 
     public string Id { get; }
     public string DisplayName { get; }
-    public string PreparingText { get; }
+    private readonly string _preparingTextKey;
+    public string PreparingText => Loc.T(_preparingTextKey);
     public NativeRecorderRuntime Runtime => _runtime;
     public bool PrefersD3D11TextureFrames => true;
 

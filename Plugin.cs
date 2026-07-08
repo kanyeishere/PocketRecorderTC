@@ -1,9 +1,11 @@
 using Dalamud.Game.Command;
 using Dalamud.IoC;
 using Dalamud.Plugin;
+using Dalamud.Interface.Textures;
 using Dalamud.Plugin.Services;
 using Recorder.Capture;
 using Recorder.Encoding;
+using Recorder.Localization;
 using Recorder.Recording;
 using Recorder.Telemetry;
 using Recorder.Windows;
@@ -26,6 +28,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IClientState ClientState { get; private set; } = null!;
     [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
     [PluginService] internal static IDutyState DutyState { get; private set; } = null!;
+    [PluginService] internal static ITextureProvider TextureProvider { get; private set; } = null!;
 
     internal Configuration Config { get; }
     internal IRecorderEnvironment Environment { get; }
@@ -46,8 +49,10 @@ public sealed class Plugin : IDalamudPlugin
     {
         NativeRecorderRuntimeManager.ConfigureFromPluginInterface(pluginInterface);
         Environment = new DalamudRecorderEnvironment(pluginInterface, Log);
-        Config = Configuration.Load(pluginInterface);
+                Config = Configuration.Load(pluginInterface);
         PocketBackendClient.Configure(Config);
+
+        Loc.Initialize(Config.Language, PluginInterface.UiLanguage);
 
         GameGraphicsDeviceProbeCache = new GameGraphicsDeviceProbeCache(Framework, Environment.Log);
         RecordingService = new RecordingService(this, GameInterop, Environment);
@@ -86,7 +91,7 @@ public sealed class Plugin : IDalamudPlugin
             try
             {
                 IsFFmpegBootstrapRunning = true;
-                FFmpegBootstrapStatus = "正在检查 FFmpeg...";
+                FFmpegBootstrapStatus = Loc.T("Warmup.CheckingFFmpeg");
 
                 string pluginConfigDirectory = PluginInterface.GetPluginConfigDirectory();
                 string? ffmpegPath = FFmpegBootstrapper.TryResolveExistingPath(
@@ -95,7 +100,7 @@ public sealed class Plugin : IDalamudPlugin
 
                 if (ffmpegPath == null)
                 {
-                    FFmpegBootstrapStatus = "正在下载必要组件...";
+                    FFmpegBootstrapStatus = Loc.T("Warmup.DownloadingComponents");
                     ffmpegPath = FFmpegBootstrapper.InstallOrUpdateBundled(pluginConfigDirectory);
                     Config.FFmpegPath = ffmpegPath;
                     Config.Save(PluginInterface);
@@ -103,18 +108,18 @@ public sealed class Plugin : IDalamudPlugin
 
                 if (ffmpegPath == null)
                 {
-                    FFmpegBootstrapStatus = "必要组件下载失败";
+                    FFmpegBootstrapStatus = Loc.T("Warmup.Failed");
                     return;
                 }
 
                 FFmpegEncoderSelector.Warmup(ffmpegPath, Config);
-                FFmpegBootstrapStatus = "必要组件已就绪";
+                FFmpegBootstrapStatus = Loc.T("Warmup.Ready");
                 IsFFmpegBootstrapComplete = true;
                 Log.Info($"[FFmpeg] Background warmup finished: {ffmpegPath}");
             }
             catch (Exception ex)
             {
-                FFmpegBootstrapStatus = "必要组件下载失败";
+                FFmpegBootstrapStatus = Loc.T("Warmup.Failed");
                 Log.Warning($"[FFmpeg] Background warmup failed: {ex.Message}");
             }
             finally
@@ -164,7 +169,7 @@ public sealed class Plugin : IDalamudPlugin
 
             case "toggle":
                 RecordingService.ToggleRecording();
-                Print($"录制状态: {RecordingService.Phase.ToDisplayText()}");
+                Print(Loc.T("Cmd.ToggleStatus", RecordingService.Phase.ToDisplayText()));
                 break;
 
             case "status":
@@ -211,15 +216,15 @@ public sealed class Plugin : IDalamudPlugin
             case "list":
             case "recordings":
             case "videos":
-                RecordingListWindow.IsOpen = true;
-                Print("已打开录像列表。");
+                                RecordingListWindow.IsOpen = true;
+                Print(Loc.T("Cmd.OpenedList"));
                 break;
 
             case "config":
             case "settings":
             case "open":
-                ConfigWindow.IsOpen = true;
-                Print("已打开设置窗口。");
+                                ConfigWindow.IsOpen = true;
+                Print(Loc.T("Cmd.OpenedConfig"));
                 break;
 
             case "help":
@@ -228,7 +233,7 @@ public sealed class Plugin : IDalamudPlugin
                 break;
 
             default:
-                Print($"未知指令: {parts[0]}");
+                Print(Loc.T("Cmd.UnknownCommand", parts[0]));
                 PrintHelp();
                 break;
         }
@@ -239,13 +244,13 @@ public sealed class Plugin : IDalamudPlugin
         var phase = RecordingService.Phase;
         if (phase != RecordingPhase.Idle)
         {
-            Print($"无法开始录制，当前状态: {phase.ToDisplayText()}。");
+            Print(Loc.T("Cmd.CannotStartStatus", phase.ToDisplayText()));
             return;
         }
 
         Print(RecordingService.StartRecording()
-            ? "开始录制。"
-            : "开始录制失败，请查看日志。");
+            ? Loc.T("Cmd.Started")
+            : Loc.T("Cmd.StartFailed"));
     }
 
     private void StopRecordingFromCommand()
@@ -253,18 +258,18 @@ public sealed class Plugin : IDalamudPlugin
         var phase = RecordingService.Phase;
         if (phase == RecordingPhase.Idle)
         {
-            Print("当前没有正在进行的录制。");
+            Print(Loc.T("Cmd.NoRecording"));
             return;
         }
 
         if (phase == RecordingPhase.Finalizing)
         {
-            Print("录制正在保存中。");
+            Print(Loc.T("Cmd.SavingRecording"));
             return;
         }
 
         RecordingService.StopRecording();
-        Print("停止录制，正在保存。");
+        Print(Loc.T("Cmd.StoppedSaving"));
     }
 
     private void HandleAutoRecordCommand(string[] parts)
@@ -272,10 +277,10 @@ public sealed class Plugin : IDalamudPlugin
         HandleSwitchCommand(
             parts,
             Config.AutoRecordEightPlayerDuty,
-            $"倒计时自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}",
-            "用法: autorecord on | off | toggle | status",
+            Loc.T("Cmd.AutoRecordStatus", Loc.OnOff(Config.AutoRecordEightPlayerDuty), AutoDutyRecordingService.StatusText),
+            Loc.T("Cmd.AutoRecordUsage"),
             enabled => Config.AutoRecordEightPlayerDuty = enabled,
-            enabled => $"倒计时自动录制已{(enabled ? "开启" : "关闭")}。");
+            enabled => Loc.T(enabled ? "Cmd.AutoRecordOn" : "Cmd.AutoRecordOff"));
     }
 
     private void HandleFloatingCommand(string[] parts)
@@ -283,73 +288,73 @@ public sealed class Plugin : IDalamudPlugin
         HandleSwitchCommand(
             parts,
             Config.ShowFloatingRecordButton,
-            $"悬浮录制按钮: {OnOff(Config.ShowFloatingRecordButton)}。",
-            "用法: floating on | off | toggle | status",
+            Loc.T("Cmd.FloatingStatus", Loc.OnOff(Config.ShowFloatingRecordButton)),
+            Loc.T("Cmd.FloatingUsage"),
             enabled =>
             {
                 Config.ShowFloatingRecordButton = enabled;
                 FloatingRecordWindow.IsOpen = enabled;
             },
-            enabled => $"悬浮录制按钮已{(enabled ? "显示" : "隐藏")}。");
+            enabled => Loc.T(enabled ? "Cmd.FloatingShown" : "Cmd.FloatingHidden"));
     }
 
     private void HandleFpsCommand(string[] parts)
     {
         if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
         {
-            Print($"目标帧率: {Config.TargetFps} FPS。");
+            Print(Loc.T("Cmd.FpsStatus", Config.TargetFps));
             return;
         }
 
         if (!int.TryParse(parts[1], out int fps) || fps is < 15 or > 144)
         {
-            Print("用法: fps 15-144");
+            Print(Loc.T("Cmd.FpsUsage"));
             return;
         }
 
         Config.TargetFps = fps;
         Config.Save(PluginInterface);
-        Print($"目标帧率已设为 {fps} FPS，下次录制生效。");
+        Print(Loc.T("Cmd.FpsSet", fps));
     }
 
     private void HandleBitrateCommand(string[] parts)
     {
         if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
         {
-            Print($"视频码率: {Config.VideoBitrate / 1_000_000} Mbps。");
+            Print(Loc.T("Cmd.BitrateStatus", Config.VideoBitrate / 1_000_000));
             return;
         }
 
         if (!int.TryParse(parts[1], out int bitrateMbps) || bitrateMbps is < 1 or > 100)
         {
-            Print("用法: bitrate 1-100");
+            Print(Loc.T("Cmd.BitrateUsage"));
             return;
         }
 
         Config.VideoBitrate = bitrateMbps * 1_000_000;
         Config.Save(PluginInterface);
-        Print($"视频码率已设为 {bitrateMbps} Mbps，下次录制生效。");
+        Print(Loc.T("Cmd.BitrateSet", bitrateMbps));
     }
 
     private void HandleAudioCommand(string[] parts)
     {
         if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
         {
-            Print($"声音来源: {AudioModeText(Config.AudioCaptureMode)}。");
+            Print(Loc.T("Cmd.AudioStatus", AudioModeText(Config.AudioCaptureMode)));
             return;
         }
 
         AudioCaptureMode? mode = ParseAudioMode(parts[1], Config.AudioCaptureMode);
         if (mode == null)
         {
-            Print("用法: audio game | system | off | toggle | status");
+            Print(Loc.T("Cmd.AudioUsage"));
             return;
         }
 
         Config.AudioCaptureMode = mode.Value;
         Config.CaptureAudio = mode.Value != AudioCaptureMode.Off;
         Config.Save(PluginInterface);
-        Print($"声音来源已设为 {AudioModeText(mode.Value)}，下次录制生效。");
+        Print(Loc.T("Cmd.AudioSet", AudioModeText(mode.Value)));
     }
 
     private void OpenOutputDirectory()
@@ -358,24 +363,24 @@ public sealed class Plugin : IDalamudPlugin
         try
         {
             ShellHelpers.OpenDirectory(dir);
-            Print($"已打开输出目录: {dir}");
+            Print(Loc.T("Cmd.OutputOpened", dir));
         }
         catch (Exception ex)
         {
             Log.Error($"Failed to open output directory: {ex}");
-            Print($"打开输出目录失败: {ex.Message}");
+            Print(Loc.T("Cmd.OutputFailed", ex.Message));
         }
     }
 
     private void PrintStatus()
     {
         string elapsed = RecordingService.Phase == RecordingPhase.Recording
-            ? $"，时长 {RecordingService.Elapsed:hh\\:mm\\:ss}，帧数 {RecordingService.FrameCount}"
+            ? Loc.T("Cmd.StatusElapsed", RecordingService.Elapsed.ToString("hh\\:mm\\:ss"), RecordingService.FrameCount)
             : string.Empty;
 
-        Print($"录制状态: {RecordingService.Phase.ToDisplayText()}{elapsed}。");
-        Print($"倒计时自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}");
-        Print($"参数: {Config.TargetFps} FPS / {Config.VideoBitrate / 1_000_000} Mbps / 声音 {AudioModeText(Config.AudioCaptureMode)} / 卫月界面 {OnOff(Config.IncludeOverlay)}。");
+        Print(Loc.T("Cmd.StatusLine", RecordingService.Phase.ToDisplayText(), elapsed));
+        Print(Loc.T("Cmd.AutoRecordLine", Loc.OnOff(Config.AutoRecordEightPlayerDuty), AutoDutyRecordingService.StatusText));
+        Print(Loc.T("Cmd.ParamsLine", Config.TargetFps, Config.VideoBitrate / 1_000_000, AudioModeText(Config.AudioCaptureMode), Loc.OnOff(Config.IncludeOverlay)));
     }
 
     private void HandleOverlayCommand(string[] parts)
@@ -383,10 +388,10 @@ public sealed class Plugin : IDalamudPlugin
         HandleSwitchCommand(
             parts,
             Config.IncludeOverlay,
-            $"录制卫月界面: {OnOff(Config.IncludeOverlay)}。",
-            "用法: overlay on | off | toggle | status",
+            Loc.T("Cmd.OverlayStatus", Loc.OnOff(Config.IncludeOverlay)),
+            Loc.T("Cmd.OverlayUsage"),
             enabled => Config.IncludeOverlay = enabled,
-            enabled => $"录制卫月界面已{(enabled ? "开启" : "关闭")}，下次录制生效。");
+            enabled => Loc.T(enabled ? "Cmd.OverlayOn" : "Cmd.OverlayOff"));
     }
 
     private void HandleSwitchCommand(
@@ -426,7 +431,7 @@ public sealed class Plugin : IDalamudPlugin
         };
     }
 
-    private static string OnOff(bool enabled) => enabled ? "开启" : "关闭";
+    private static string OnOff(bool enabled) => Loc.OnOff(enabled);
 
     private static AudioCaptureMode? ParseAudioMode(string value, AudioCaptureMode currentValue)
     {
@@ -444,9 +449,9 @@ public sealed class Plugin : IDalamudPlugin
     {
         return mode switch
         {
-            AudioCaptureMode.Game => "只录制游戏声音",
-            AudioCaptureMode.System => "录制系统声音",
-            _ => "不录制声音",
+            AudioCaptureMode.Game => Loc.T("Config.AudioGame"),
+            AudioCaptureMode.System => Loc.T("Config.AudioSystem"),
+            _ => Loc.T("Config.AudioOff"),
         };
     }
 
@@ -455,14 +460,14 @@ public sealed class Plugin : IDalamudPlugin
         ChatGui.Print($"[Pocket Recorder] {message}");
     }
 
-    private static void PrintHelp()
+        private static void PrintHelp()
     {
-        Print("命令: start, end, toggle, status, config, output");
-        Print("录像列表: list");
-        Print("自动录制: autorecord on/off/toggle/status");
-        Print("悬浮按钮: floating on/off/toggle/status");
-        Print("参数: fps 60, bitrate 32, audio game/system/off/status, overlay on/off/status");
-        Print("短命令同样可用: /pktr start, /pktr end");
+        Print(Loc.T("Cmd.HelpLine1"));
+        Print(Loc.T("Cmd.HelpLine2"));
+        Print(Loc.T("Cmd.HelpLine3"));
+        Print(Loc.T("Cmd.HelpLine4"));
+        Print(Loc.T("Cmd.HelpLine5"));
+        Print(Loc.T("Cmd.HelpLine6"));
     }
 
     private void OnUiBuilderDraw()

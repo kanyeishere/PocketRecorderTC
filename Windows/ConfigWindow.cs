@@ -1,6 +1,7 @@
 using ImGuiNET;
 using Dalamud.Interface.Windowing;
 using Recorder.Encoding;
+using Recorder.Localization;
 using Recorder.Recording;
 using System;
 using System.Numerics;
@@ -16,16 +17,18 @@ internal sealed class ConfigWindow : Window
     private bool _ffmpegInstallInProgress;
     private string _ffmpegInstallStatus = string.Empty;
 
-    public ConfigWindow(Plugin plugin) : base("Pocket Recorder###PocketRecorderConfig")
+    public ConfigWindow(Plugin plugin) : base("###PocketRecorderConfig")
     {
         _plugin = plugin;
-        Size = new Vector2(420, 520);
+        Size = new Vector2(420, 560);
         SizeCondition = ImGuiCond.FirstUseEver;
         Flags = ImGuiWindowFlags.NoCollapse;
     }
 
     public override void Draw()
     {
+        WindowName = Loc.T("Config.WindowTitle") + "###PocketRecorderConfig";
+
         var config = _plugin.Config;
 
         // ── 录制状态 ──
@@ -39,7 +42,7 @@ internal sealed class ConfigWindow : Window
 
         ImGui.Separator();
 
-        DrawAutomationSettings(config);
+        DrawGeneralSettings(config);
 
         ImGui.Separator();
 
@@ -62,7 +65,12 @@ internal sealed class ConfigWindow : Window
         DrawFFmpegSettings(config);
 
         ImGui.Separator();
-        ImGui.TextDisabled("设置会自动保存");
+
+        // ── 隐私与诊断 ──
+        DrawDiagnosticsSettings(config);
+
+        ImGui.Separator();
+        ImGui.TextDisabled(Loc.T("Config.SettingsAutoSave"));
     }
 
     private void DrawRecordingStatus()
@@ -76,17 +84,17 @@ internal sealed class ConfigWindow : Window
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.3f, 0.3f, 1f));
             ImGui.Text($"{GetPhaseIndicator(phase)} {phase.ToDisplayText()}  {elapsed:hh\\:mm\\:ss}");
             ImGui.PopStyleColor();
-            ImGui.Text($"帧数: {frameCount}");
+            ImGui.Text(Loc.T("Config.FrameCount", frameCount));
             if (!string.IsNullOrWhiteSpace(_plugin.RecordingService.CurrentBackend))
-                ImGui.Text($"后端: {_plugin.RecordingService.CurrentBackend}");
+                ImGui.Text(Loc.T("Config.Backend", _plugin.RecordingService.CurrentBackend));
             if (!string.IsNullOrEmpty(_plugin.RecordingService.CurrentFilePath))
             {
-                ImGui.TextWrapped($"文件: {_plugin.RecordingService.CurrentFilePath}");
+                ImGui.TextWrapped(Loc.T("Config.File", _plugin.RecordingService.CurrentFilePath));
             }
         }
         else
         {
-            ImGui.Text("○ 待机中");
+            ImGui.Text(Loc.T("Config.Idle"));
         }
     }
 
@@ -97,12 +105,12 @@ internal sealed class ConfigWindow : Window
         if (ffmpegBusy)
         {
             ImGui.BeginDisabled();
-            ImGui.Button("正在下载必要组件", new Vector2(-1, 32));
+            ImGui.Button(Loc.T("Config.DownloadingComponents"), new Vector2(-1, 32));
             ImGui.EndDisabled();
         }
         else if (phase == RecordingPhase.Recording || phase == RecordingPhase.Preparing)
         {
-            if (ImGui.Button("■ 停止录制", new Vector2(-1, 32)))
+            if (ImGui.Button(Loc.T("Config.StopRecording"), new Vector2(-1, 32)))
             {
                 _plugin.RecordingService.StopRecording();
             }
@@ -110,51 +118,104 @@ internal sealed class ConfigWindow : Window
         else if (phase == RecordingPhase.Finalizing)
         {
             ImGui.BeginDisabled();
-            ImGui.Button("保存中", new Vector2(-1, 32));
+            ImGui.Button(Loc.T("Config.Saving"), new Vector2(-1, 32));
             ImGui.EndDisabled();
         }
         else
         {
-            if (ImGui.Button("● 开始录制", new Vector2(-1, 32)))
+            if (ImGui.Button(Loc.T("Config.StartRecording"), new Vector2(-1, 32)))
             {
                 _plugin.RecordingService.StartRecording();
             }
         }
-        ImGui.TextDisabled("快捷命令: /pktr start, /pktr end, /pktr status");
+        ImGui.TextDisabled(Loc.T("Config.QuickCommands"));
     }
 
     private static void DrawCommunityLink()
     {
         ImGui.Spacing();
-        if (ImGui.Button("加入 Discord 社群", new Vector2(-1, 0)))
+        if (ImGui.Button(Loc.T("Config.JoinDiscord"), new Vector2(-1, 0)))
             OpenDiscordInvite();
 
         ImGui.TextDisabled(DiscordInviteUrl);
         ImGui.SameLine();
-        if (ImGui.SmallButton("复制链接##discord"))
+        if (ImGui.SmallButton(Loc.T("Config.CopyLink") + "##discord"))
             ImGui.SetClipboardText(DiscordInviteUrl);
     }
 
-    private void DrawAutomationSettings(Configuration config)
+    private void DrawGeneralSettings(Configuration config)
     {
-        ImGui.Text("快捷与自动录制");
+        ImGui.Text(Loc.T("Config.GeneralSettings"));
+
+        // Language selector
+        string[] langLabels =
+        {
+            Loc.T("Config.LanguageAuto"),
+            Loc.T("Config.LanguageEnglish"),
+            Loc.T("Config.LanguageJapanese"),
+            Loc.T("Config.LanguageChineseSimplified"),
+            Loc.T("Config.LanguageChineseTraditional"),
+        };
+        AppLanguage[] langValues =
+        {
+            AppLanguage.Auto,
+            AppLanguage.English,
+            AppLanguage.Japanese,
+            AppLanguage.ChineseSimplified,
+            AppLanguage.ChineseTraditional,
+        };
+        int langIdx = Array.IndexOf(langValues, config.Language);
+        if (langIdx < 0)
+            langIdx = 0;
+
+        if (ImGui.Combo(Loc.T("Config.Language"), ref langIdx, langLabels, langLabels.Length))
+        {
+            config.Language = langValues[langIdx];
+            SaveConfig(config);
+            Loc.Initialize(config.Language, Plugin.PluginInterface.UiLanguage);
+        }
+
+        ImGui.Separator();
+
+        ImGui.Text(Loc.T("Config.ShortcutsAndAuto"));
 
         bool floating = config.ShowFloatingRecordButton;
-        if (ImGui.Checkbox("显示悬浮录制按钮", ref floating))
+        if (ImGui.Checkbox(Loc.T("Config.ShowFloatingButton"), ref floating))
         {
             config.ShowFloatingRecordButton = floating;
             _plugin.FloatingRecordWindow.IsOpen = floating;
             SaveConfig(config);
         }
 
+        if (floating)
+        {
+            ImGui.Indent();
+            float scale = config.FloatingRecordButtonScale;
+            if (ImGui.SliderFloat(Loc.T("Config.FloatingButtonScale"), ref scale, 0.5f, 2.0f, "%.1fx"))
+            {
+                config.FloatingRecordButtonScale = Math.Clamp(scale, 0.5f, 2.0f);
+                SaveConfig(config);
+            }
+
+            if (ImGui.Button(Loc.T("Config.ResetFloatingPosition")))
+            {
+                config.FloatingRecordButtonPosition = new Vector2(48f, 180f);
+                config.HasFloatingRecordButtonPosition = true;
+                _plugin.FloatingRecordWindow.Position = config.FloatingRecordButtonPosition;
+                _plugin.FloatingRecordWindow.PositionCondition = ImGuiCond.Always;
+                SaveConfig(config);
+            }
+            ImGui.Unindent();
+        }
+
         bool autoDuty = config.AutoRecordEightPlayerDuty;
-        if (ImGui.Checkbox("倒计时自动录制", ref autoDuty))
+        if (ImGui.Checkbox(Loc.T("Config.CountdownAutoRecord"), ref autoDuty))
         {
             config.AutoRecordEightPlayerDuty = autoDuty;
             SaveConfig(config);
         }
 
-        ImGui.TextDisabled($"自动录制状态: {_plugin.AutoDutyRecordingService.StatusText}");
+        ImGui.TextDisabled(Loc.T("Config.AutoRecordStatus", _plugin.AutoDutyRecordingService.StatusText));
     }
 
     private static string GetPhaseIndicator(RecordingPhase phase)
@@ -169,9 +230,9 @@ internal sealed class ConfigWindow : Window
 
     private void DrawVideoSettings(Configuration config)
     {
-        ImGui.Text("视频设置");
+        ImGui.Text(Loc.T("Config.VideoSettings"));
 
-        string[] recordingBackends = { "显卡原生录制", "FFmpeg 录制" };
+        string[] recordingBackends = { Loc.T("Config.NativeRecording"), Loc.T("Config.FFmpegRecording") };
         RecordingBackendMode[] recordingBackendValues =
         [
             RecordingBackendMode.Native,
@@ -181,7 +242,7 @@ internal sealed class ConfigWindow : Window
         if (recordingBackendIdx < 0)
             recordingBackendIdx = 0;
 
-        if (ImGui.Combo("录制方式", ref recordingBackendIdx, recordingBackends, recordingBackends.Length))
+        if (ImGui.Combo(Loc.T("Config.RecordingMethod"), ref recordingBackendIdx, recordingBackends, recordingBackends.Length))
         {
             config.RecordingBackendMode = recordingBackendValues[recordingBackendIdx];
             config.ForceFFmpegFallbackForTesting = false;
@@ -189,24 +250,24 @@ internal sealed class ConfigWindow : Window
         }
 
         ImGui.TextDisabled(config.RecordingBackendMode == RecordingBackendMode.Native
-            ? "优先使用显卡原生录制；不可用时自动回退 FFmpeg。"
-            : "固定使用 FFmpeg 录制。");
+            ? Loc.T("Config.NativeRecordingDesc")
+            : Loc.T("Config.FFmpegRecordingDesc"));
 
         int bitrate = config.VideoBitrate / 1_000_000;
-        if (ImGui.SliderInt("码率 (Mbps)", ref bitrate, 1, 100))
+        if (ImGui.SliderInt(Loc.T("Config.Bitrate"), ref bitrate, 1, 100))
         {
             config.VideoBitrate = bitrate * 1_000_000;
         }
         SaveConfigAfterItemEdit(config);
 
         int fps = config.TargetFps;
-        if (ImGui.SliderInt("目标帧率", ref fps, 15, 144))
+        if (ImGui.SliderInt(Loc.T("Config.TargetFps"), ref fps, 15, 144))
         {
             config.TargetFps = fps;
         }
         SaveConfigAfterItemEdit(config);
 
-        string[] outputScales = { "原始尺寸", "1/4 输出" };
+        string[] outputScales = { Loc.T("Config.OriginalSize"), Loc.T("Config.QuarterOutput") };
         VideoOutputScaleMode[] outputScaleValues =
         [
             VideoOutputScaleMode.Original,
@@ -216,26 +277,26 @@ internal sealed class ConfigWindow : Window
         if (outputScaleIdx < 0)
             outputScaleIdx = 0;
 
-        if (ImGui.Combo("输出分辨率", ref outputScaleIdx, outputScales, outputScales.Length))
+        if (ImGui.Combo(Loc.T("Config.OutputResolution"), ref outputScaleIdx, outputScales, outputScales.Length))
         {
             config.VideoOutputScaleMode = outputScaleValues[outputScaleIdx];
             SaveConfig(config);
         }
-        ImGui.TextDisabled("1/4 输出会保持画面比例，宽高各缩到 1/2。");
+        ImGui.TextDisabled(Loc.T("Config.QuarterOutputDesc"));
 
         bool includeOverlay = config.IncludeOverlay;
-        if (ImGui.Checkbox("录制卫月界面", ref includeOverlay))
+        if (ImGui.Checkbox(Loc.T("Config.RecordOverlay"), ref includeOverlay))
         {
             config.IncludeOverlay = includeOverlay;
             SaveConfig(config);
         }
-        ImGui.TextDisabled("开启后会包含 Dalamud/ImGui 叠加层，下次录制生效。");
+        ImGui.TextDisabled(Loc.T("Config.OverlayDesc"));
 
-        string[] modes = { "自动", "兼容", "高级" };
+        string[] modes = { Loc.T("Config.EncodingAuto"), Loc.T("Config.EncodingCompatible"), Loc.T("Config.EncodingAdvanced") };
         int modeIdx = config.VideoCodec == "auto"
             ? (config.UseHardwareEncoder ? 0 : 1)
             : 2;
-        if (ImGui.Combo("编码模式", ref modeIdx, modes, modes.Length))
+        if (ImGui.Combo(Loc.T("Config.EncodingMode"), ref modeIdx, modes, modes.Length))
         {
             if (modeIdx == 0)
             {
@@ -268,13 +329,13 @@ internal sealed class ConfigWindow : Window
 
     private void DrawAudioSettings(Configuration config)
     {
-        ImGui.Text("音频设置");
-        string[] audioModes = { "不录制声音", "只录制游戏声音", "录制系统声音" };
+        ImGui.Text(Loc.T("Config.AudioSettings"));
+        string[] audioModes = { Loc.T("Config.AudioOff"), Loc.T("Config.AudioGame"), Loc.T("Config.AudioSystem") };
         AudioCaptureMode[] modeValues = { AudioCaptureMode.Off, AudioCaptureMode.Game, AudioCaptureMode.System };
         int modeIdx = Array.IndexOf(modeValues, config.AudioCaptureMode);
         if (modeIdx < 0) modeIdx = 1;
 
-        if (ImGui.Combo("声音来源", ref modeIdx, audioModes, audioModes.Length))
+        if (ImGui.Combo(Loc.T("Config.AudioSource"), ref modeIdx, audioModes, audioModes.Length))
         {
             config.AudioCaptureMode = modeValues[modeIdx];
             config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
@@ -286,51 +347,64 @@ internal sealed class ConfigWindow : Window
 
     private void DrawFFmpegSettings(Configuration config)
     {
-        ImGui.Text("FFmpeg 设置");
+        ImGui.Text(Loc.T("Config.FFmpegSettings"));
 
         // FFmpeg 路径
         string ffmpegPath = config.FFmpegPath;
-        if (ImGui.InputText("FFmpeg 路径 (空=自动)", ref ffmpegPath, 512))
+        if (ImGui.InputText(Loc.T("Config.FFmpegPath"), ref ffmpegPath, 512))
         {
             config.FFmpegPath = ffmpegPath;
         }
         SaveConfigAfterItemEdit(config);
-        ImGui.TextDisabled($"当前: {config.GetEffectiveFFmpegPath(Plugin.PluginInterface)}");
+        ImGui.TextDisabled(Loc.T("Config.CurrentPath", config.GetEffectiveFFmpegPath(Plugin.PluginInterface)));
         DrawBundledFFmpegControls(config);
 
 #if DEBUG
         bool forceFFmpeg = config.ForceFFmpegFallbackForTesting;
-        if (ImGui.Checkbox("本地测试 FFmpeg fallback", ref forceFFmpeg))
+        if (ImGui.Checkbox(Loc.T("Config.DebugForceFFmpeg"), ref forceFFmpeg))
         {
             config.ForceFFmpegFallbackForTesting = forceFFmpeg;
             SaveConfig(config);
         }
 
-        if (ImGui.Button("本地测试 NVIDIA 驱动提醒", new Vector2(-1, 0)))
+        if (ImGui.Button(Loc.T("Config.DebugNvidiaToast"), new Vector2(-1, 0)))
             _plugin.RecordingService.ShowNvencDriverUpdateToastForTesting();
 #endif
 
-        ImGui.TextDisabled($"编码模式: {GetEncodingModeText(config)}");
+        ImGui.TextDisabled(Loc.T("Config.EncodingModeLabel", GetEncodingModeText(config)));
 
         if (config.VideoCodec != "auto")
         {
             string[] codecs = { "hevc_nvenc", "hevc_qsv", "hevc_amf", "h264_nvenc", "h264_qsv", "h264_amf", "libx264", "libx265" };
             int codecIdx = Array.IndexOf(codecs, config.VideoCodec);
             if (codecIdx < 0) codecIdx = 0;
-            if (ImGui.Combo("视频编码器", ref codecIdx, codecs, codecs.Length))
+            if (ImGui.Combo(Loc.T("Config.VideoEncoder"), ref codecIdx, codecs, codecs.Length))
             {
                 config.VideoCodec = codecs[codecIdx];
                 SaveConfig(config);
             }
 
             string preset = config.EncoderPreset;
-            if (ImGui.InputText("预设 (auto=推荐)", ref preset, 64))
+            if (ImGui.InputText(Loc.T("Config.Preset"), ref preset, 64))
             {
                 config.EncoderPreset = preset;
             }
             SaveConfigAfterItemEdit(config);
-            ImGui.TextDisabled($"实际预设: {config.ResolvePreset()}");
+            ImGui.TextDisabled(Loc.T("Config.ActualPreset", config.ResolvePreset()));
         }
+    }
+
+    private void DrawDiagnosticsSettings(Configuration config)
+    {
+        ImGui.Text(Loc.T("Config.DiagnosticsSettings"));
+
+        bool telemetry = config.EnablePocketBackendTelemetry;
+        if (ImGui.Checkbox(Loc.T("Config.EnableTelemetry"), ref telemetry))
+        {
+            config.EnablePocketBackendTelemetry = telemetry;
+            SaveConfig(config);
+        }
+        ImGui.TextDisabled(Loc.T("Config.TelemetryDesc"));
     }
 
     private void DrawBundledFFmpegControls(Configuration config)
@@ -341,10 +415,10 @@ internal sealed class ConfigWindow : Window
         if (busy)
         {
             ImGui.BeginDisabled();
-            ImGui.Button("下载中", new Vector2(-1, 0));
+            ImGui.Button(Loc.T("Config.Downloading"), new Vector2(-1, 0));
             ImGui.EndDisabled();
         }
-        else if (ImGui.Button("下载/更新内置 FFmpeg", new Vector2(-1, 0)))
+        else if (ImGui.Button(Loc.T("Config.DownloadUpdateFFmpeg"), new Vector2(-1, 0)))
         {
             StartBundledFFmpegInstall(config);
         }
@@ -360,7 +434,7 @@ internal sealed class ConfigWindow : Window
     private void StartBundledFFmpegInstall(Configuration config)
     {
         _ffmpegInstallInProgress = true;
-        _ffmpegInstallStatus = "正在下载 FFmpeg...";
+        _ffmpegInstallStatus = Loc.T("Warmup.DownloadingFFmpeg");
 
         var thread = new Thread(() =>
         {
@@ -370,12 +444,12 @@ internal sealed class ConfigWindow : Window
                     Plugin.PluginInterface.GetPluginConfigDirectory());
                 config.FFmpegPath = installedPath;
                 config.Save(Plugin.PluginInterface);
-                _ffmpegInstallStatus = $"已安装: {installedPath}";
+                _ffmpegInstallStatus = Loc.T("Warmup.FFmpegInstalled", installedPath);
             }
             catch (Exception ex)
             {
                 Plugin.Log!.Error($"[FFmpeg] Manual install/update failed: {ex}");
-                _ffmpegInstallStatus = $"下载失败: {ex.Message}";
+                _ffmpegInstallStatus = Loc.T("Warmup.FFmpegDownloadFailed", ex.Message);
             }
             finally
             {
@@ -392,41 +466,41 @@ internal sealed class ConfigWindow : Window
     private static string GetEncodingModeText(Configuration config)
     {
         if (config.ForceFFmpegRecording)
-            return config.EffectiveForceFFmpegFallbackForTesting ? "本地测试 FFmpeg 录制" : "FFmpeg 录制";
+            return config.EffectiveForceFFmpegFallbackForTesting ? Loc.T("Config.EncodingModeFFmpegTest") : Loc.T("Config.EncodingModeFFmpeg");
 
         if (config.VideoCodec != "auto")
-            return $"高级 ({config.VideoCodec})";
+            return Loc.T("Config.EncodingModeAdvanced", config.VideoCodec);
 
         return config.UseHardwareEncoder
-            ? "自动选择硬件编码器，失败时回退兼容模式"
-            : "兼容模式";
+            ? Loc.T("Config.EncodingModeAutoHw")
+            : Loc.T("Config.EncodingModeCompatible");
     }
 
     private static string GetAudioModeDescription(AudioCaptureMode mode)
     {
         return mode switch
         {
-            AudioCaptureMode.Game => "只录制 FFXIV 进程及其子进程的声音。",
-            AudioCaptureMode.System => "录制默认播放设备上的全部系统声音。",
-            _ => "视频将不包含音轨。",
+            AudioCaptureMode.Game => Loc.T("Config.AudioGameDesc"),
+            AudioCaptureMode.System => Loc.T("Config.AudioSystemDesc"),
+            _ => Loc.T("Config.AudioOffDesc"),
         };
     }
 
     private void DrawOutputSettings(Configuration config)
     {
-        ImGui.Text("输出设置");
+        ImGui.Text(Loc.T("Config.OutputSettings"));
 
         string dir = config.OutputDirectory;
-        if (ImGui.InputText("输出目录 (空=默认)", ref dir, 256))
+        if (ImGui.InputText(Loc.T("Config.OutputDirectory"), ref dir, 256))
         {
             config.OutputDirectory = dir;
         }
         SaveConfigAfterItemEdit(config);
 
         string effectiveDir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
-        ImGui.TextDisabled($"当前: {effectiveDir}");
+        ImGui.TextDisabled(Loc.T("Config.CurrentPath", effectiveDir));
 
-        if (ImGui.Button("打开输出目录"))
+        if (ImGui.Button(Loc.T("Config.OpenOutputDir")))
         {
             try
             {
@@ -439,11 +513,11 @@ internal sealed class ConfigWindow : Window
         }
 
         ImGui.SameLine();
-        if (ImGui.Button("录像列表"))
+        if (ImGui.Button(Loc.T("Config.RecordingList")))
             _plugin.RecordingListWindow.IsOpen = true;
 
         int retentionDays = config.RecordingRetentionDays;
-        ImGui.InputInt("录像保存期限 (天，0=永久)", ref retentionDays);
+        ImGui.InputInt(Loc.T("Config.RetentionDays"), ref retentionDays);
         if (ImGui.IsItemDeactivatedAfterEdit())
         {
             config.RecordingRetentionDays = Math.Clamp(retentionDays, 0, RecordingRetentionCleanupService.MaxRetentionDays);
@@ -452,12 +526,11 @@ internal sealed class ConfigWindow : Window
 
         if (config.RecordingRetentionDays <= 0)
         {
-            ImGui.TextDisabled("自动清理关闭，不会删除任何录像。");
+            ImGui.TextDisabled(Loc.T("Config.CleanupOff"));
         }
         else
         {
-            ImGui.TextDisabled($"仅清理输出目录中早于 {config.RecordingRetentionDays} 天的 Pocket Recorder 录像。");
-            ImGui.TextDisabled("清理会永久删除文件；录制中会自动跳过。");
+            ImGui.TextDisabled(Loc.T("Config.CleanupDesc", config.RecordingRetentionDays));
         }
 
         string cleanupStatus = _plugin.RetentionCleanupService.LastStatusText;

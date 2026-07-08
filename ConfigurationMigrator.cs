@@ -1,5 +1,6 @@
 using Dalamud.Plugin;
 using Recorder.Encoding;
+using Recorder.Localization;
 using System;
 
 namespace Recorder;
@@ -168,6 +169,12 @@ internal static class ConfigurationMigrator
                 : RecordingBackendMode.Native;
             config.ForceFFmpegFallbackForTesting = false;
             SaveVersion(config, pi, 21);
+        }
+
+        if (config.Version < 22)
+        {
+            config.Language = AppLanguage.Auto;
+            SaveVersion(config, pi, 22);
         }
 
         config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;

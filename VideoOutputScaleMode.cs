@@ -1,3 +1,5 @@
+using Recorder.Localization;
+
 namespace Recorder;
 
 public enum VideoOutputScaleMode
@@ -31,8 +33,8 @@ internal static class VideoOutputScale
     public static string ToDisplayText(VideoOutputScaleMode mode)
         => mode switch
         {
-            VideoOutputScaleMode.QuarterPixels => "1/4 输出",
-            _ => "原始尺寸",
+            VideoOutputScaleMode.QuarterPixels => Loc.T("VideoScale.Quarter"),
+            _ => Loc.T("VideoScale.Original"),
         };
 
     private static int MakeEvenAtLeastTwo(int value)

@@ -11,9 +11,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.5.7</Version>
-    <AssemblyVersion>1.0.5.7</AssemblyVersion>
-    <FileVersion>1.0.5.7</FileVersion>
+    <Version>1.0.5.8</Version>
+    <AssemblyVersion>1.0.5.8</AssemblyVersion>
+    <FileVersion>1.0.5.8</FileVersion>
     <AssemblyName>PocketRecorder</AssemblyName>
     <RootNamespace>Recorder</RootNamespace>
     <NativeRecorderFfmpegRoot Condition="'$(NativeRecorderFfmpegRoot)' == ''">lib\native\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</NativeRecorderFfmpegRoot>
@@ -36,8 +36,10 @@
     <None Remove="PocketRecorder.json" />
     <None Remove="images\icon.png" />
     <EmbeddedResource Include="PocketRecorder.json" />
+    <EmbeddedResource Include="Localization\locales\*.json" />
     <Content Include="PocketRecorder.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="images\star-*.png" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderOutputDll)" Condition="'$(NativeRecorderAutoBuild)' == 'true' or Exists('$(NativeRecorderOutputDll)')" Link="NativeRecorder.abi13.dll" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avformat-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avcodec-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />

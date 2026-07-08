@@ -2,6 +2,8 @@ using Recorder.Encoding;
 using System;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -17,7 +19,9 @@ internal sealed record RecordingTelemetryContext(
     string RequestedCodec,
     string SelectedBackendReason,
     string? NativeProbeReason,
-    string NativeNvencSdk = "");
+    string NativeNvencSdk = "",
+    string CpuName = "",
+    int TotalMemoryMB = 0);
 
 internal readonly record struct RecordingGpuInfo(string Vendor, string AdapterName);
 
@@ -88,6 +92,50 @@ internal static class RecordingTelemetry
         }
 
         return new RecordingGpuInfo("unknown", adapterName ?? string.Empty);
+    }
+
+    public static string DetectCpuName()
+    {
+        try
+        {
+            if (TryReadRegistryString(
+                    HKeyLocalMachine,
+                    @"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                    "ProcessorNameString",
+                    out string? value) &&
+                !string.IsNullOrWhiteSpace(value))
+            {
+                return value.Trim();
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+
+        try
+        {
+            return $"{Environment.ProcessorCount} cores";
+        }
+        catch
+        {
+            return "unknown";
+        }
+    }
+
+    public static int DetectTotalMemoryMB()
+    {
+        try
+        {
+            if (GetPhysicallyInstalledSystemMemory(out ulong totalKb))
+                return (int)Math.Min(totalKb / 1024, int.MaxValue);
+        }
+        catch
+        {
+            // ignore
+        }
+
+        return 0;
     }
 
     public static string BackendMode(string backendId, string? backendLabel)
@@ -178,4 +226,53 @@ internal static class RecordingTelemetry
     private static bool IsNone(string value)
         => value.Length == 0 ||
            string.Equals(value, "<none>", StringComparison.OrdinalIgnoreCase);
+
+    #region Windows P/Invoke helpers for system info
+
+    private const int HKeyLocalMachine = unchecked((int)0x80000002);
+    private const int KeyRead = 0x20019;
+    private const int RegSz = 1;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetPhysicallyInstalledSystemMemory(out ulong totalMemoryInKilobytes);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int RegOpenKeyEx(int hKey, string subKey, int ulOptions, int samDesired, out IntPtr phkResult);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int RegQueryValueEx(IntPtr hKey, string lpValueName, IntPtr lpReserved, out int lpType, [Out] byte[] lpData, ref int lpcbData);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern int RegCloseKey(IntPtr hKey);
+
+    private static bool TryReadRegistryString(int rootKey, string subKey, string valueName, out string? value)
+    {
+        value = null;
+        IntPtr hKey = IntPtr.Zero;
+        try
+        {
+            if (RegOpenKeyEx(rootKey, subKey, 0, KeyRead, out hKey) != 0)
+                return false;
+
+            int type;
+            int dataSize = 512;
+            byte[] data = new byte[dataSize];
+            if (RegQueryValueEx(hKey, valueName, IntPtr.Zero, out type, data, ref dataSize) != 0 || type != RegSz)
+                return false;
+
+            int charCount = dataSize / 2;
+            if (charCount > 0 && data[(charCount - 1) * 2] == 0 && data[(charCount - 1) * 2 + 1] == 0)
+                charCount--;
+            value = System.Text.Encoding.Unicode.GetString(data, 0, charCount * 2);
+            return true;
+        }
+        finally
+        {
+            if (hKey != IntPtr.Zero)
+                RegCloseKey(hKey);
+        }
+    }
+
+    #endregion
 }

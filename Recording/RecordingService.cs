@@ -2,6 +2,7 @@ using Dalamud.Plugin.Services;
 using Recorder.Capture;
 using Recorder.Diagnostics;
 using Recorder.Encoding;
+using Recorder.Localization;
 using Recorder.Telemetry;
 using System;
 using System.Diagnostics;
@@ -255,7 +256,9 @@ internal sealed class RecordingService : IDisposable
                 request.VideoCodec,
                 backendPlan.Reason,
                 backendPlan.NativeRecorderProbeReason,
-                GetNativeNvencSdkSummary(backendPlan.Backend));
+                GetNativeNvencSdkSummary(backendPlan.Backend),
+                RecordingTelemetry.DetectCpuName(),
+                RecordingTelemetry.DetectTotalMemoryMB());
             RecordingDiagnosticLog.UpdateRecordingContext(_telemetryContext);
 
             _request = request;
@@ -821,7 +824,7 @@ internal sealed class RecordingService : IDisposable
             _videoHeight = 0;
             _videoPixelFormat = VideoPixelFormat.Bgra;
             _nativeStartupGate.Reset();
-            _currentBackend = _backendPlan?.PreparingText ?? "FFmpeg fallback 准备中";
+            _currentBackend = _backendPlan?.PreparingText ?? Loc.T("Warmup.PreparingText");
             _lifecycle = RecordingLifecycle.Preparing;
             _softFps.Reset(log: false);
         }
@@ -875,7 +878,7 @@ internal sealed class RecordingService : IDisposable
         {
             try
             {
-                Plugin.ChatGui.PrintError("[Pocket Recorder] NVIDIA 驱动版本过旧，无法开启原生录制，已自动降档至 FFmpeg 录制，请更新驱动。");
+                Plugin.ChatGui.PrintError($"[Pocket Recorder] {Loc.T("NvencDriver.ChatMessage")}");
             }
             catch (Exception notifyEx)
             {

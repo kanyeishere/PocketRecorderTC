@@ -176,7 +176,8 @@ internal static class RecordingDiagnosticLog
                 string line =
                     $"Record | gpuVendor={Normalize(context.GpuVendor)}, gpuAdapter={Normalize(context.GpuAdapter)}, " +
                     $"backendMode={Normalize(context.BackendMode)}, backendLabel={Normalize(context.BackendLabel)}, " +
-                    $"dalamudApiLevel={context.DalamudApiLevel}, nativeNvencSdk={Normalize(context.NativeNvencSdk)}";
+                    $"dalamudApiLevel={context.DalamudApiLevel}, nativeNvencSdk={Normalize(context.NativeNvencSdk)}, " +
+                    $"cpuName={Normalize(context.CpuName)}, totalMemoryMB={context.TotalMemoryMB}";
                 if (!string.IsNullOrWhiteSpace(_logPath))
                     AppendLineNoLock(line);
                 else
@@ -331,6 +332,8 @@ internal static class RecordingDiagnosticLog
                     context.SelectedBackendReason,
                     context.NativeProbeReason,
                     context.NativeNvencSdk,
+                    context.CpuName,
+                    context.TotalMemoryMB,
                     FinalFrameDiagnostics = finalFrameDiagnostics,
                 });
     }

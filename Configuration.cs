@@ -1,6 +1,7 @@
 using Dalamud.Configuration;
 using Dalamud.Plugin;
 using Recorder.Encoding;
+using Recorder.Localization;
 using System;
 
 namespace Recorder;
@@ -8,7 +9,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 21;
+    public int Version { get; set; } = 22;
 
     /// <summary>匿名安装标识，仅用于 Pocket Backend 独立用户统计。</summary>
     public string InstallId { get; set; } = Guid.NewGuid().ToString("N");
@@ -79,6 +80,9 @@ public class Configuration : IPluginConfiguration
     /// <summary>是否在录制中包含 Dalamud 界面（Overlay）。</summary>
     public bool IncludeOverlay { get; set; } = false;
 
+    /// <summary>界面语言选择。Auto 表示跟随 Dalamud 客户端语言。</summary>
+    public AppLanguage Language { get; set; } = AppLanguage.Auto;
+
     /// <summary>录制开始/停止快捷键命令文本。</summary>
     public string ToggleCommand { get; set; } = "/pocketrecorder";
 
@@ -93,6 +97,9 @@ public class Configuration : IPluginConfiguration
 
     /// <summary>是否已经保存过悬浮录制按钮位置。</summary>
     public bool HasFloatingRecordButtonPosition { get; set; } = false;
+
+    /// <summary>悬浮录制按钮缩放比例。</summary>
+    public float FloatingRecordButtonScale { get; set; } = 1.0f;
 
     public static Configuration Load(IDalamudPluginInterface pi)
     {

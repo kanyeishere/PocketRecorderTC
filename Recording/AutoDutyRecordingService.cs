@@ -4,6 +4,7 @@ using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.System.Framework;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using Lumina.Excel.Sheets;
+using Recorder.Localization;
 using System;
 using System.IO;
 using System.Text.RegularExpressions;
@@ -49,10 +50,10 @@ internal sealed class AutoDutyRecordingService : IDisposable
         {
             lock (_sync)
             {
-                if (_autoRecordingActive)
-                    return $"自动录制中: {_recordDutyName}";
+                                if (_autoRecordingActive)
+                    return Loc.T("AutoDuty.Recording", _recordDutyName);
 
-                return "等待倒计时";
+                return Loc.T("AutoDuty.Waiting");
             }
         }
     }

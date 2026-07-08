@@ -1,6 +1,10 @@
 using ImGuiNET;
+using Dalamud.Interface.Textures;
+using Dalamud.Interface.Textures.TextureWraps;
 using Dalamud.Interface.Windowing;
+using Recorder.Localization;
 using Recorder.Recording;
+using System.IO;
 using System.Numerics;
 
 namespace Recorder.Windows;
@@ -8,11 +12,27 @@ namespace Recorder.Windows;
 internal sealed class FloatingRecordWindow : Window
 {
     private readonly Plugin _plugin;
-    private readonly Vector2 _buttonSize = new(58f, 58f);
-    private readonly Vector2 _starButtonSize = new(32f, 58f);
-    private readonly Vector2 _windowPadding = new(7f, 7f);
-    private readonly Vector2 _compactWindowSize = new(72f, 72f);
-    private readonly Vector2 _starWindowSize = new(109f, 72f);
+
+    // Base sizes (at scale = 1.0)
+    private const float BaseButtonSize = 58f;
+    private const float BasePadding = 7f;
+    private const float BaseStarButtonWidth = 32f;
+    private const float BaseStarIconSize = 25f;
+    private const float BaseCompactWindow = BaseButtonSize + BasePadding * 2f;
+    private const float BaseStarWindow = BaseButtonSize + BaseStarButtonWidth + BasePadding * 2f + 5f;
+
+    private float Scale => Math.Clamp(_plugin.Config.FloatingRecordButtonScale, 0.5f, 2.0f);
+    private Vector2 ButtonSize => new(BaseButtonSize * Scale);
+    private Vector2 StarButtonSize => new(BaseStarButtonWidth * Scale, BaseButtonSize * Scale);
+    private Vector2 StarIconSize => new(BaseStarIconSize * Scale);
+    private Vector2 WindowPadding => new(BasePadding * Scale);
+    private Vector2 CompactWindowSize => new(BaseCompactWindow * Scale);
+    private Vector2 StarWindowSize => new(BaseStarWindow * Scale, BaseCompactWindow * Scale);
+
+    private ISharedImmediateTexture? _starNormalTexture;
+    private ISharedImmediateTexture? _starHoverTexture;
+    private ISharedImmediateTexture? _starActiveTexture;
+    private bool _starTextureLoadAttempted;
     private bool _wasDragging;
     private bool _rightDragStartedOnButton;
     private Vector2 _rightDragStartMousePos;
@@ -24,7 +44,7 @@ internal sealed class FloatingRecordWindow : Window
     {
         _plugin = plugin;
         IsOpen = _plugin.Config.ShowFloatingRecordButton;
-        Size = _compactWindowSize;
+        Size = CompactWindowSize;
         SizeCondition = ImGuiCond.Always;
         Position = _plugin.Config.FloatingRecordButtonPosition;
         PositionCondition = _plugin.Config.HasFloatingRecordButtonPosition
@@ -55,7 +75,7 @@ internal sealed class FloatingRecordWindow : Window
         var phase = _plugin.RecordingService.Phase;
         bool active = phase is RecordingPhase.Preparing or RecordingPhase.Recording;
         bool busy = phase == RecordingPhase.Finalizing || ffmpegBusy;
-        Size = active ? _starWindowSize : _compactWindowSize;
+        Size = active ? StarWindowSize : CompactWindowSize;
         SizeCondition = ImGuiCond.Always;
         _suppressContextMenuThisFrame = false;
         bool pressed = DrawCyberRecordButton(active, busy);
@@ -68,12 +88,12 @@ internal sealed class FloatingRecordWindow : Window
             ImGui.BeginTooltip();
             ImGui.TextUnformatted(
                 ffmpegBusy
-                    ? "正在下载必要组件"
+                    ? Loc.T("Floating.TooltipDownloading")
                     : active
-                        ? "- 左键停止录制\n- 右键单击打开菜单\n- 右键按住拖动"
+                        ? Loc.T("Floating.TooltipStop")
                         : busy
-                            ? "保存中"
-                            : "- 左键开始录制\n- 右键单击打开菜单\n- 右键按住拖动");
+                            ? Loc.T("Floating.TooltipSaving")
+                            : Loc.T("Floating.TooltipStart"));
             ImGui.EndTooltip();
         }
 
@@ -91,16 +111,16 @@ internal sealed class FloatingRecordWindow : Window
         if (!_suppressContextMenuThisFrame &&
             ImGui.BeginPopup("PocketRecorderFloatingMenu"))
         {
-            if (ImGui.MenuItem("打开设置"))
+            if (ImGui.MenuItem(Loc.T("Floating.OpenSettings")))
                 _plugin.ConfigWindow.IsOpen = true;
 
-            if (ImGui.MenuItem("录像列表"))
+            if (ImGui.MenuItem(Loc.T("Floating.RecordingList")))
                 _plugin.RecordingListWindow.IsOpen = true;
 
-            if (ImGui.MenuItem("打开输出目录"))
+            if (ImGui.MenuItem(Loc.T("Floating.OpenOutputDir")))
                 OpenOutputDirectory();
 
-            if (ImGui.MenuItem("重置位置"))
+            if (ImGui.MenuItem(Loc.T("Floating.ResetPosition")))
             {
                 _plugin.Config.FloatingRecordButtonPosition = new Vector2(48f, 180f);
                 _plugin.Config.HasFloatingRecordButtonPosition = true;
@@ -110,7 +130,7 @@ internal sealed class FloatingRecordWindow : Window
             }
 
             bool show = _plugin.Config.ShowFloatingRecordButton;
-            if (ImGui.MenuItem("显示悬浮按钮", string.Empty, show))
+            if (ImGui.MenuItem(Loc.T("Floating.ShowFloatingButton"), string.Empty, show))
             {
                 _plugin.Config.ShowFloatingRecordButton = !show;
                 _plugin.Config.Save(Plugin.PluginInterface);
@@ -124,9 +144,9 @@ internal sealed class FloatingRecordWindow : Window
     {
         bool starred = _plugin.RecordingService.CurrentRecordingStarred;
 
-        ImGui.SameLine(0f, 5f);
-        ImGui.SetCursorPosY(_windowPadding.Y);
-        ImGui.InvisibleButton("##PocketRecorderStarButton", _starButtonSize);
+        ImGui.SameLine(0f, 5f * Scale);
+        ImGui.SetCursorPosY(WindowPadding.Y);
+        ImGui.InvisibleButton("##PocketRecorderStarButton", StarButtonSize);
 
         if (ImGui.IsItemClicked(ImGuiMouseButton.Left))
         {
@@ -148,14 +168,32 @@ internal sealed class FloatingRecordWindow : Window
             ? Color(1f, 0.72f, 0.15f, 0.38f)
             : Color(0.10f, 0.86f, 1f, hovered ? 0.42f : 0.22f);
 
-        DrawStarShape(draw, center, 11.2f, 5.2f, starFill, starStroke, starGlow, starred);
+        DrawStarTexture(draw, center, starred, hovered);
+        DrawStarShape(draw, center, 11.2f * Scale, 5.2f * Scale, starFill, starStroke, starGlow, starred);
 
         if (hovered)
         {
             ImGui.BeginTooltip();
-            ImGui.TextUnformatted(starred ? "本次录像已标星" : "标记本次录像");
+            ImGui.TextUnformatted(starred ? Loc.T("Floating.StarActive") : Loc.T("Floating.StarMark"));
             ImGui.EndTooltip();
         }
+    }
+
+    private void DrawStarTexture(ImDrawListPtr draw, Vector2 center, bool starred, bool hovered)
+    {
+        EnsureStarTextures();
+        ISharedImmediateTexture? texture = starred
+            ? _starActiveTexture
+            : hovered
+                ? _starHoverTexture
+                : _starNormalTexture;
+
+        if (texture == null)
+            return;
+
+        var wrap = texture.GetWrapOrEmpty();
+        var min = center - StarIconSize * 0.5f;
+        draw.AddImage(wrap.ImGuiHandle, min, min + StarIconSize);
     }
 
     private static void DrawStarShape(
@@ -189,13 +227,32 @@ internal sealed class FloatingRecordWindow : Window
             draw.AddLine(points[i], points[(i + 1) % points.Length], stroke, 2.2f);
     }
 
+    private void EnsureStarTextures()
+    {
+        if (_starTextureLoadAttempted)
+            return;
+
+        _starTextureLoadAttempted = true;
+        try
+        {
+            string imageDirectory = Path.Combine(Path.GetDirectoryName(typeof(Plugin).Assembly.Location) ?? string.Empty, "images");
+            _starNormalTexture = Plugin.TextureProvider.GetFromFile(Path.Combine(imageDirectory, "star-normal.png"));
+            _starHoverTexture = Plugin.TextureProvider.GetFromFile(Path.Combine(imageDirectory, "star-hover.png"));
+            _starActiveTexture = Plugin.TextureProvider.GetFromFile(Path.Combine(imageDirectory, "star-active.png"));
+        }
+        catch (System.Exception ex)
+        {
+            Plugin.Log.Warning($"[Floating] Failed to load star textures: {ex.Message}");
+        }
+    }
+
     private bool DrawCyberRecordButton(bool active, bool busy)
     {
         ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, Vector2.Zero);
         try
         {
-            ImGui.SetCursorPos(_windowPadding);
-            ImGui.InvisibleButton("##PocketRecorderCyberButton", _buttonSize);
+            ImGui.SetCursorPos(WindowPadding);
+            ImGui.InvisibleButton("##PocketRecorderCyberButton", ButtonSize);
             bool pressed = ImGui.IsItemClicked(ImGuiMouseButton.Left);
             bool hovered = ImGui.IsItemHovered();
             bool held = ImGui.IsItemActive();
@@ -216,31 +273,32 @@ internal sealed class FloatingRecordWindow : Window
             uint red = Color(1.00f, 0.18f, 0.28f, 1f);
             uint muted = Color(0.60f, 0.70f, 0.78f, 1f);
 
-            draw.AddRectFilled(min + new Vector2(3f, 4f), max + new Vector2(3f, 4f), shadow, 16f);
-            draw.AddRectFilled(min, max, shell, 16f);
-            draw.AddRect(min + new Vector2(0.5f, 0.5f), max - new Vector2(0.5f, 0.5f), cyan, 16f, ImDrawFlags.None, 1.35f);
-            draw.AddRect(min + new Vector2(4f, 4f), max - new Vector2(4f, 4f), magenta, 12f, ImDrawFlags.None, 1.1f);
+            float s = Scale;
+            draw.AddRectFilled(min + new Vector2(3f * s, 4f * s), max + new Vector2(3f * s, 4f * s), shadow, 16f * s);
+            draw.AddRectFilled(min, max, shell, 16f * s);
+            draw.AddRect(min + new Vector2(0.5f * s, 0.5f * s), max - new Vector2(0.5f * s, 0.5f * s), cyan, 16f * s, ImDrawFlags.None, 1.35f * s);
+            draw.AddRect(min + new Vector2(4f * s, 4f * s), max - new Vector2(4f * s, 4f * s), magenta, 12f * s, ImDrawFlags.None, 1.1f * s);
 
-            var panelMin = min + new Vector2(10f, 10f);
-            var panelMax = max - new Vector2(10f, 10f);
-            draw.AddRectFilled(panelMin, panelMax, panel, 10f);
-            DrawCornerTicks(draw, panelMin, panelMax, cyan, magenta);
+            var panelMin = min + new Vector2(10f * s, 10f * s);
+            var panelMax = max - new Vector2(10f * s, 10f * s);
+            draw.AddRectFilled(panelMin, panelMax, panel, 10f * s);
+            DrawCornerTicks(draw, panelMin, panelMax, cyan, magenta, s);
 
             if (busy)
             {
-                draw.AddCircle(center, 11f, muted, 28, 2.2f);
-                draw.AddCircle(center, 17f, Color(0.35f, 0.45f, 0.55f, 0.34f), 32, 1.5f);
+                draw.AddCircle(center, 11f * s, muted, 28, 2.2f * s);
+                draw.AddCircle(center, 17f * s, Color(0.35f, 0.45f, 0.55f, 0.34f), 32, 1.5f * s);
             }
             else if (active)
             {
-                var half = new Vector2(8.5f, 8.5f);
-                draw.AddRectFilled(center - half, center + half, red, 3f);
-                draw.AddRect(center - new Vector2(15f, 15f), center + new Vector2(15f, 15f), Color(1f, 0.18f, 0.28f, 0.42f), 8f, ImDrawFlags.None, 1.7f);
+                var half = new Vector2(8.5f * s, 8.5f * s);
+                draw.AddRectFilled(center - half, center + half, red, 3f * s);
+                draw.AddRect(center - new Vector2(15f * s, 15f * s), center + new Vector2(15f * s, 15f * s), Color(1f, 0.18f, 0.28f, 0.42f), 8f * s, ImDrawFlags.None, 1.7f * s);
             }
             else
             {
-                draw.AddCircleFilled(center, 9.5f, green, 32);
-                draw.AddCircle(center, 15.5f, Color(0.08f, 0.92f, 0.58f, 0.44f), 32, 2.2f);
+                draw.AddCircleFilled(center, 9.5f * s, green, 32);
+                draw.AddCircle(center, 15.5f * s, Color(0.08f, 0.92f, 0.58f, 0.44f), 32, 2.2f * s);
             }
 
             return pressed;
@@ -293,22 +351,22 @@ internal sealed class FloatingRecordWindow : Window
         PositionCondition = ImGuiCond.Always;
     }
 
-    private static void DrawCornerTicks(ImDrawListPtr draw, Vector2 min, Vector2 max, uint cyan, uint magenta)
+    private static void DrawCornerTicks(ImDrawListPtr draw, Vector2 min, Vector2 max, uint cyan, uint magenta, float scale)
     {
-        const float length = 8f;
-        const float thickness = 1.8f;
+        float length = 8f * scale;
+        float thickness = 1.8f * scale;
 
-        draw.AddLine(min + new Vector2(2f, 0f), min + new Vector2(length, 0f), cyan, thickness);
-        draw.AddLine(min + new Vector2(0f, 2f), min + new Vector2(0f, length), cyan, thickness);
+        draw.AddLine(min + new Vector2(2f * scale, 0f), min + new Vector2(length, 0f), cyan, thickness);
+        draw.AddLine(min + new Vector2(0f, 2f * scale), min + new Vector2(0f, length), cyan, thickness);
 
-        draw.AddLine(new Vector2(max.X - length, min.Y), new Vector2(max.X - 2f, min.Y), magenta, thickness);
-        draw.AddLine(new Vector2(max.X, min.Y + 2f), new Vector2(max.X, min.Y + length), magenta, thickness);
+        draw.AddLine(new Vector2(max.X - length, min.Y), new Vector2(max.X - 2f * scale, min.Y), magenta, thickness);
+        draw.AddLine(new Vector2(max.X, min.Y + 2f * scale), new Vector2(max.X, min.Y + length), magenta, thickness);
 
-        draw.AddLine(new Vector2(min.X + 2f, max.Y), new Vector2(min.X + length, max.Y), magenta, thickness);
-        draw.AddLine(new Vector2(min.X, max.Y - length), new Vector2(min.X, max.Y - 2f), magenta, thickness);
+        draw.AddLine(new Vector2(min.X + 2f * scale, max.Y), new Vector2(min.X + length, max.Y), magenta, thickness);
+        draw.AddLine(new Vector2(min.X, max.Y - length), new Vector2(min.X, max.Y - 2f * scale), magenta, thickness);
 
-        draw.AddLine(max - new Vector2(length, 0f), max - new Vector2(2f, 0f), cyan, thickness);
-        draw.AddLine(max - new Vector2(0f, length), max - new Vector2(0f, 2f), cyan, thickness);
+        draw.AddLine(max - new Vector2(length, 0f), max - new Vector2(2f * scale, 0f), cyan, thickness);
+        draw.AddLine(max - new Vector2(0f, length), max - new Vector2(0f, 2f * scale), cyan, thickness);
     }
 
     private static uint Color(float r, float g, float b, float a) =>

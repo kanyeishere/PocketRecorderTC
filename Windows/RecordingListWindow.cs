@@ -1,5 +1,6 @@
 using ImGuiNET;
 using Dalamud.Interface.Windowing;
+using Recorder.Localization;
 using Recorder.Recording;
 using System;
 using System.Collections.Generic;
@@ -22,7 +23,7 @@ internal sealed class RecordingListWindow : Window
     private SortColumn _sortColumn = SortColumn.LastWrite;
     private bool _sortAscending;
 
-    public RecordingListWindow(Plugin plugin) : base("录像列表###PocketRecorderRecordingList")
+    public RecordingListWindow(Plugin plugin) : base("###PocketRecorderRecordingList")
     {
         _plugin = plugin;
         Size = new Vector2(812, 440);
@@ -37,6 +38,8 @@ internal sealed class RecordingListWindow : Window
 
     public override void Draw()
     {
+        WindowName = Loc.T("List.WindowTitle") + "###PocketRecorderRecordingList";
+
         if (_refreshRequested || (DateTime.UtcNow - _lastRefreshUtc) > TimeSpan.FromSeconds(5))
             Refresh();
 
@@ -50,7 +53,7 @@ internal sealed class RecordingListWindow : Window
 
         if (_items.Count == 0)
         {
-            ImGui.TextDisabled("没有找到录像文件。");
+            ImGui.TextDisabled(Loc.T("List.NoFiles"));
             return;
         }
 
@@ -62,15 +65,15 @@ internal sealed class RecordingListWindow : Window
 
     private void DrawToolbar(string outputDirectory)
     {
-        if (ImGui.Button("刷新"))
+        if (ImGui.Button(Loc.T("List.Refresh")))
             Refresh();
 
         ImGui.SameLine();
-        if (ImGui.Button("打开输出目录"))
+        if (ImGui.Button(Loc.T("List.OpenOutputDir")))
             TryRun(() => ShellHelpers.OpenDirectory(outputDirectory));
 
         ImGui.SameLine();
-        ImGui.TextDisabled($"{_items.Count} 个文件");
+        ImGui.TextDisabled(Loc.T("List.FileCount", _items.Count));
 
         ImGui.TextDisabled(outputDirectory);
     }
@@ -86,11 +89,11 @@ internal sealed class RecordingListWindow : Window
             return;
 
         ImGui.TableSetupColumn("★", ImGuiTableColumnFlags.WidthFixed, 34f);
-        ImGui.TableSetupColumn("文件", ImGuiTableColumnFlags.WidthStretch);
-        ImGui.TableSetupColumn("时间", ImGuiTableColumnFlags.WidthFixed, 120f);
-        ImGui.TableSetupColumn("时长", ImGuiTableColumnFlags.WidthFixed, 78f);
-        ImGui.TableSetupColumn("大小", ImGuiTableColumnFlags.WidthFixed, 78f);
-        ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthFixed, 190f);
+        ImGui.TableSetupColumn(Loc.T("List.ColFile"), ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn(Loc.T("List.ColTime"), ImGuiTableColumnFlags.WidthFixed, 120f);
+        ImGui.TableSetupColumn(Loc.T("List.ColDuration"), ImGuiTableColumnFlags.WidthFixed, 78f);
+        ImGui.TableSetupColumn(Loc.T("List.ColSize"), ImGuiTableColumnFlags.WidthFixed, 78f);
+        ImGui.TableSetupColumn(Loc.T("List.ColActions"), ImGuiTableColumnFlags.WidthFixed, 190f);
         ImGui.TableSetupScrollFreeze(0, 1);
         DrawTableHeader();
 
@@ -104,11 +107,11 @@ internal sealed class RecordingListWindow : Window
     {
         ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
         DrawSortableHeaderCell("★", SortColumn.Starred);
-        DrawSortableHeaderCell("文件", SortColumn.FileName);
-        DrawSortableHeaderCell("时间", SortColumn.LastWrite);
-        DrawSortableHeaderCell("时长", SortColumn.Duration);
-        DrawSortableHeaderCell("大小", SortColumn.Length);
-        DrawHeaderCell("操作");
+        DrawSortableHeaderCell(Loc.T("List.ColFile"), SortColumn.FileName);
+        DrawSortableHeaderCell(Loc.T("List.ColTime"), SortColumn.LastWrite);
+        DrawSortableHeaderCell(Loc.T("List.ColDuration"), SortColumn.Duration);
+        DrawSortableHeaderCell(Loc.T("List.ColSize"), SortColumn.Length);
+        DrawHeaderCell(Loc.T("List.ColActions"));
     }
 
     private void DrawSortableHeaderCell(string text, SortColumn column)
@@ -182,7 +185,7 @@ internal sealed class RecordingListWindow : Window
             ImGui.EndDisabled();
 
         if (ImGui.IsItemHovered())
-            DrawTooltip(disabled ? "录制中的文件暂不能改名" : item.Starred ? "取消星标" : "标为星标");
+            DrawTooltip(disabled ? Loc.T("List.CannotRenameRecording") : item.Starred ? Loc.T("List.StarRemove") : Loc.T("List.StarMark"));
     }
 
     private void DrawActions(RecordingFileItem item, bool disabled)
@@ -190,25 +193,25 @@ internal sealed class RecordingListWindow : Window
         if (disabled)
             ImGui.BeginDisabled();
 
-        if (ImGui.SmallButton("播放"))
+        if (ImGui.SmallButton(Loc.T("List.Play")))
             TryRun(() => ShellHelpers.OpenFile(item.FullPath));
 
         ImGui.SameLine();
-        if (ImGui.SmallButton("定位"))
+        if (ImGui.SmallButton(Loc.T("List.Locate")))
             TryRun(() => ShellHelpers.ShowFileInExplorer(item.FullPath));
 
         ImGui.SameLine();
 
         if (_deleteConfirmPath != null && string.Equals(_deleteConfirmPath, item.FullPath, StringComparison.OrdinalIgnoreCase))
         {
-            if (ImGui.SmallButton("确认"))
+            if (ImGui.SmallButton(Loc.T("List.Confirm")))
                 DeleteFile(item.FullPath);
 
             ImGui.SameLine();
-            if (ImGui.SmallButton("取消"))
+            if (ImGui.SmallButton(Loc.T("List.Cancel")))
                 _deleteConfirmPath = null;
         }
-        else if (ImGui.SmallButton("删除"))
+        else if (ImGui.SmallButton(Loc.T("List.Delete")))
         {
             _deleteConfirmPath = item.FullPath;
         }
@@ -217,7 +220,7 @@ internal sealed class RecordingListWindow : Window
             ImGui.EndDisabled();
 
         if (disabled && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-            DrawTooltip("录制中的文件暂不能操作");
+            DrawTooltip(Loc.T("List.CannotOperateRecording"));
     }
 
     private void ToggleFileStar(RecordingFileItem item)
@@ -249,7 +252,7 @@ internal sealed class RecordingListWindow : Window
         string outputDirectory = _plugin.Config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
         if (!Directory.Exists(outputDirectory))
         {
-            _statusText = "输出目录不存在。";
+            _statusText = Loc.T("List.OutputDirNotExist");
             return;
         }
 
@@ -275,7 +278,7 @@ internal sealed class RecordingListWindow : Window
         }
         catch (Exception ex)
         {
-            _statusText = $"读取录像列表失败: {ex.Message}";
+            _statusText = Loc.T("List.ReadListFailed", ex.Message);
             Plugin.Log.Warning($"[RecordingList] Refresh failed: {ex}");
         }
     }

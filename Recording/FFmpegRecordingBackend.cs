@@ -1,6 +1,7 @@
 using Recorder.Capture;
 using Recorder.Diagnostics;
 using Recorder.Encoding;
+using Recorder.Localization;
 using System;
 
 namespace Recorder.Recording;
@@ -16,7 +17,7 @@ internal sealed class FFmpegRecordingBackend : IRecordingBackend
 
     public string Id => "ffmpeg";
     public string DisplayName => "FFmpeg";
-    public string PreparingText => "FFmpeg 准备中";
+    public string PreparingText => Loc.T("Backend.FFmpegPreparing");
     public bool PrefersD3D11TextureFrames => false;
 
     public RecordingBackendCapabilities Capabilities { get; } = new(

@@ -1,3 +1,4 @@
+using Recorder.Localization;
 using System;
 using System.IO;
 using System.Text.RegularExpressions;
@@ -48,7 +49,7 @@ internal sealed class RecordingRetentionCleanupService : IDisposable
         get
         {
             if (IsCleanupRunning)
-                return "正在清理旧录像...";
+                return Loc.T("Retention.Cleaning");
 
             lock (_statusSync)
                 return _lastResult?.StatusText ?? string.Empty;
@@ -80,7 +81,7 @@ internal sealed class RecordingRetentionCleanupService : IDisposable
         }
         catch (Exception ex)
         {
-            var result = CleanupResult.Create($"清理旧录像失败: {ex.Message}");
+            var result = CleanupResult.Create(Loc.T("Retention.Failed", ex.Message));
             SetLastResult(result);
             _log.Warning($"[Retention] Cleanup failed: {ex}");
         }
@@ -97,11 +98,11 @@ internal sealed class RecordingRetentionCleanupService : IDisposable
             return null;
 
         if (_plugin.RecordingService.Phase != RecordingPhase.Idle)
-            return CleanupResult.Create("录制中，已跳过旧录像清理。");
+            return CleanupResult.Create(Loc.T("Retention.SkippedRecording"));
 
         string configuredDirectory = _plugin.Config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
         if (string.IsNullOrWhiteSpace(configuredDirectory) || !Directory.Exists(configuredDirectory))
-            return CleanupResult.Create("输出目录不存在，已跳过旧录像清理。");
+            return CleanupResult.Create(Loc.T("Retention.OutputDirNotExist"));
 
         if (!TryGetSafeDirectory(configuredDirectory, out string outputDirectory, out string unsafeReason))
             return CleanupResult.Create(unsafeReason);
@@ -136,10 +137,10 @@ internal sealed class RecordingRetentionCleanupService : IDisposable
         }
 
         string message = failedFiles > 0
-            ? $"已删除 {deletedFiles} 个旧录像，释放 {FormatBytes(deletedBytes)}，失败 {failedFiles} 个。"
+            ? Loc.T("Retention.DeletedWithFailures", deletedFiles, FormatBytes(deletedBytes), failedFiles)
             : deletedFiles > 0
-                ? $"已删除 {deletedFiles} 个旧录像，释放 {FormatBytes(deletedBytes)}。"
-                : "没有需要清理的旧录像。";
+                ? Loc.T("Retention.Deleted", deletedFiles, FormatBytes(deletedBytes))
+                : Loc.T("Retention.NothingToDelete");
 
         _log.Info($"[Retention] Cleanup {trigger}: retentionDays={retentionDays}, deleted={deletedFiles}, bytes={deletedBytes}, failed={failedFiles}");
         return CleanupResult.Create(message);
@@ -162,7 +163,7 @@ internal sealed class RecordingRetentionCleanupService : IDisposable
         if (!string.IsNullOrWhiteSpace(normalizedRoot) &&
             string.Equals(normalizedDirectory, normalizedRoot, StringComparison.OrdinalIgnoreCase))
         {
-            failureReason = "输出目录是磁盘根目录，已跳过旧录像清理。";
+            failureReason = Loc.T("Retention.RootDirectory");
             return false;
         }
 
@@ -200,7 +201,7 @@ internal sealed class RecordingRetentionCleanupService : IDisposable
 
     private sealed record CleanupResult(DateTimeOffset FinishedAt, string Message)
     {
-        public string StatusText => $"上次清理 {FinishedAt.LocalDateTime:MM-dd HH:mm}: {Message}";
+        public string StatusText => Loc.T("Retention.LastCleanup", FinishedAt.LocalDateTime.ToString("MM-dd HH:mm"), Message);
 
         public static CleanupResult Create(string message)
             => new(DateTimeOffset.Now, message);

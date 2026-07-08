@@ -1,3 +1,5 @@
+using Recorder.Localization;
+
 namespace Recorder.Recording;
 
 internal static class RecordingPhaseExtensions
@@ -6,10 +8,10 @@ internal static class RecordingPhaseExtensions
     {
         return phase switch
         {
-            RecordingPhase.Idle => "待机",
-            RecordingPhase.Preparing => "准备中",
-            RecordingPhase.Recording => "录制中",
-            RecordingPhase.Finalizing => "保存中",
+            RecordingPhase.Idle => Loc.T("Phase.Idle"),
+            RecordingPhase.Preparing => Loc.T("Phase.Preparing"),
+            RecordingPhase.Recording => Loc.T("Phase.Recording"),
+            RecordingPhase.Finalizing => Loc.T("Phase.Finalizing"),
             _ => phase.ToString(),
         };
     }
