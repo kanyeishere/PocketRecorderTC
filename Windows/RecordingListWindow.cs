@@ -14,10 +14,16 @@ internal sealed class RecordingListWindow : Window
     private const string StarFilled = "★";
     private const string StarHollow = "☆";
 
+    private static readonly Vector4 RowHoverBg = new(0.96f, 0.67f, 0.18f, 0.30f);
+    private static readonly Vector4 RowSelectedBg = new(0.12f, 0.38f, 0.82f, 0.78f);
+    private static readonly Vector4 RowSelectedHoverBg = new(0.18f, 0.52f, 1f, 0.86f);
+    private static readonly Vector4 RowSelectedText = new(1f, 1f, 1f, 1f);
+
     private readonly Plugin _plugin;
     private readonly List<RecordingFileItem> _items = [];
     private DateTime _lastRefreshUtc = DateTime.MinValue;
     private string _statusText = string.Empty;
+    private string? _selectedPath;
     private string? _deleteConfirmPath;
     private bool _refreshRequested;
     private SortColumn _sortColumn = SortColumn.LastWrite;
@@ -145,11 +151,17 @@ internal sealed class RecordingListWindow : Window
     private void DrawRow(RecordingFileItem item)
     {
         bool isCurrent = IsCurrentRecordingFile(item.FullPath);
+        bool isSelected = IsSelectedRecordingFile(item.FullPath);
 
         ImGui.PushID(item.FullPath);
         ImGui.TableNextRow();
 
         ImGui.TableNextColumn();
+        isSelected = ApplyRowInteraction(item, isSelected);
+
+        if (isSelected)
+            ImGui.PushStyleColor(ImGuiCol.Text, RowSelectedText);
+
         DrawStarToggle(item, isCurrent);
 
         ImGui.TableNextColumn();
@@ -170,7 +182,38 @@ internal sealed class RecordingListWindow : Window
         ImGui.TableNextColumn();
         DrawActions(item, isCurrent);
 
+        if (isSelected)
+            ImGui.PopStyleColor();
+
         ImGui.PopID();
+    }
+
+    private bool ApplyRowInteraction(RecordingFileItem item, bool isSelected)
+    {
+        var style = ImGui.GetStyle();
+        Vector2 rowMin = ImGui.GetCursorScreenPos() - new Vector2(0f, style.CellPadding.Y);
+        float rowWidth = MathF.Max(1f, ImGui.GetWindowWidth());
+        Vector2 rowMax = rowMin + new Vector2(rowWidth, ImGui.GetFrameHeight() + style.CellPadding.Y * 2f);
+        bool hovered = ImGui.IsMouseHoveringRect(rowMin, rowMax);
+
+        if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+        {
+            _selectedPath = item.FullPath;
+            isSelected = true;
+        }
+
+        if (isSelected)
+        {
+            ImGui.TableSetBgColor(
+                ImGuiTableBgTarget.RowBg0,
+                ImGui.ColorConvertFloat4ToU32(hovered ? RowSelectedHoverBg : RowSelectedBg));
+        }
+        else if (hovered)
+        {
+            ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.ColorConvertFloat4ToU32(RowHoverBg));
+        }
+
+        return isSelected;
     }
 
     private void DrawStarToggle(RecordingFileItem item, bool disabled)
@@ -227,7 +270,10 @@ internal sealed class RecordingListWindow : Window
     {
         TryRun(() =>
         {
-            RecordingFileNames.RenameStarred(item.FullPath, !item.Starred);
+            string newPath = RecordingFileNames.RenameStarred(item.FullPath, !item.Starred);
+            if (IsSelectedRecordingFile(item.FullPath))
+                _selectedPath = newPath;
+
             _deleteConfirmPath = null;
             RequestRefresh();
         });
@@ -238,6 +284,9 @@ internal sealed class RecordingListWindow : Window
         TryRun(() =>
         {
             File.Delete(path);
+            if (IsSelectedRecordingFile(path))
+                _selectedPath = null;
+
             _deleteConfirmPath = null;
             RequestRefresh();
         });
@@ -274,6 +323,9 @@ internal sealed class RecordingListWindow : Window
             }
 
             ApplySort();
+            if (_selectedPath != null && !_items.Exists(item => PathsEqual(item.FullPath, _selectedPath)))
+                _selectedPath = null;
+
             _statusText = string.Empty;
         }
         catch (Exception ex)
@@ -328,13 +380,23 @@ internal sealed class RecordingListWindow : Window
         if (string.IsNullOrWhiteSpace(current))
             return false;
 
+        return PathsEqual(path, current);
+    }
+
+    private bool IsSelectedRecordingFile(string path) => PathsEqual(path, _selectedPath);
+
+    private static bool PathsEqual(string? left, string? right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+            return false;
+
         try
         {
-            return string.Equals(Path.GetFullPath(path), Path.GetFullPath(current), StringComparison.OrdinalIgnoreCase);
+            return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
         }
         catch
         {
-            return string.Equals(path, current, StringComparison.OrdinalIgnoreCase);
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
         }
     }
 
