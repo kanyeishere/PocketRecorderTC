@@ -194,7 +194,7 @@ internal sealed class RecordingListWindow : Window
         Vector2 rowMin = ImGui.GetCursorScreenPos() - style.CellPadding;
         Vector2 rowMax = new(
             ImGui.GetWindowPos().X + ImGui.GetWindowWidth() - style.WindowPadding.X,
-            rowMin.Y + ImGui.GetFrameHeight() + style.CellPadding.Y * 2f);
+            rowMin.Y + ImGui.GetTextLineHeight() + style.CellPadding.Y * 2f);
         Vector2 mouse = ImGui.GetMousePos();
         bool hovered = mouse.X >= rowMin.X &&
                        mouse.X <= rowMax.X &&
