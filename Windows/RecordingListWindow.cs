@@ -191,10 +191,15 @@ internal sealed class RecordingListWindow : Window
     private bool ApplyRowInteraction(RecordingFileItem item, bool isSelected)
     {
         var style = ImGui.GetStyle();
-        Vector2 rowMin = ImGui.GetCursorScreenPos() - new Vector2(0f, style.CellPadding.Y);
-        float rowWidth = MathF.Max(1f, ImGui.GetWindowWidth());
-        Vector2 rowMax = rowMin + new Vector2(rowWidth, ImGui.GetFrameHeight() + style.CellPadding.Y * 2f);
-        bool hovered = ImGui.IsMouseHoveringRect(rowMin, rowMax);
+        Vector2 rowMin = ImGui.GetCursorScreenPos() - style.CellPadding;
+        Vector2 rowMax = new(
+            ImGui.GetWindowPos().X + ImGui.GetWindowWidth() - style.WindowPadding.X,
+            rowMin.Y + ImGui.GetFrameHeight() + style.CellPadding.Y * 2f);
+        Vector2 mouse = ImGui.GetMousePos();
+        bool hovered = mouse.X >= rowMin.X &&
+                       mouse.X <= rowMax.X &&
+                       mouse.Y >= rowMin.Y &&
+                       mouse.Y <= rowMax.Y;
 
         if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
         {
@@ -202,18 +207,21 @@ internal sealed class RecordingListWindow : Window
             isSelected = true;
         }
 
-        if (isSelected)
-        {
-            ImGui.TableSetBgColor(
-                ImGuiTableBgTarget.RowBg0,
-                ImGui.ColorConvertFloat4ToU32(hovered ? RowSelectedHoverBg : RowSelectedBg));
-        }
-        else if (hovered)
-        {
-            ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.ColorConvertFloat4ToU32(RowHoverBg));
-        }
+        Vector4? bgColor = isSelected
+            ? hovered ? RowSelectedHoverBg : RowSelectedBg
+            : hovered ? RowHoverBg : null;
+        if (bgColor.HasValue)
+            DrawRowBackground(rowMin, rowMax, bgColor.Value);
 
         return isSelected;
+    }
+
+    private static void DrawRowBackground(Vector2 rowMin, Vector2 rowMax, Vector4 color)
+    {
+        var draw = ImGui.GetWindowDrawList();
+        draw.PushClipRect(rowMin, rowMax, false);
+        draw.AddRectFilled(rowMin, rowMax, ImGui.ColorConvertFloat4ToU32(color));
+        draw.PopClipRect();
     }
 
     private void DrawStarToggle(RecordingFileItem item, bool disabled)
