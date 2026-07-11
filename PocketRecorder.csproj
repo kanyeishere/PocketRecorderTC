@@ -11,9 +11,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.5.13</Version>
-    <AssemblyVersion>1.0.5.13</AssemblyVersion>
-    <FileVersion>1.0.5.13</FileVersion>
+    <Version>1.0.5.14</Version>
+    <AssemblyVersion>1.0.5.14</AssemblyVersion>
+    <FileVersion>1.0.5.14</FileVersion>
     <AssemblyName>PocketRecorder</AssemblyName>
     <RootNamespace>Recorder</RootNamespace>
     <NativeRecorderFfmpegRoot Condition="'$(NativeRecorderFfmpegRoot)' == ''">lib\native\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</NativeRecorderFfmpegRoot>

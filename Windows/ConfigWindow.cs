@@ -325,6 +325,11 @@ internal sealed class ConfigWindow : Window
             }
         }
 
+        if (modeIdx == 1)
+        {
+            ImGui.TextDisabled(Loc.T("Config.EncodingSoftwareDesc"));
+        }
+
     }
 
     private void DrawAudioSettings(Configuration config)
