@@ -177,6 +177,19 @@ internal static class ConfigurationMigrator
             SaveVersion(config, pi, 22);
         }
 
+        if (config.Version < 23)
+        {
+            // Force-migrate users from "Compatible" encoding mode to "Auto" mode
+            // so that hardware encoding (native NVENC/AMF/QSV or FFmpeg hwenc) is used.
+            if (config.VideoCodec == "auto" && !config.UseHardwareEncoder)
+            {
+                config.UseHardwareEncoder = true;
+                config.EncoderPreset = "auto";
+            }
+
+            SaveVersion(config, pi, 23);
+        }
+
         config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
 
         if (!Enum.IsDefined(typeof(RecordingBackendMode), config.RecordingBackendMode))
