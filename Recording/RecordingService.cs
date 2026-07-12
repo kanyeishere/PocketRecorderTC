@@ -258,7 +258,19 @@ internal sealed class RecordingService : IDisposable
                 backendPlan.NativeRecorderProbeReason,
                 GetNativeNvencSdkSummary(backendPlan.Backend),
                 RecordingTelemetry.DetectCpuName(),
-                RecordingTelemetry.DetectTotalMemoryMB());
+                RecordingTelemetry.DetectTotalMemoryMB(),
+                config.ForceFFmpegRecording ? "ffmpeg" : "native",
+                request.VideoBitrate,
+                request.TargetFps,
+                0,
+                0,
+                0,
+                0,
+                request.VideoOutputScaleMode.ToString().ToLowerInvariant(),
+                request.IncludeOverlay,
+                request.UseHardwareEncoder,
+                request.EncoderPreset,
+                request.AudioCaptureMode.ToString().ToLowerInvariant());
             RecordingDiagnosticLog.UpdateRecordingContext(_telemetryContext);
 
             _request = request;
@@ -546,6 +558,10 @@ internal sealed class RecordingService : IDisposable
                         SelectedBackendReason = string.IsNullOrWhiteSpace(nativeRuntimeReason) ? backendPlan.Reason : nativeRuntimeReason,
                         NativeProbeReason = backendPlan.NativeRecorderProbeReason,
                         NativeNvencSdk = GetNativeNvencSdkSummary(backendPlan.Backend),
+                        SourceWidth = startResult.VideoFormat.Width,
+                        SourceHeight = startResult.VideoFormat.Height,
+                        OutputWidth = startResult.VideoFormat.OutputWidth,
+                        OutputHeight = startResult.VideoFormat.OutputHeight,
                     };
                 writerPublished = true;
                 _lifecycle = RecordingLifecycle.Recording;

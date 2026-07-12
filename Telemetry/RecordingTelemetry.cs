@@ -21,7 +21,20 @@ internal sealed record RecordingTelemetryContext(
     string? NativeProbeReason,
     string NativeNvencSdk = "",
     string CpuName = "",
-    int TotalMemoryMB = 0);
+    int TotalMemoryMB = 0,
+    // 用户录制设置
+    string RecordingBackendMode = "native",
+    int VideoBitrate = 0,
+    int TargetFps = 0,
+    int SourceWidth = 0,
+    int SourceHeight = 0,
+    int OutputWidth = 0,
+    int OutputHeight = 0,
+    string VideoOutputScaleMode = "original",
+    bool IncludeOverlay = false,
+    bool UseHardwareEncoder = true,
+    string EncoderPreset = "auto",
+    string AudioCaptureMode = "off");
 
 internal readonly record struct RecordingGpuInfo(string Vendor, string AdapterName);
 
