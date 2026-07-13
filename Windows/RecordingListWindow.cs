@@ -103,8 +103,19 @@ internal sealed class RecordingListWindow : Window
         ImGui.TableSetupScrollFreeze(0, 1);
         DrawTableHeader();
 
-        foreach (var item in _items)
-            DrawRow(item);
+        unsafe
+        {
+            var clipperData = new ImGuiListClipper();
+            var clipper = new ImGuiListClipperPtr(&clipperData);
+            clipper.Begin(_items.Count);
+            while (clipper.Step())
+            {
+                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
+                    DrawRow(_items[i]);
+            }
+
+            clipper.End();
+        }
 
         ImGui.EndTable();
     }
@@ -195,11 +206,21 @@ internal sealed class RecordingListWindow : Window
         Vector2 rowMax = new(
             ImGui.GetWindowPos().X + ImGui.GetWindowWidth() - style.WindowPadding.X,
             rowMin.Y + ImGui.GetTextLineHeight() + style.CellPadding.Y * 2f);
+        // The active draw-list clip is the current table cell's visible area.
+        // Reuse its Y bounds for a full-row hit target so frozen headers and
+        // partially visible rows cannot receive input outside the table body.
+        var draw = ImGui.GetWindowDrawList();
+        Vector2 clipMin = draw.GetClipRectMin();
+        Vector2 clipMax = draw.GetClipRectMax();
+        float visibleMinY = MathF.Max(rowMin.Y, clipMin.Y);
+        float visibleMaxY = MathF.Min(rowMax.Y, clipMax.Y);
         Vector2 mouse = ImGui.GetMousePos();
-        bool hovered = mouse.X >= rowMin.X &&
+        bool hovered = visibleMinY < visibleMaxY &&
+                       ImGui.IsWindowHovered() &&
+                       mouse.X >= rowMin.X &&
                        mouse.X <= rowMax.X &&
-                       mouse.Y >= rowMin.Y &&
-                       mouse.Y <= rowMax.Y;
+                       mouse.Y >= visibleMinY &&
+                       mouse.Y <= visibleMaxY;
 
         if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
         {
@@ -211,17 +232,13 @@ internal sealed class RecordingListWindow : Window
             ? hovered ? RowSelectedHoverBg : RowSelectedBg
             : hovered ? RowHoverBg : null;
         if (bgColor.HasValue)
-            DrawRowBackground(rowMin, rowMax, bgColor.Value);
+        {
+            ImGui.TableSetBgColor(
+                ImGuiTableBgTarget.RowBg0,
+                ImGui.ColorConvertFloat4ToU32(bgColor.Value));
+        }
 
         return isSelected;
-    }
-
-    private static void DrawRowBackground(Vector2 rowMin, Vector2 rowMax, Vector4 color)
-    {
-        var draw = ImGui.GetWindowDrawList();
-        draw.PushClipRect(rowMin, rowMax, false);
-        draw.AddRectFilled(rowMin, rowMax, ImGui.ColorConvertFloat4ToU32(color));
-        draw.PopClipRect();
     }
 
     private void DrawStarToggle(RecordingFileItem item, bool disabled)
