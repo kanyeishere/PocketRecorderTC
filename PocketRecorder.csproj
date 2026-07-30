@@ -11,9 +11,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-<Version>1.0.5.16</Version>
-<AssemblyVersion>1.0.5.16</AssemblyVersion>
-<FileVersion>1.0.5.16</FileVersion>
+<Version>1.0.5.17</Version>
+<AssemblyVersion>1.0.5.17</AssemblyVersion>
+<FileVersion>1.0.5.17</FileVersion>
     <AssemblyName>PocketRecorder</AssemblyName>
     <RootNamespace>Recorder</RootNamespace>
     <NativeRecorderFfmpegRoot Condition="'$(NativeRecorderFfmpegRoot)' == ''">lib\native\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</NativeRecorderFfmpegRoot>
@@ -59,7 +59,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="PromeRotation.SDK.API12" Version="0.1.0-preview.2" />
+    <PackageReference Include="PromeRotation.SDK.TC" Version="0.1.0-preview.1" />
     <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
     <PackageReference Include="TerraFX.Interop.Windows" Version="10.0.22621.2" ExcludeAssets="runtime" PrivateAssets="all" />
   </ItemGroup>

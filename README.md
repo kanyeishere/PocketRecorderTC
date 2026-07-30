@@ -130,8 +130,8 @@ You can configure a recording retention period in the settings window. The defau
 
 ## 注意事项 / Notes
 
-- 当前插件面向 Windows 环境，依赖 Dalamud API 12。
-  The plugin targets Windows and requires Dalamud API 12.
+- 当前插件面向 Windows 环境，依赖 Dalamud API 13。
+  The plugin targets Windows and requires Dalamud API 13.
 - 首次使用自动 FFmpeg 下载时需要网络访问；也可以在设置窗口中填写已有的 `ffmpeg.exe` 路径。
   First-time automatic FFmpeg download requires network access; you can also specify an existing `ffmpeg.exe` path in the settings window.
 - 录制质量和性能取决于分辨率、帧率、码率和本机编码器能力。若硬件编码不可用，可切换到兼容模式。

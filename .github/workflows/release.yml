@@ -149,7 +149,7 @@ jobs:
             TestingAssemblyVersion = $version
             ApplicableVersion      = "any"
             Tags                   = @("recording", "capture", "video", "audio", "ffmpeg", "ffxiv")
-            DalamudApiLevel        = 12
+            DalamudApiLevel        = 13
             IconUrl                = "https://cdn.jsdelivr.net/gh/kanyeishere/PocketRecorderTC@master/images/icon.png"
             RepoUrl                = $repoUrl
             DownloadLinkInstall    = $downloadUrl

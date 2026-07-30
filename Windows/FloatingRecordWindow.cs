@@ -1,4 +1,4 @@
-using ImGuiNET;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Textures.TextureWraps;
 using Dalamud.Interface.Windowing;
@@ -193,7 +193,7 @@ internal sealed class FloatingRecordWindow : Window
 
         var wrap = texture.GetWrapOrEmpty();
         var min = center - StarIconSize * 0.5f;
-        draw.AddImage(wrap.ImGuiHandle, min, min + StarIconSize);
+        draw.AddImage(wrap.Handle, min, min + StarIconSize);
     }
 
     private static void DrawStarShape(
