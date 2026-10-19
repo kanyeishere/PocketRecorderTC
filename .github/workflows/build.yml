@@ -70,6 +70,14 @@ jobs:
           if ($legacyNativeDlls.Count -ne 0) {
             throw "Legacy split NativeRecorder DLLs must not be packaged: $($legacyNativeDlls.Name -join ', ')"
           }
+          $privateVisualCppRuntimeDlls = @(
+            "msvcp140.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll"
+          ) | Where-Object { Test-Path (Join-Path $outputDir $_) }
+          if ($privateVisualCppRuntimeDlls.Count -ne 0) {
+            throw "Private VC++ runtime DLLs must not be packaged beside NativeRecorder: $($privateVisualCppRuntimeDlls -join ', ')"
+          }
 
       - name: Store Build Artifacts
         uses: actions/upload-artifact@v4

@@ -125,8 +125,12 @@ std::string wide_to_utf8(const wchar_t* text)
     if (length <= 1)
         return {};
 
-    std::string result(static_cast<size_t>(length - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), length, nullptr, nullptr);
+    std::string result(static_cast<size_t>(length), '\0');
+    int written = WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), length, nullptr, nullptr);
+    if (written <= 1)
+        return {};
+
+    result.resize(static_cast<size_t>(written - 1));
     return result;
 }
 

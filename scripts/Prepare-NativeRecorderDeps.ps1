@@ -370,9 +370,10 @@ if ($null -eq $oneVplRuntime) {
     $oneVplRuntimeNativeSource = Join-Path $oneVplRuntimeExtract "runtimes\win-x64\native"
     $oneVplRuntimeNativeDest = Join-Path $oneVplRuntimeRoot "runtimes\win-x64\native"
     New-Item -ItemType Directory -Force -Path $oneVplRuntimeNativeDest | Out-Null
-    foreach ($pattern in @("libvpl.dll", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
-        Copy-Item -Path (Join-Path $oneVplRuntimeNativeSource $pattern) -Destination $oneVplRuntimeNativeDest -Force -ErrorAction SilentlyContinue
-    }
+    # Do not copy the package's toolset-specific VC++ runtime beside the plugin.
+    # NativeRecorder is rebuilt independently and must resolve the machine's
+    # current redistributable rather than oneVPL's older private copy.
+    Copy-Item -Path (Join-Path $oneVplRuntimeNativeSource "libvpl.dll") -Destination $oneVplRuntimeNativeDest -Force
     if (Test-Path (Join-Path $oneVplRuntimeExtract "vpl")) {
         Copy-Item -Path (Join-Path $oneVplRuntimeExtract "vpl") -Destination $oneVplRuntimeRoot -Recurse -Force
     }
