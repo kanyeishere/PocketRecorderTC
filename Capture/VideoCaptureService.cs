@@ -118,14 +118,6 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _shouldCaptureFrame = shouldCaptureFrame;
     }
 
-    public bool PreinstallPresentHook()
-    {
-        if (_disposed)
-            return false;
-
-        return TryInstallPresentHook(enable: false);
-    }
-
     public bool Start(int targetFps, int? captureFps = null)
     {
         if (_disposed)
@@ -164,7 +156,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _nv12PerfStats.Reset();
         _sw.Restart();
 
-        if (TryInstallPresentHook(enable: true))
+        if (TryInstallPresentHook())
         {
             _capturing = true;
             _captureMethod = "PresentHook";
@@ -214,7 +206,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     //  Present Hook 捕获
     // ──────────────────────────────────────────────────────────
 
-    private bool TryInstallPresentHook(bool enable)
+    private bool TryInstallPresentHook()
     {
         lock (_hookSync)
         {
@@ -241,22 +233,12 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
                         IGameInteropProvider.HookBackend.Automatic);
                 }
 
-                if (enable && !_presentHookEnabled)
+                if (!_presentHookEnabled)
                 {
                     _presentHook.Enable();
                     _presentHookEnabled = true;
                     _captureMethod = "PresentHook";
                     Plugin.Log!.Info("[Video] ✓ Present hook enabled.");
-                }
-                else if (!enable && _presentHookEnabled)
-                {
-                    _presentHook.Disable();
-                    _presentHookEnabled = false;
-                    Plugin.Log!.Info("[Video] ✓ Present hook disabled.");
-                }
-                else if (!enable)
-                {
-                    Plugin.Log!.Info("[Video] ✓ Present hook installed (disabled).");
                 }
 
                 return true;
@@ -301,7 +283,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private int OnPresentDetour(IntPtr swapChainPtr, uint syncInterval, uint flags)
     {
         Interlocked.Increment(ref _presentDetourDepth);
-        if (_capturing && !IncludeOverlay)
+        if (_capturing)
         {
             TryCaptureInPresentHook(swapChainPtr, "before");
         }
@@ -312,11 +294,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
 
         try
         {
-            int result = _presentHook!.Original(swapChainPtr, syncInterval, flags);
-            if (_capturing && IncludeOverlay)
-                TryCaptureInPresentHook(swapChainPtr, "after");
-
-            return result;
+            return _presentHook!.Original(swapChainPtr, syncInterval, flags);
         }
         finally
         {
