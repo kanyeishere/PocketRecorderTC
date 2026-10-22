@@ -14,7 +14,8 @@ namespace Recorder.Capture;
 
 /// <summary>
 /// 视频捕获服务。
-/// 通过 Hook IDXGISwapChain::Present 在 Present 前直接捕获游戏 D3D11 backbuffer。
+/// 通过 Hook IDXGISwapChain::Present 捕获游戏 D3D11 backbuffer。
+/// 普通模式在 ImGui 前捕获；包含界面时在 ImGui 渲染后、真正 Present 前捕获。
 /// </summary>
 internal sealed unsafe partial class VideoCaptureService : IDisposable
 {
@@ -22,6 +23,8 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private readonly Action<VideoFrame> _onFrame;
     private readonly Func<bool>? _shouldCaptureFrame;
     private readonly object _hookSync = new();
+    private readonly DalamudPostImGuiScheduler _postImGuiScheduler = new();
+    private readonly Action _captureAfterImGuiRenderAction;
 
     // D3D11 对象
     private ID3D11Device* _device;
@@ -91,6 +94,11 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private bool _loggedBackBufferSuccess;
     private string _captureMethod = "unknown";
     private int _presentDetourDepth;
+    private int _postImGuiCaptureDepth;
+    private int _postImGuiCaptureQueued;
+    private int _postImGuiCaptureFailureLogged;
+    private int _postImGuiCaptureSuccessLogged;
+    private long _postImGuiSwapChainAddress;
 
     private const int MaxConsecutiveEmptyFramesBeforeWarning = 3;
     private const int StagingTextureCount = 3;
@@ -116,6 +124,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _gameInterop = gameInterop;
         _onFrame = onFrame;
         _shouldCaptureFrame = shouldCaptureFrame;
+        _captureAfterImGuiRenderAction = CaptureAfterImGuiRender;
     }
 
     public bool Start(int targetFps, int? captureFps = null)
@@ -147,6 +156,11 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _nativeSharedFallbackLogged = false;
         _lockedOutputPixelFormat = null;
         _presentDetourDepth = 0;
+        _postImGuiCaptureDepth = 0;
+        _postImGuiCaptureQueued = 0;
+        _postImGuiCaptureFailureLogged = 0;
+        _postImGuiCaptureSuccessLogged = 0;
+        _postImGuiSwapChainAddress = 0;
         _nonGameSwapChainSkipCount = 0;
         _lastNonGameSwapChainLogTicks = 0;
         _lastGameSwapChainRefreshTicks = 0;
@@ -285,7 +299,11 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         Interlocked.Increment(ref _presentDetourDepth);
         if (_capturing)
         {
-            TryCaptureInPresentHook(swapChainPtr, "before");
+            bool captureAfterImGui = IncludeOverlay &&
+                                     ShouldCaptureSwapChain(swapChainPtr) &&
+                                     TryQueueCaptureAfterImGuiRender(swapChainPtr);
+            if (!captureAfterImGui)
+                TryCaptureInPresentHook(swapChainPtr, IncludeOverlay ? "before (post-ImGui fallback)" : "before");
         }
         else if (!_capturing)
         {
@@ -299,6 +317,50 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         finally
         {
             Interlocked.Decrement(ref _presentDetourDepth);
+        }
+    }
+
+    private bool TryQueueCaptureAfterImGuiRender(IntPtr swapChainPtr)
+    {
+        // A callback that was not drained by the previous Present must not block video
+        // progress. The caller will safely capture before Present for this frame instead.
+        if (Interlocked.CompareExchange(ref _postImGuiCaptureQueued, 1, 0) != 0)
+            return false;
+
+        Interlocked.Exchange(ref _postImGuiSwapChainAddress, swapChainPtr.ToInt64());
+        if (_postImGuiScheduler.TryEnqueue(_captureAfterImGuiRenderAction, out string failureReason))
+        {
+            if (Interlocked.Exchange(ref _postImGuiCaptureSuccessLogged, 1) == 0)
+                Plugin.Log!.Info("[Video] ✓ Overlay capture scheduled after ImGui render and before Present.");
+            return true;
+        }
+
+        Interlocked.Exchange(ref _postImGuiCaptureQueued, 0);
+        if (Interlocked.Exchange(ref _postImGuiCaptureFailureLogged, 1) == 0)
+        {
+            Plugin.Log!.Warning(
+                $"[Video] Post-ImGui overlay capture is unavailable; falling back to safe pre-Present capture. {failureReason}");
+        }
+
+        return false;
+    }
+
+    private void CaptureAfterImGuiRender()
+    {
+        Interlocked.Increment(ref _postImGuiCaptureDepth);
+        try
+        {
+            if (!_capturing || _disposed || !IncludeOverlay)
+                return;
+
+            long swapChainAddress = Volatile.Read(ref _postImGuiSwapChainAddress);
+            if (swapChainAddress != 0)
+                TryCaptureInPresentHook(new IntPtr(swapChainAddress), "after ImGui render, before");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _postImGuiCaptureQueued, 0);
+            Interlocked.Decrement(ref _postImGuiCaptureDepth);
         }
     }
 
@@ -788,15 +850,23 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
 
     private void WaitForPresentDetoursToDrain()
     {
-        if (Volatile.Read(ref _presentDetourDepth) == 0)
+        if (Volatile.Read(ref _presentDetourDepth) == 0 &&
+            Volatile.Read(ref _postImGuiCaptureDepth) == 0)
             return;
 
         Stopwatch waitSw = Stopwatch.StartNew();
-        while (Volatile.Read(ref _presentDetourDepth) > 0 && waitSw.ElapsedMilliseconds < 250)
+        while ((Volatile.Read(ref _presentDetourDepth) > 0 ||
+                Volatile.Read(ref _postImGuiCaptureDepth) > 0) &&
+               waitSw.ElapsedMilliseconds < 250)
             Thread.Sleep(1);
 
-        if (Volatile.Read(ref _presentDetourDepth) > 0)
-            Plugin.Log!.Warning($"[Video] Present detours did not drain within {waitSw.ElapsedMilliseconds}ms.");
+        if (Volatile.Read(ref _presentDetourDepth) > 0 ||
+            Volatile.Read(ref _postImGuiCaptureDepth) > 0)
+        {
+            Plugin.Log!.Warning(
+                $"[Video] Capture callbacks did not drain within {waitSw.ElapsedMilliseconds}ms " +
+                $"(present={Volatile.Read(ref _presentDetourDepth)}, postImGui={Volatile.Read(ref _postImGuiCaptureDepth)}).");
+        }
     }
 
     private void ReleaseCaptureResources()
